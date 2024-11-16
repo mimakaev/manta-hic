@@ -1,3 +1,9 @@
+"""
+Helper functions for Hi-C operations in PyTorch, not directly involved in the model. 
+
+TODO: Add tests for these functions.
+"""
+
 import math
 
 import torch

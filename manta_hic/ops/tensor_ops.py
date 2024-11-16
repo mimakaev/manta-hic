@@ -1,3 +1,7 @@
+"""
+Utility functions for generic torch tensor operations.
+"""
+
 import torch
 
 

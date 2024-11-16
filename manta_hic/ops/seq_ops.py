@@ -1,3 +1,7 @@
+"""
+Utilities for working with DNA sequences, including fast onehot and reverse complement functions.
+"""
+
 import numpy as np
 import pysam
 
@@ -9,7 +13,7 @@ ar[np.array(["ACGTacgt"], dtype="S").view(np.int8)] = np.array([0, 1, 2, 3, 0, 1
 def onehot_turbo(seq_string: str) -> np.ndarray:
     """
     A turbocharged make one hot function. Possibly the fastest you can do without Cython
-    (will buy you a drink if you beat it). Uses coding ACGT as 0123, so reverse complement is just flipping.
+    (will buy you a drink if you beat it). Uses coding ACGT as rows 0123, so reverse complement is just flipping.
 
     Other characters are treated as N, with is (0,0,0,0) (not 0.25).
 
