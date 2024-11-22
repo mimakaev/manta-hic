@@ -1,0 +1,10 @@
+name: manta_env
+channels:
+  - defaults
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.12
+  - hictk
+  - polars
+  - pytorch

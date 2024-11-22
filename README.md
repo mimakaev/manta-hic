@@ -11,3 +11,10 @@ Throughout the project we use the following convention for tensor sizes:
 * C - number of channels
 * N - number of bins 
 * H - number of heads
+
+
+# Attributions 
+
+This project includes code derived from Meta's Llama 2 materials, available at:
+https://ai.meta.com/resources/models-and-libraries/llama-downloads/
+Licensed under the LLAMA 2 Community License.

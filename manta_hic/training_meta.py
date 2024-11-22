@@ -10,9 +10,10 @@ https://github.com/calico/borzoi/tree/main?tab=readme-ov-file but I haven't expl
 
 """
 
-import polars as pl
 import os
 from importlib.resources import files
+
+import polars as pl
 
 seqs_hg38 = pl.read_parquet(os.path.join(files("manta_hic"), "data", "borzoi_seqs_hg38.pq"))
 seqs_mm10 = pl.read_parquet(os.path.join(files("manta_hic"), "data", "borzoi_seqs_mm10.pq"))
