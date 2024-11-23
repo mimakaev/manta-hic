@@ -7,8 +7,6 @@ Main differences from Borzoi are:
 * Using modern transformer architecture with rotary embeddings and SDPA
 """
 
-import os
-
 import h5py
 import hdf5plugin
 import numpy as np

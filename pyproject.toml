@@ -30,6 +30,8 @@ classifiers = [
 dependencies = ["torch", "numpy", "pysam","polars"]  # Add runtime dependencies here
 requires-python = ">=3.10"
 
+[project.scripts]
+manta_hic = "manta_hic.cli:cli"
 
 [tool.setuptools.package-data]
 manta_hic = ["data/*"]
