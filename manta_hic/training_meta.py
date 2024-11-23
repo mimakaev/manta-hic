@@ -8,11 +8,53 @@ downloaded are timestamped in Dec 2023, and were the only version at the time of
 believe that it is what is referred to "latest" rather than "legacy" here
 https://github.com/calico/borzoi/tree/main?tab=readme-ov-file but I haven't exploerd it in depth yet.
 
+Code that was used to generate the data is below
+
+import polars as pl
+
+seqs = pl.read_csv(
+    f"/ssdhome/magus/work/activities/deep_learning/borzoi_inference/shared/seqs_hg38.bed",
+    has_header=False,
+    separator="\t",
+    new_columns=["chrom", "start", "end", "fold"],
+).with_columns(pl.lit("hg38").alias("genome"))
+
+seqs2 = pl.read_csv(
+    f"/ssdhome/magus/work/activities/deep_learning/borzoi_inference/shared/seqs_mm10.bed",
+    has_header=False,
+    separator="\t",
+    new_columns=["chrom", "start", "end", "fold"],
+).with_columns(pl.lit("mm10").alias("genome"))
+
+targs = pl.read_csv("/home/magus/nn/hg38/targets.txt", separator="\t", columns=(1,2,3,4,5,6,7,8))
+targs2 = pl.read_csv("/home/magus/nn/mm10/targets.txt", separator="\t", columns=(1,2,3,4,5,6,7,8))
+
+fold_df = (
+    seqs.sort("genome", "chrom", "start", "end")
+    .group_by(
+        "genome",
+        "chrom",
+        (pl.col("fold") != pl.col("fold").shift(1).over("genome", "chrom").fill_null(pl.col("fold")))
+        .cum_sum()
+        .alias("index"),
+    )
+    .agg(pl.col("start").min(), pl.col("end").max(), pl.col("fold").first(), pl.col("fold").n_unique().alias("n_folds"))
+    .select("genome", "chrom", "start", "end", "fold", "n_folds")
+    .sort("genome", "chrom", "start")
+)
+assert (fold_df["n_folds"] == 1).all()
+fold_df.write_parquet("saved_datafiles_for_library/borzoi_folds.pq")
+seqs.write_parquet("saved_datafiles_for_library/borzoi_seqs_hg38.pq",compression_level=9)
+seqs2.write_parquet("saved_datafiles_for_library/borzoi_seqs_mm10.pq", compression_level=9)
+targs.write_parquet("saved_datafiles_for_library/borzoi_targs_hg38.pq", compression_level=9)
+targs2.write_parquet("saved_datafiles_for_library/borzoi_targs_mm10.pq", compression_level=9)
+
 """
 
 import os
 from importlib.resources import files
 
+import numpy as np
 import polars as pl
 
 seqs_hg38 = pl.read_parquet(os.path.join(files("manta_hic"), "data", "borzoi_seqs_hg38.pq"))
@@ -22,8 +64,8 @@ targs_mm10 = pl.read_parquet(os.path.join(files("manta_hic"), "data", "borzoi_ta
 
 strand_pair_hg38 = targs_hg38["strand_pair"].to_numpy()
 strand_pair_mm10 = targs_mm10["strand_pair"].to_numpy()
-strand_pair_hg38.setflags(write=False)  # make it read-only
-strand_pair_mm10.setflags(write=False)
+strand_pair_hg38
+strand_pair_mm10
 
 
 def get_seqs_targs(genome, version="2023"):
@@ -54,13 +96,12 @@ def get_seqs_targs(genome, version="2023"):
 
 def get_strand_pair(genome, version="2023"):
     """
-    Returns the strand pair for the specified genome and "Borzoi data version". Strand pairs are cached in memory as
-    read-only numpy arrays as they are rapidly needed during training.
+    Returns the strand pair for the specified genome and "Borzoi data version".
     """
     if genome == "hg38":
-        return strand_pair_hg38
+        return np.array(strand_pair_hg38)
     elif genome == "mm10":
-        return strand_pair_mm10
+        return np.array(strand_pair_mm10)
     else:
         raise ValueError(f"Genome {genome} not supported. Must be 'hg38' or 'mm10'.")
 

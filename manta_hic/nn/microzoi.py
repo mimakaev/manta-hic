@@ -1,12 +1,19 @@
 """
-A "micro Borzoi" model for predicting gene expression from DNA sequences. 
+A "micro Borzoi" model for predicting gene expression from DNA sequences.
 
-Main differences from Borzoi are: 
-* Model operates at a single 256bp resolution 
-* There is no U-net 
+Main differences from Borzoi are:
+* Model operates at a single 256bp resolution
+* There is no U-net
 * Using modern transformer architecture with rotary embeddings and SDPA
 """
 
+import os
+
+import h5py
+import hdf5plugin
+import numpy as np
+import polars as pl
+import pysam
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -17,6 +24,8 @@ from manta_hic.nn.layers import (
     DoubleConvolutionalDownsampleBlock,
     TransformerTower,
 )
+from manta_hic.ops.seq_ops import make_seq_1hot
+from manta_hic.training_meta import get_seqs_targs
 
 
 class MicroBorzoi(nn.Module):
@@ -44,7 +53,7 @@ class MicroBorzoi(nn.Module):
         self.nbins = seq_length // 256
         self.crop = (seq_length // 32 - 6144) // 8 // 2
 
-        self.conv_block_type = "single"
+        self.conv_block_type = conv_block
         self.check_first = checkpoint_first
         self.channels_1d = [base_channels * i for i in tower_mults]
         ch_1d = self.channels_1d
@@ -100,7 +109,8 @@ class MicroBorzoi(nn.Module):
         x = self.mha_tower(x)
 
         # Crop after transformers - the rest is just local convolutions
-        x = x[:, :, self.crop + offset : x.shape[2] - self.crop + offset]
+        crop_st, crop_end = self.crop + offset, x.shape[2] - self.crop + offset
+        x = x[:, :, crop_st:crop_end]
         x = self.output_conv_block(x)  # groups=1, w=1
         x = self.dropout(x)
         x = self.output_conv_block2(x)  # groups=8, w=3
@@ -148,3 +158,76 @@ def corr(target, output, return_individual=False):
         cr = cr.detach().cpu().numpy()
         return cr_mean, cr
     return cr_mean
+
+
+def dataGenerator(
+    *,
+    base,
+    genomes,
+    seq_length,
+    fasta_path,
+    resolution,  # end storage parameters
+    batch_size=1,  # start training/validation parameters
+    val_fold=3,
+    test_fold=4,
+    max_shift=0,
+    mode="val",
+):
+    """Ranks and world size aware data generator that would alternate hg38 and mm10 blocks"""
+
+    fastas = {name: pysam.FastaFile(fasta_path.format(name)) for name in genomes}
+
+    dfs = []
+
+    val_fold = int(val_fold)
+    test_fold = int(test_fold)
+    omit_folds = [val_fold, test_fold]
+    for gen in genomes:
+        seqdf, _ = get_seqs_targs(gen)
+        # add index and genome, convert fold to int, add seq start and end
+        seqdf = seqdf.with_columns(
+            pl.int_range(pl.len()).over("fold").alias("index"),
+            pl.col("fold").str.replace("fold", "").cast(int),
+            ((pl.col("start") + pl.col("end")) // 2 - seq_length // 2).alias("seq_start"),
+            ((pl.col("start") + pl.col("end")) // 2 + seq_length // 2).alias("seq_end"),
+        )
+        # add file path per fold and keys
+        seqdf = seqdf.with_columns(
+            (pl.lit(base + "/" + gen + "/fold") + pl.col("fold").cast(str) + pl.lit(".h5")).alias("file"),
+            (pl.lit("sample") + pl.col("index").cast(str)).alias("key"),
+        )
+
+        if mode == "train":
+            seqdf = seqdf.filter(~pl.col("fold").cast(int).is_in(omit_folds))
+        elif mode == "val":
+            seqdf = seqdf.filter(pl.col("fold").cast(int) == val_fold)
+        elif mode == "test":
+            seqdf = seqdf.filter(pl.col("fold").cast(int) == test_fold)
+        elif mode != "all":
+            raise ValueError("Mode should be train, val, test, or all")
+        dfs.append(seqdf[: len(seqdf) // batch_size * batch_size])  # truncate to batch size
+
+    # concat and shuffle in blocks of batch_size - lol polars is good!
+    seqdf = pl.concat(dfs).sort((pl.int_range(pl.len()) // batch_size).hash(np.random.randint(0, 1e9)))
+
+    for batch in seqdf.iter_slices(batch_size):
+        if mode == "train":
+            shift_bins = np.random.randint(-max_shift, max_shift)
+        else:
+            shift_bins = 0
+        shift_bp = shift_bins * resolution
+
+        global_meta = {"shift_bins": shift_bins, "genome": batch["genome"][0]}
+        batch_arrs = [[], []]
+        metadatas = []
+        for row in batch.iter_rows(named=True):
+            with h5py.File(row["file"], "r") as myfile:
+                d = myfile[row["key"] + "/data"][:]
+                batch_arrs[1].append(d)
+
+                fa = fastas[row["genome"]]
+                seq_hot = make_seq_1hot(fa, row["chrom"], row["seq_start"] - shift_bp, row["seq_end"] - shift_bp)
+                batch_arrs[0].append(seq_hot)
+
+                metadatas.append(row)
+        yield (batch_arrs, global_meta, metadatas)

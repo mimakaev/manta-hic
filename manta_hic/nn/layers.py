@@ -127,8 +127,8 @@ class FusedEncoderBlock(nn.Module):  # also from llama
         x_fc1 = self.ff_linear_1(x)
         x_fc2 = self.ff_linear_2(x)
         x = nn.functional.silu(x_fc1) * x_fc2
-        x = self.ff_linear_3(x)
-        return self.ff_dropout(x)
+        x = self.ff_dropout(x)
+        return self.ff_linear_3(x)
 
 
 class TransformerTower(nn.Module):
