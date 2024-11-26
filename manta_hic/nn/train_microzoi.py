@@ -144,7 +144,7 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
             target = list_to_tensor_batch(target, DEVICE, dtype=torch.float32).permute(0, 2, 1)
             target.requires_grad = False
 
-            with torch.no_grad():
+            with torch.no_grad(), autocast("cuda"):
                 assert shift_bins == 0
                 output = model(in_data, genome=genome, offset=shift_bins)
                 val_corrs_epoch.append(float(corr(target, output)))
