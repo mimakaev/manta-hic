@@ -6,6 +6,7 @@ import pickle
 import queue
 import shutil
 import threading
+import gc
 
 import click
 import numpy as np
@@ -122,7 +123,7 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
             scaler.step(optimizer)
             scaler.update()
 
-            train_corrs_epoch.append(mean_corr := corr(target, output))
+            train_corrs_epoch.append(mean_corr := float(corr(target, output)))
             run_corr = (1 / (E := 100 * (epoch + 1))) * float(mean_corr) + ((E - 1) / E) * run_corr
             print(f"Epoch [{epoch}/{num_epochs}], queue len {que_len}, {genome} loss={loss.item():.3g}", end="")
             print(f"corr={mean_corr:.3g} running {run_corr:.3g} ", end="")
@@ -131,6 +132,7 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
 
         loader_thread.join()
 
+        gc.collect()
         # validation loop
         print(f"Epoch {epoch} validation")
         model.eval()
@@ -147,7 +149,8 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
             with torch.no_grad(), autocast("cuda"):
                 assert shift_bins == 0
                 output = model(in_data, genome=genome, offset=shift_bins)
-                val_corrs_epoch.append(float(corr(target, output)))
+                val_corrs_epoch.append(mean_corr := float(corr(target, output)))
+                print(f"Epoch [{epoch}/{num_epochs}], {genome} val corr={mean_corr:.3g}")
             del in_data, target, output
         loader_thread.join()
 
