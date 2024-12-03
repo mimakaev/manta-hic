@@ -89,8 +89,7 @@ class FusedEncoderBlock(nn.Module):  # also from llama
         # FF Layer
         self.ff_dropout = nn.Dropout(drop_p)
         self.ff_linear_1 = nn.Linear(in_features=d_model, out_features=d_model * ff_mult, bias=False)
-        self.ff_linear_2 = nn.Linear(in_features=d_model, out_features=d_model * ff_mult, bias=False)
-        self.ff_linear_3 = nn.Linear(in_features=d_model * ff_mult, out_features=d_model, bias=False)
+        self.ff_linear_2 = nn.Linear(in_features=d_model * ff_mult, out_features=d_model, bias=False)
 
         # Pre layer norms
         self.norm1 = nn.RMSNorm(d_model)
@@ -98,7 +97,7 @@ class FusedEncoderBlock(nn.Module):  # also from llama
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self._att_block(self.norm1(x), self.freqs_cis)
-        return x + self._ff_block(self.norm2(x))
+        return x + self.ff_dropout(self.ff_linear_2(nn.GELU(self.ff_linear_1(x))))
 
     def _att_block(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
@@ -121,14 +120,6 @@ class FusedEncoderBlock(nn.Module):  # also from llama
         out = att.transpose(1, 2).contiguous()
         out = out.view(batch_size, seq_len, self.n_heads * self.d_head)
         return self.resid_dropout(self.att_proj_linear(out))
-
-    def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
-        "Fancy LLAMA FF block"
-        x_fc1 = self.ff_linear_1(x)
-        x_fc2 = self.ff_linear_2(x)
-        x = nn.functional.silu(x_fc1) * x_fc2
-        x = self.ff_dropout(x)
-        return self.ff_linear_3(x)
 
 
 class TransformerTower(nn.Module):
