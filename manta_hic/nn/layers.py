@@ -97,7 +97,7 @@ class FusedEncoderBlock(nn.Module):  # also from llama
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self._att_block(self.norm1(x), self.freqs_cis)
-        return x + self.ff_dropout(self.ff_linear_2(nn.GELU(self.ff_linear_1(x))))
+        return x + self.ff_dropout(self.ff_linear_2(F.gelu(self.ff_linear_1(x))))
 
     def _att_block(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape

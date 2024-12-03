@@ -121,7 +121,7 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
             with autocast("cuda"):
                 output = model(in_data, genome=genome, offset=shift_bins)  # [B, C, N]
                 loss = borzoi_loss(output, target)
-            del in_data, target
+
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -131,7 +131,6 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
             print(f"Epoch [{epoch}/{num_epochs}], queue len {que_len}, {genome} loss={loss.item():.3g}", end="")
             print(f"corr={mean_corr:.3g} running {run_corr:.3g} ", end="")
             print("duration: ", (dt.datetime.now() - current) / dt.timedelta(seconds=1))
-            del output, loss, mean_corr, run_corr
 
         loader_thread.join()
 
@@ -154,7 +153,6 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
                 output = model(in_data, genome=genome, offset=shift_bins)
                 val_corrs_epoch.append(mean_corr := float(corr(target, output)))
                 print(f"Epoch [{epoch}/{num_epochs}], {genome} val corr={mean_corr:.3g}")
-            del in_data, target, output
         loader_thread.join()
 
         torch.save(model.state_dict(), f"{folder}/model_{epoch}.pth")

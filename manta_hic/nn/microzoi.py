@@ -83,6 +83,7 @@ class MicroBorzoi(nn.Module):
             n_bins=self.nbins,
             n_heads=n_heads,
             drop_p=attn_dropout,
+            ff_mult=2,
         )
 
         self.output_conv_block = ConvolutionalBlock1d(working_channels, self.last_chanels, W=1, D=1, groups=1)
