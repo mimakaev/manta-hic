@@ -58,7 +58,7 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     return xq_out.type_as(xq), xk_out.type_as(xk)  # dtype: float32/(b)float16 as autocast wishes
 
 
-def precompute_freqs_cis(dim: int, N: int, theta: float = 40000.0) -> torch.Tensor:
+def precompute_freqs_cis(dim: int, N: int, theta: float = 10000.0) -> torch.Tensor:
     "Slightly longer theta because llama3 has it and because we may use it up to 16k context size"
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))  # [dim//2]
     t = torch.arange(N, device=freqs.device)
@@ -92,12 +92,16 @@ class FusedEncoderBlock(nn.Module):  # also from llama
         self.ff_linear_2 = nn.Linear(in_features=d_model * ff_mult, out_features=d_model, bias=False)
 
         # Pre layer norms
-        self.norm1 = nn.RMSNorm(d_model)
-        self.norm2 = nn.RMSNorm(d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self._att_block(self.norm1(x), self.freqs_cis)
-        return x + self.ff_dropout(self.ff_linear_2(F.gelu(self.ff_linear_1(x))))
+        x = x + self._ff_block(self.norm2(x))
+        return x
+
+    def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
+        return self.ff_linear_2(F.gelu(self.ff_linear_1(x)))
 
     def _att_block(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
