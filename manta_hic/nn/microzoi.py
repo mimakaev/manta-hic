@@ -36,6 +36,7 @@ class MicroBorzoi(nn.Module):
         width=[3, 3, 3, 3, 3, 3, 3],
         base_channels=64,
         n_heads=16,
+        ff_mult=4,
         transf_layers=12,
         seq_length=2**19 + 2**18,
         last_channels_mult=32,
@@ -83,7 +84,7 @@ class MicroBorzoi(nn.Module):
             n_bins=self.nbins,
             n_heads=n_heads,
             drop_p=attn_dropout,
-            ff_mult=2,
+            ff_mult=ff_mult,
         )
 
         self.output_conv_block = ConvolutionalBlock1d(working_channels, self.last_chanels, W=1, D=1, groups=1)
