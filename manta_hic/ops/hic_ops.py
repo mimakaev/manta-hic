@@ -1,5 +1,5 @@
 """
-Helper functions for Hi-C operations in PyTorch, not directly involved in the model. 
+Helper functions for Hi-C operations in PyTorch, not directly involved in the model.
 
 TODO: Add tests for these functions.
 """
@@ -222,8 +222,8 @@ def create_expected_matrix(
 
 def hic_hierarchical_loss(
     pred_ooe: torch.Tensor,  # [B, C, N, N]
-    raw: torch.Tensor,  #  [B, C, N, N]
-    exp_mat: torch.Tensor,  #  [B, C, N, N]
+    raw: torch.Tensor,  # [B, C, N, N]
+    exp_mat: torch.Tensor,  # [B, C, N, N]
     loss_scale_factor: float = 0.5,
     sum_loss_weight: float = 0.2,
     continuity_loss_weight: float = 0.02,

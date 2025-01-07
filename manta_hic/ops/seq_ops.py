@@ -52,7 +52,7 @@ def make_seq_1hot(
     if end < 0:
         seq_dna = "N" * (end - start)
     else:
-        seq_dna = genome_open.fetch(chrm, start, end)
+        seq_dna = genome_open.fetch(chrm, max(start, 0), end)
         if start < 0:
             seq_dna = "N" * (-start) + seq_dna
         if len(seq_dna) < seq_len:
