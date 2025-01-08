@@ -19,7 +19,6 @@ from torch.utils.checkpoint import checkpoint
 
 from manta_hic.nn.layers import (
     ConvolutionalBlock1d,
-    DoubleConvolutionalDownsampleBlock,
     TransformerTower,
 )
 from manta_hic.ops.seq_ops import make_seq_1hot
@@ -32,7 +31,7 @@ class MicroBorzoi(nn.Module):
         seq_conv_width=15,
         tower_mults=[8, 10, 12, 14, 16, 16, 16, 16],
         groups=[1, 1, 1, 1, 1, 1, 1],
-        conv_block="double",
+        conv_block="single",
         width=[3, 3, 3, 3, 3, 3, 3],
         base_channels=64,
         n_heads=16,
@@ -46,6 +45,7 @@ class MicroBorzoi(nn.Module):
         conv_dropout=0.2,
         num_bn_checkpoints=1,
         checkpoint_first=False,
+        return_type="default",
     ):
         super().__init__()
         # Hard-coding those as Borzoi training data never changes
@@ -61,6 +61,7 @@ class MicroBorzoi(nn.Module):
         self.nheads = n_heads
         self.output_channels_human = output_channels_human
         self.output_channels_mouse = output_channels_mouse
+        self.return_type = return_type
 
         # utility layers
         self.dropout = nn.Dropout1d(p=conv_dropout)
@@ -72,8 +73,9 @@ class MicroBorzoi(nn.Module):
         self.conv_blocks = nn.ModuleList()
         if conv_block == "single":
             convBlock = ConvolutionalBlock1d
-        elif conv_block == "double":
-            convBlock = DoubleConvolutionalDownsampleBlock
+        else:
+            raise ValueError("Only single blocks are supported")
+
         for ind, (c_st, c_end, gr, W) in enumerate(zip(self.channels_1d[:-1], self.channels_1d[1:], groups, width)):
             do_checkpoint = ind < num_bn_checkpoints
             self.conv_blocks.append(convBlock(c_st, c_end, W=W, groups=gr, checkpoint_bn=do_checkpoint))
@@ -86,14 +88,14 @@ class MicroBorzoi(nn.Module):
             drop_p=attn_dropout,
             ff_mult=ff_mult,
         )
+        if self.return_type in ["default"]:
+            self.output_conv_block = ConvolutionalBlock1d(working_channels, self.last_chanels, W=1, D=1, groups=1)
+            self.output_conv_block2 = ConvolutionalBlock1d(self.last_chanels, self.last_chanels, W=3, D=1, groups=8)
 
-        self.output_conv_block = ConvolutionalBlock1d(working_channels, self.last_chanels, W=1, D=1, groups=1)
-        self.output_conv_block2 = ConvolutionalBlock1d(self.last_chanels, self.last_chanels, W=3, D=1, groups=8)
+            self.final_conv_human = nn.Conv1d(self.last_chanels, self.output_channels_human, kernel_size=1)
+            self.final_conv_mouse = nn.Conv1d(self.last_chanels, self.output_channels_mouse, kernel_size=1)
 
-        self.final_conv_human = nn.Conv1d(self.last_chanels, self.output_channels_human, kernel_size=1)
-        self.final_conv_mouse = nn.Conv1d(self.last_chanels, self.output_channels_mouse, kernel_size=1)
-
-    def forward(self, x, genome="hg38", offset=0):
+    def forward(self, x, genome="hg38", offset=0, crop_mha=0):
 
         # First convolutional layer (possibly checkpointed - it's the biggest)
         first = lambda x: self.maxpool(self.conv0(x))
@@ -101,16 +103,17 @@ class MicroBorzoi(nn.Module):
 
         # Convolutional blocks - double block has stride 2 so no need for maxpool
         for conv_block in self.conv_blocks:
-            if self.conv_block_type == "single":
-                x = self.maxpool(conv_block(x))
-            else:
-                x = conv_block(x)
+            x = self.maxpool(conv_block(x))
 
         x = self.mha_tower(x)
+
+        if self.return_type == "mha":
+            return x[:, :, crop_mha : x.shape[2] - crop_mha]  # crop on device to make it faster
 
         # Crop after transformers - the rest is just local convolutions
         crop_st, crop_end = self.crop + offset, x.shape[2] - self.crop + offset
         x = x[:, :, crop_st:crop_end]
+
         x = self.output_conv_block(x)  # groups=1, w=1
         x = self.dropout(x)
         x = self.output_conv_block2(x)  # groups=8, w=3
