@@ -106,28 +106,34 @@ def get_strand_pair(genome, version="2023"):
         raise ValueError(f"Genome {genome} not supported. Must be 'hg38' or 'mm10'.")
 
 
-def assign_folds(df, val_fold, test_fold, genome):
+def assign_fold_type(df, val_fold, test_fold, genome, overlap_threshold=0.8):
     """
     Assigns folds to the given dataframe based on the specified validation and test folds.
 
-    Discards rows that do not have a corresponding fold in the fold dataframe or overlap with multiple fold types.
-    Names of the assigned "fold_type" are "train", "val", and "test".
+    Identifies the rows that do not have a corresponding fold in the fold dataframe
+    or overlap with multiple fold types (unless the overlap with the fold is above the specified threshold).
+    Those rows are labelled with a fold type "discard".
+
+    Names of the assigned "fold_type" are "train", "val", "test", and "discard".
 
     Parameters
     ----------
     df : polars.DataFrame
         The dataframe containing the data to be assigned folds.
-    val_fold : int
+    val_fold : str
         The fold to be used for validation (e.g. "fold3")
-    test_fold : int
+    test_fold : str
         The fold to be used for testing (e.g. "fold4").
     genome : str
         The genome identifier to filter the folds.
+    overlap_threshold : float
+        The minimum fraction of overlap between the fold and the data for it to be assigned the fold type.
+        Default is 0.8.
 
     Returns
     -------
     polars.DataFrame
-        A dataframe with an additional column 'fold' and 'fold_type', the latter indicating whether each row is part
+        A dataframe with an additional column 'fold_type', the latter indicating whether each row is part
         of the training, validation, or test set.
 
     Raises
@@ -135,13 +141,16 @@ def assign_folds(df, val_fold, test_fold, genome):
     ValueError
         If `val_fold` or `test_fold` are not present in the unique folds of the fold dataframe.
     """
+
     df = pl.DataFrame(df)
     fold_df = pl.read_parquet(os.path.join(files("manta_hic"), "data", "borzoi_folds.pq"))
 
+    # check if val_fold and test_fold are present in the fold_df
     unique_folds = fold_df["fold"].unique().to_list()
-    if val_fold not in unique_folds and test_fold not in unique_folds:
+    if val_fold not in unique_folds or test_fold not in unique_folds:
         raise ValueError(f"Validation fold {val_fold} or test fold {test_fold} not found in {unique_folds}")
 
+    # assign fold_type to the fold_df dataframe
     fold_df = fold_df.filter(pl.col("genome") == genome).with_columns(
         pl.when(pl.col("fold") == val_fold)
         .then(pl.lit("val"))
@@ -149,17 +158,35 @@ def assign_folds(df, val_fold, test_fold, genome):
         .alias("fold_type")
     )
 
-    overlap = (
-        df.join_where(  # sorry for the beta functionality. Living on the edge, hoping it stays.
+    # overlap, add overlap length, overlap fraction, filter out rows with multiple fold types
+    df_with_folds = (
+        df.join_where(
             fold_df,
             pl.col("chrom") == pl.col("chrom_right"),
             pl.col("start") < pl.col("end_right"),
             pl.col("start_right") < pl.col("end"),
             suffix="_right",
         )
-        .filter(pl.col("fold_type").n_unique().over("chrom", "start", "end") == 1)
-        .select(list(df.columns) + ["fols", "fold_type"])
-        .unique()
+        .with_columns(overlap_length=pl.min_horizontal("end", "end_right") - pl.max_horizontal("start", "start_right"))
+        .with_columns((pl.col("overlap_length") / (pl.col("end") - pl.col("start"))).alias("overlap_fraction"))
+        .filter(
+            (pl.col("fold_type").n_unique().over("chrom", "start", "end") == 1)
+            | (pl.col("overlap_fraction") > overlap_threshold)
+        )
+        .sort("overlap_fraction", descending=True)
+        .group_by("chrom", "start", "end")
+        .agg(pl.col("fold_type").first())
     )
 
-    return overlap
+    # verify that all 3 fold types are present
+    assert df_with_folds["fold_type"].n_unique() == 3
+
+    # Join the assignments back into the original dataframe
+    df2 = df.join(df_with_folds, on=["chrom", "start", "end"], how="left")
+    df2 = df2.with_columns(pl.col("fold_type").fill_null("discard"))
+
+    # verify that dataframes are the same length and starts are the same
+    assert len(df) == len(df2)
+    assert (df["chrom"].to_numpy() == df2["chrom"].to_numpy()).all()
+
+    return df2
