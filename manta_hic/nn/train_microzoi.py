@@ -1,4 +1,5 @@
 import datetime as dt
+import gc
 import glob
 import json
 import os
@@ -6,11 +7,9 @@ import pickle
 import queue
 import shutil
 import threading
-import gc
 
 import click
 import numpy as np
-
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 

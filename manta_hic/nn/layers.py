@@ -5,36 +5,36 @@ from torch.utils.checkpoint import checkpoint
 
 
 class ConvolutionalBlock1d(nn.Module):
-    """Convolutional block with batch normalization and GELU activation"""
+    """Convolutional block with group normalization and GELU activation"""
 
-    def __init__(self, in_C, C, W, *, D=1, groups=1, checkpoint_bn=False):
-        "A simple convolutional block with batch normalization and GELU activation"
+    def __init__(self, in_C, C, W, *, D=1, groups=1, checkpoint_gn=False):
+        "A simple convolutional block with group normalization and GELU activation"
 
         super().__init__()
-        self.bn = nn.BatchNorm1d(in_C)
-        self.checkpoint_bn = checkpoint_bn
+        self.groupnorm = nn.GroupNorm(num_groups=in_C // 32, num_channels=in_C)
+        self.checkpoint_gn = checkpoint_gn
         self.conv = nn.Conv1d(in_C, C, kernel_size=W, padding=(W // 2) * D, dilation=D, groups=groups)
 
     def forward(self, x):
-        fun = lambda x: F.gelu(self.bn(x))
-        x = checkpoint(fun, x, use_reentrant=True) if self.checkpoint_bn else fun(x)
+        fun = lambda x: F.gelu(self.groupnorm(x))
+        x = checkpoint(fun, x, use_reentrant=True) if self.checkpoint_gn else fun(x)
         return self.conv(x)
 
 
 class DoubleConvolutionalDownsampleBlock(nn.Module):
     """Downsample block with two convolutional layers, second with stride 2"""
 
-    def __init__(self, in_C, C, W, D=1, groups=1, checkpoint_bn=True):
+    def __init__(self, in_C, C, W, D=1, groups=1, checkpoint_gn=True):
         super().__init__()
-        self.bn = nn.BatchNorm1d(in_C)
-        self.bn2 = nn.BatchNorm1d(C)
-        self.do_check = checkpoint_bn
+        self.gn = nn.GroupNorm(num_groups=in_C // 32, num_channels=in_C)
+        self.gn2 = nn.GroupNorm(num_groups=C // 32, num_channels=C)
+        self.do_check = checkpoint_gn
         self.conv = nn.Conv1d(in_C, C, kernel_size=W, padding=(W // 2) * D, dilation=D, groups=groups)
         self.conv2 = nn.Conv1d(C, C, kernel_size=4, stride=2, padding=1, groups=1)
 
     def forward(self, x):
-        fun = lambda x: F.gelu(self.bn(x))
-        fun2 = lambda x: F.gelu(self.bn2(x))
+        fun = lambda x: F.gelu(self.gn(x))
+        fun2 = lambda x: F.gelu(self.gn2(x))
 
         x = checkpoint(fun, x, use_reentrant=True) if self.do_check else fun(x)
         x = self.conv(x)
@@ -59,7 +59,6 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
 
 
 def precompute_freqs_cis(dim: int, N: int, theta: float = 10000.0) -> torch.Tensor:
-    "Slightly longer theta because llama3 has it and because we may use it up to 16k context size"
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))  # [dim//2]
     t = torch.arange(N, device=freqs.device)
     freqs = torch.outer(t, freqs).float()  # [N, dim//2]
@@ -92,8 +91,8 @@ class FusedEncoderBlock(nn.Module):  # also from llama
         self.ff_linear_2 = nn.Linear(in_features=d_model * ff_mult, out_features=d_model, bias=False)
 
         # Pre layer norms
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        self.norm1 = nn.RmsNorm(d_model)
+        self.norm2 = nn.RmsNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self._att_block(self.norm1(x), self.freqs_cis)
@@ -101,7 +100,7 @@ class FusedEncoderBlock(nn.Module):  # also from llama
         return x
 
     def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
-        return self.ff_linear_2(F.gelu(self.ff_linear_1(x)))
+        return self.ff_dropout(self.ff_linear_2(F.gelu(self.ff_linear_1(x))))
 
     def _att_block(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
@@ -132,10 +131,12 @@ class TransformerTower(nn.Module):
     def __init__(self, n_layers: int, d_model: int, n_bins: int, n_heads: int, **kwargs):
         super().__init__()
         self.layers = nn.ModuleList([FusedEncoderBlock(d_model, n_bins, n_heads, **kwargs) for _ in range(n_layers)])
+        self.norm = nn.RmsNorm(d_model)
 
     def forward(self, x):
         x = x.permute(0, 2, 1)
         for layer in self.layers:
             x = layer(x)
+        x = self.norm(x)
         x = x.permute(0, 2, 1)
         return x

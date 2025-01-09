@@ -17,10 +17,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from manta_hic.nn.layers import (
-    ConvolutionalBlock1d,
-    TransformerTower,
-)
+from manta_hic.nn.layers import ConvolutionalBlock1d, TransformerTower
 from manta_hic.ops.seq_ops import make_seq_1hot
 from manta_hic.training_meta import get_seqs_targs
 
