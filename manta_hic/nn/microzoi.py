@@ -38,7 +38,7 @@ class MicroBorzoi(nn.Module):
         output_channels_human=7611,
         output_channels_mouse=2608,
         attn_dropout=0.4,
-        conv_dropout=0.2,
+        conv_dropout=0.15,
         num_gn_checkpoints=1,
         checkpoint_first=False,
         return_type="default",
