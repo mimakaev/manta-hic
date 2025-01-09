@@ -69,7 +69,7 @@ class MicroBorzoi(nn.Module):
 
         for ind, (c_st, c_end, gr, W) in enumerate(zip(self.channels_1d[:-1], self.channels_1d[1:], groups, width)):
             do_checkpoint = ind < num_gn_checkpoints
-            self.conv_blocks.append(ConvolutionalBlock1d(c_st, c_end, W=W, groups=gr, checkpoint_bn=do_checkpoint))
+            self.conv_blocks.append(ConvolutionalBlock1d(c_st, c_end, W=W, groups=gr, checkpoint_gn=do_checkpoint))
 
         self.mha_tower = TransformerTower(
             n_layers=transf_layers,

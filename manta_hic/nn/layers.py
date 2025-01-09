@@ -91,8 +91,8 @@ class FusedEncoderBlock(nn.Module):  # also from llama
         self.ff_linear_2 = nn.Linear(in_features=d_model * ff_mult, out_features=d_model, bias=False)
 
         # Pre layer norms
-        self.norm1 = nn.RmsNorm(d_model)
-        self.norm2 = nn.RmsNorm(d_model)
+        self.norm1 = nn.RMSNorm(d_model)
+        self.norm2 = nn.RMSNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self._att_block(self.norm1(x), self.freqs_cis)
@@ -131,7 +131,7 @@ class TransformerTower(nn.Module):
     def __init__(self, n_layers: int, d_model: int, n_bins: int, n_heads: int, **kwargs):
         super().__init__()
         self.layers = nn.ModuleList([FusedEncoderBlock(d_model, n_bins, n_heads, **kwargs) for _ in range(n_layers)])
-        self.norm = nn.RmsNorm(d_model)
+        self.norm = nn.RMSNorm(d_model)
 
     def forward(self, x):
         x = x.permute(0, 2, 1)
