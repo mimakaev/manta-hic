@@ -17,10 +17,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from manta_hic.nn.layers import (
-    ConvolutionalBlock1d,
-    TransformerTower,
-)
+from manta_hic.nn.layers import ConvolutionalBlock1d, TransformerTower
 from manta_hic.ops.seq_ops import make_seq_1hot
 from manta_hic.training_meta import get_seqs_targs
 
@@ -31,7 +28,6 @@ class MicroBorzoi(nn.Module):
         seq_conv_width=15,
         tower_mults=[8, 10, 12, 14, 16, 16, 16, 16],
         groups=[1, 1, 1, 1, 1, 1, 1],
-        conv_block="single",
         width=[3, 3, 3, 3, 3, 3, 3],
         base_channels=64,
         n_heads=16,
@@ -41,9 +37,9 @@ class MicroBorzoi(nn.Module):
         last_channels_mult=32,
         output_channels_human=7611,
         output_channels_mouse=2608,
-        attn_dropout=0.3,
-        conv_dropout=0.2,
-        num_bn_checkpoints=1,
+        attn_dropout=0.4,
+        conv_dropout=0.15,
+        num_gn_checkpoints=1,
         checkpoint_first=False,
         return_type="default",
     ):
@@ -52,7 +48,6 @@ class MicroBorzoi(nn.Module):
         self.nbins = seq_length // 256
         self.crop = (seq_length // 32 - 6144) // 8 // 2
 
-        self.conv_block_type = conv_block
         self.check_first = checkpoint_first
         self.channels_1d = [base_channels * i for i in tower_mults]
         ch_1d = self.channels_1d
@@ -71,14 +66,10 @@ class MicroBorzoi(nn.Module):
         self.conv0 = nn.Conv1d(4, ch_1d[0], kernel_size=seq_conv_width, padding=10)
 
         self.conv_blocks = nn.ModuleList()
-        if conv_block == "single":
-            convBlock = ConvolutionalBlock1d
-        else:
-            raise ValueError("Only single blocks are supported")
 
         for ind, (c_st, c_end, gr, W) in enumerate(zip(self.channels_1d[:-1], self.channels_1d[1:], groups, width)):
-            do_checkpoint = ind < num_bn_checkpoints
-            self.conv_blocks.append(convBlock(c_st, c_end, W=W, groups=gr, checkpoint_bn=do_checkpoint))
+            do_checkpoint = ind < num_gn_checkpoints
+            self.conv_blocks.append(ConvolutionalBlock1d(c_st, c_end, W=W, groups=gr, checkpoint_gn=do_checkpoint))
 
         self.mha_tower = TransformerTower(
             n_layers=transf_layers,
@@ -101,7 +92,7 @@ class MicroBorzoi(nn.Module):
         first = lambda x: self.maxpool(self.conv0(x))
         x = checkpoint(first, x, use_reentrant=True) if self.check_first else first(x)
 
-        # Convolutional blocks - double block has stride 2 so no need for maxpool
+        # Convolutional blocks
         for conv_block in self.conv_blocks:
             x = self.maxpool(conv_block(x))
 
@@ -117,6 +108,7 @@ class MicroBorzoi(nn.Module):
         x = self.output_conv_block(x)  # groups=1, w=1
         x = self.dropout(x)
         x = self.output_conv_block2(x)  # groups=8, w=3
+        x = self.dropout(x)
         x = F.gelu(x)
 
         if genome == "hg38":
