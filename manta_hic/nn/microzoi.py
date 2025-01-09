@@ -108,6 +108,7 @@ class MicroBorzoi(nn.Module):
         x = self.output_conv_block(x)  # groups=1, w=1
         x = self.dropout(x)
         x = self.output_conv_block2(x)  # groups=8, w=3
+        x = self.dropout(x)
         x = F.gelu(x)
 
         if genome == "hg38":
