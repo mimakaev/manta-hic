@@ -165,6 +165,7 @@ def dataGenerator(
     val_fold=3,
     test_fold=4,
     max_shift=0,
+    random_shift_bp=27,  # +- 27bp out of 256
     mode="val",
 ):
     """Ranks and world size aware data generator that would alternate hg38 and mm10 blocks"""
@@ -207,11 +208,13 @@ def dataGenerator(
     for batch in seqdf.iter_slices(batch_size):
         if mode == "train":
             shift_bins = np.random.randint(-max_shift, max_shift)
+            extra_shift_bp = np.random.randint(-random_shift_bp, random_shift_bp + 1)
+            shift_bp = shift_bins * resolution + extra_shift_bp
         else:
             shift_bins = 0
-        shift_bp = shift_bins * resolution
+            shift_bp = 0
 
-        global_meta = {"shift_bins": shift_bins, "genome": batch["genome"][0]}
+        global_meta = {"shift_bins": shift_bins, "shift_bp": shift_bp, "genome": batch["genome"][0]}
         batch_arrs = [[], []]
         metadatas = []
         for row in batch.iter_rows(named=True):
