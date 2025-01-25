@@ -31,8 +31,8 @@ class MicroBorzoi(nn.Module):
     def __init__(
         self,
         seq_conv_width=15,
-        tower_mults=[8, 10, 12, 14, 16, 16, 16, 16],
-        groups=[1, 1, 1, 1, 1, 1, 1],
+        tower_mults=[8, 9, 10, 11, 12, 14, 16, 16],
+        groups=[4, 1, 4, 1, 4, 1, 4],
         width=[3, 3, 3, 3, 3, 3, 3],
         base_channels=64,
         n_heads=16,
@@ -44,8 +44,8 @@ class MicroBorzoi(nn.Module):
         output_channels_mouse=2608,
         attn_dropout=0.4,
         conv_dropout=0.15,
-        num_gn_checkpoints=1,
-        checkpoint_first=False,
+        num_gn_checkpoints=0,
+        checkpoint_first=True,
         return_type="default",
     ):
         super().__init__()
