@@ -33,7 +33,7 @@ def process_mcools(manifest_path, output_folder, resolutions, target_size, step_
 @click.option("--fasta", "-f", type=click.Path(exists=True), required=True, help="Path to the FASTA file.")
 @click.option("--device", "-d", default="cuda:0", help="Torch device")
 @click.option("--batch-size", "-b", default=4, help="Batch size.")
-@click.option("--chrom", type=str, multiple=True, default=["chr1", "chrX"], help="Chromosomes to process.")
+@click.option("--chrom", type=str, multiple=True, default=["#", "chrX"], help="Chromosomes to process.")
 @click.option("--params-file", "-p", type=click.Path(exists=True), help="Path to the parameters file.")
 @click.option("--n-runs", "-n", default=16, help="Number of runs.")
 @click.option("--crop-mha-range", "-r", type=(int, int), default=(640, 1024), help="Crop MHA range.")
