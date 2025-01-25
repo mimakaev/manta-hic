@@ -415,9 +415,12 @@ def create_microzoi_model_from_cache(cache_path, device="cuda", return_type="mha
         params = json.loads(f.attrs["model_params"])
 
     # combine model parameters
-    params["model"].update(kwargs).update({"return_type": return_type})
-    model = MicroBorzoi(**params["model"]).to(device)
-    model.load_state_dict(torch.load(io.BytesIO(model_bytes), map_location=device))
+    mod_args = params["model"]
+    mod_args.update(kwargs)
+    mod_args.update({"return_type": return_type})
+
+    model = MicroBorzoi(**mod_args).to(device)
+    model.load_state_dict(torch.load(io.BytesIO(model_bytes), map_location=device, weights_only=True))
     model.eval()
     return model
 
