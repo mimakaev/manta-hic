@@ -3,12 +3,12 @@
 # ------------------------------------
 import os
 
+import bioframe
+import cooler
+import cooltools
+import h5py
 import numpy as np
 import pandas as pd
-import cooler
-import h5py
-import bioframe
-import cooltools
 
 
 def get_bad_bin_masks(uri):

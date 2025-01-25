@@ -5,6 +5,55 @@ Utilities for working with DNA sequences, including fast onehot and reverse comp
 import numpy as np
 import pysam
 
+
+def open_fasta_chromsizes(
+    in_fasta,
+    chroms=("#", "chrX"),
+):
+    """
+    Opens a genome fasta file, or takes a pysam.FastaFile like object, and returns open file and chromsizes.
+
+    Parameters
+    ----------
+    in_fasta : str or pysam.FastaFile (or compatible)
+        Path to the genome fasta file or an open pysam.FastaFile object.
+    chroms : Iterable, optional
+        Chromosome names. Default is ["#", "chrX"] where "#" is all the numeric chromosomes chr{number}.
+
+    Returns
+    -------
+    pysam.FastaFile, dict
+        An open pysam.FastaFile object and a dictionary of chromosome sizes.
+    """
+    # Open the genome FASTA file if a path is provided
+    if isinstance(in_fasta, str):
+        genome_open = pysam.FastaFile(in_fasta)
+    else:
+        genome_open = in_fasta
+
+    # Fetch all chromosome names and sizes
+    all_chroms = genome_open.references
+    chromsizes = {chrom: genome_open.get_reference_length(chrom) for chrom in all_chroms}
+
+    # Filter chromosomes based on `chroms`
+    filtered_chromsizes = {}
+    for chrom in chroms:
+        if chrom == "#":
+            # Handle numeric chromosomes like chr1, chr2, ..., chr22
+            numeric_chroms = [f"chr{i}" for i in range(1, 23)]
+            for c in numeric_chroms:
+                if c in chromsizes:
+                    filtered_chromsizes[c] = chromsizes[c]
+        else:
+            # Handle explicitly specified chromosomes
+            if chrom in chromsizes:
+                filtered_chromsizes[chrom] = chromsizes[chrom]
+            else:
+                raise ValueError(f"Chromosome {chrom} not found in the genome.")
+
+    return genome_open, filtered_chromsizes
+
+
 # precomputing the array for the onehot encoding
 ar = np.zeros(256, dtype=np.int32) + 4  # 4 for unknown characters - last row is discarded
 ar[np.array(["ACGTacgt"], dtype="S").view(np.int8)] = np.array([0, 1, 2, 3, 0, 1, 2, 3])
@@ -110,9 +159,11 @@ class InMemoryFasta:
     -------
     fetch(chrom, start, end)
         Retrieves a subsequence from the preloaded chromosome sequence.
+    get_reference_length(chrom)
+        Retrieves the length of the chromosome sequence (mimics the 'get_reference_length' method of pysam.FastaFile).
     """
 
-    def __init__(self, fasta_open: pysam.FastaFile, chroms: tuple[str] = ("#", "chrX", "chrY")):
+    def __init__(self, fasta_open: pysam.FastaFile, chroms: tuple[str] = ("#", "chrX")):
         chromsizes = fasta_open.get_reference_length()
         if "#" in chroms:
             try_chroms = [f"chr{i}" for i in range(1, 23)]
@@ -125,7 +176,11 @@ class InMemoryFasta:
         self.seqs = {}
         for chrom in chrom_names:
             self.seqs[chrom] = fasta_open.fetch(chrom, 0, chromsizes[chrom])
+        self.references = list(self.seqs.keys())  # for compatibility with pysam.FastaFile
 
     def fetch(self, chrom: str, start: str, end: str) -> str:
         seq = self.seqs[chrom]
         return seq[start:end]
+
+    def get_reference_length(self, chrom: str) -> int:
+        return len(self.seqs[chrom])

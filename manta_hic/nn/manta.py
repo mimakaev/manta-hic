@@ -28,7 +28,7 @@ from manta_hic.ops.hic_ops import (
     create_expected_matrix,
     hic_hierarchical_loss,
 )
-from manta_hic.ops.seq_ops import make_seq_1hot
+from manta_hic.ops.seq_ops import make_seq_1hot, open_fasta_chromsizes
 from manta_hic.ops.tensor_ops import list_to_tensor_batch
 from manta_hic.training_meta import assign_fold_type
 
@@ -214,21 +214,21 @@ class MicrozoiStochasticActivationFetcher(object):
 
 def populate_microzoi_cache(
     cache_path,
-    params_file,
     modfile,
-    fasta_open,
-    chromsizes,
+    fasta,
+    chroms=("#", "chrX"),
+    params_file=None,
     N_runs=16,
-    crop_mha_range=(768, 1024),
+    crop_mha_range=(640, 1024),
     max_shift_bp=128,
     batch_size=4,
     n_channels=1024 + 8,
-    device="cuda",
+    device="cuda:0",
 ):
     """
-    Populate a single HDF5 file with MicroZoi activations for N_runs of random parameters.
-    Instead of storing per-block, we create one dataset per chromosome & orientation,
-    of shape [n_channels, total_bins], and fill it in chunks. Each run has its own group.
+    Populate a single HDF5 file with MicroZoi activations for N_runs of random parameters. Instead of storing
+    per-block, we create one dataset per chromosome & orientation, of shape [n_channels, total_bins], and fill it in
+    chunks. Each run has its own group.
 
     For each (run, chrom, orientation), we:
       - Round the chromsize down to a multiple of BIN_BP
@@ -248,12 +248,14 @@ def populate_microzoi_cache(
     ----------
     cache_path : str
         Path to the HDF5 cache file to create.
-    folder : str
-        Directory containing params.json for the MicroBorzoi model.
     modfile : str
         Path to the model file (e.g. "model.pt").
-    chromsizes : dict
-        {chrom_name: chrom_length} dictionary.
+    fasta: str or pysam.FastaFile
+        Path to the FASTA file or an open handle.
+    chroms: list of str
+        List of chromosome names to populate the cache for.
+    params_file : str
+        Path to the JSON file with model parameters. Defaults to None (default parameters).
     N_runs : int
         Number of runs (distinct random shifts, offsets, crop sizes) to store.
     crop_mha_range : tuple of int
@@ -266,11 +268,27 @@ def populate_microzoi_cache(
         Expected number of channels returned by the model. Default is 1024+8=1032.
     device : str
         Torch device to load model and do computations.
+
+    Notes
+    -----
+    Crop_mha range starts at 640 bins. The reason for that is that 640 bins allows for creating a mutation that
+    affects only one tile. Since 768 is the quarter of the receptive field, we would crop two quarters from each side,
+    and overhangs of neighboring tiles would "meet" in the center of the current tile. A smaller crop_mha of 640
+    leaves 256 bins in the center of the tile, which is where a mutation should be placed to affect only one tile. We
+    are including 640 bins in here so that the model would know about this crop_mha size and would do mutational
+    screens well.
+
     """
 
     # Load the microzoi model
 
-    params = json.load(open(params_file, "r"))
+    fasta_open, chromsizes = open_fasta_chromsizes(fasta, chroms)
+
+    if params_file is None:
+        params = {"model": {}}  # default parameters
+    else:
+        params = json.load(open(params_file, "r"))
+
     base_model = MicroBorzoi(return_type="mha", **params["model"]).to(device)
     sd = torch.load(modfile, map_location=device, weights_only=True)
     base_model.load_state_dict(sd, strict=False)
@@ -327,7 +345,7 @@ def populate_microzoi_cache(
                         ds_name,
                         shape=(n_channels, total_bins),
                         dtype=np.float16,
-                        compression=hdf5plugin.Zstd(clevel=6),
+                        compression=hdf5plugin.Zstd(clevel=12),
                         chunks=(n_channels, min(1024, total_bins)),
                     )
 
