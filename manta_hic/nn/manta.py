@@ -1,7 +1,6 @@
 import datetime as dt
 import io
 import json
-import os
 import queue
 import threading
 from contextlib import nullcontext
@@ -308,7 +307,7 @@ def populate_microzoi_cache(
 
         # Save the entire model as a single blob
         with io.BytesIO() as buffer:
-            torch.save(base_model, buffer)
+            torch.save(base_model.state_dict(), buffer)
             buffer.seek(0)
             model_bytes = np.frombuffer(buffer.read(), dtype=np.uint8)
         f.create_dataset("model_blob", data=model_bytes)
@@ -392,7 +391,7 @@ def populate_microzoi_cache(
                         raise RuntimeError("Didn't fill the entire dataset - mismatch between chunking and total_bins.")
 
 
-def create_microzoi_model_from_cache(cache_path, device="cuda"):
+def create_microzoi_model_from_cache(cache_path, device="cuda", return_type="mha", **kwargs):
     """
     Create a MicroZoi (MicroBorzoi) model from the 'model_blob' recorded in the HDF5 cache file.
     This re-creates the exact Torch model used to produce the cached activations.
@@ -403,6 +402,8 @@ def create_microzoi_model_from_cache(cache_path, device="cuda"):
         Path to the HDF5 file created by populate_microzoi_cache.
     device : str
         Torch device.
+    kwargs : dict
+        Additional keyword arguments to pass to the MicroBorzoi constructor.
 
     Returns
     -------
@@ -411,9 +412,15 @@ def create_microzoi_model_from_cache(cache_path, device="cuda"):
     """
     with h5py.File(cache_path, "r") as f:
         model_bytes = f["model_blob"][:].tobytes()
+        params = json.loads(f.attrs["model_params"])
 
-    with io.BytesIO(model_bytes) as buf:
-        model = torch.load(buf, map_location=device, weights_only=False)
+    # combine model parameters
+    mod_args = params["model"]
+    mod_args.update(kwargs)
+    mod_args.update({"return_type": return_type})
+
+    model = MicroBorzoi(**mod_args).to(device)
+    model.load_state_dict(torch.load(io.BytesIO(model_bytes), map_location=device, weights_only=True))
     model.eval()
     return model
 
