@@ -51,6 +51,7 @@ def _expand(ar: torch.Tensor) -> torch.Tensor:
 
 
 # Borrowed from cooltools.lib.numutils but rewrote in torch
+@torch.no_grad()
 def adaptive_coarsegrain_torch(
     ar: torch.Tensor,
     countar: torch.Tensor,
@@ -168,6 +169,7 @@ def adaptive_coarsegrain_torch(
     return ar_next  # [B, C, N, N]
 
 
+@torch.no_grad()
 def create_expected_matrix(
     snippet: torch.Tensor,
     weight: torch.Tensor,
@@ -328,18 +330,17 @@ def hic_hierarchical_loss(
     return loss
 
 
-def hic_spearman_corr(
+@torch.no_grad()
+def hic_corrs(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Computes the Spearman rank correlation between corresponding Hi-C matrices.
+    Computes Spearman rank correlation, Pearson correlation, and mean squared difference (MSD)
+    between corresponding Hi-C matrices.
 
-    This function calculates the Spearman rank correlation between corresponding matrices in two tensors, excluding
-    any positions where either matrix has zero or non-finite values. It returns a tensor containing the Spearman
-    correlation coefficients for each batch and channel pair.
-
-    This solution is preferred to a fully vectorized one as it is about twice faster for 1000x1000 matrices.
+    This function calculates the correlations and MSD between corresponding matrices in two tensors,
+    excluding any positions where either matrix has zero or non-finite values.
 
     Parameters
     ----------
@@ -350,8 +351,11 @@ def hic_spearman_corr(
 
     Returns
     -------
-    torch.Tensor
-        Tensor of Spearman rank correlations for each batch and channel. Shape [B, C].
+    (spearman_corr, pearson_corr, msd) : tuple of torch.Tensor
+        Each of shape [B, C], containing:
+          spearman_corr: Spearman rank correlations
+          pearson_corr: Pearson correlations
+          msd: mean squared differences
     """
     B, C, N, _ = mat1.shape
     mat1 = mat1.reshape(B * C, N * N)
@@ -360,9 +364,9 @@ def hic_spearman_corr(
     # Create mask of valid positions where both matrices have non-zero, finite values
     valid_mask = (mat1 != 0) & (mat2 != 0) & torch.isfinite(mat1) & torch.isfinite(mat2)
 
-    spearman_corr = torch.empty(
-        B * C, device=mat1.device, dtype=torch.float32
-    )  # Tensor to store correlation coefficients
+    spearman_corr = torch.empty(B * C, device=mat1.device, dtype=torch.float32)
+    pearson_corr = torch.empty(B * C, device=mat1.device, dtype=torch.float32)
+    msd = torch.empty(B * C, device=mat1.device, dtype=torch.float32)
 
     for i in range(B * C):
         x = mat1[i][valid_mask[i]]
@@ -370,29 +374,43 @@ def hic_spearman_corr(
 
         if x.numel() == 0:
             spearman_corr[i] = float("nan")
+            pearson_corr[i] = float("nan")
+            msd[i] = float("nan")
             continue
 
-        # Compute ranks (approximate, ties are not handled)
+        # Ranks for Spearman (approximate, ties are not handled)
         rx = torch.zeros_like(x).float()
         ry = torch.zeros_like(y).float()
-
         rx[torch.sort(x)[1]] = torch.arange(len(x), dtype=torch.float32, device=mat1.device)
         ry[torch.sort(y)[1]] = torch.arange(len(y), dtype=torch.float32, device=mat1.device)
 
-        # Compute Pearson correlation between ranks
-        cov = ((rx - rx.mean()) * (ry - ry.mean())).mean()
-        spearman_corr[i] = cov / (rx.std() * ry.std() + 1e-8)
+        # Spearman via Pearson on ranks
+        cov_s = ((rx - rx.mean()) * (ry - ry.mean())).mean()
+        spearman_corr[i] = cov_s / (rx.std() * ry.std() + 1e-8)
 
-    return spearman_corr.view(B, C)
+        # Pearson
+        cov_p = ((x - x.mean()) * (y - y.mean())).mean()
+        pearson_corr[i] = cov_p / (x.std() * y.std() + 1e-8)
+
+        # Mean squared difference
+        msd[i] = (x / y).log().square().mean()
+
+    return (
+        spearman_corr.view(B, C),
+        pearson_corr.view(B, C),
+        msd.view(B, C),
+    )
 
 
-def coarsegrained_spearman_corr(
+@torch.no_grad()
+def coarsegrained_hic_corrs(
     pred_ooe: torch.Tensor,
     raw: torch.Tensor,
     weight: torch.Tensor,
     exp: torch.Tensor,
-    cutoff: int = 5,
-) -> torch.Tensor:
+    cutoff: int = 10,
+    also_divide_by_mean: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Computes Spearman rank correlations between predicted OOE and adaptively coarse-grained OOE from raw data.
 
@@ -413,12 +431,22 @@ def coarsegrained_spearman_corr(
         Expected value tensor. Shape [B, C, N * 5 / 4].
     cutoff : int, optional
         Minimum number of raw counts per pixel required to stop 2x2 pooling in adaptive coarsegraining. Default is 5.
+    also_divide_by_mean : bool, optional
+        Whether to also divide the matrices by their mean over channels (but within batch). Default is False.
 
     Returns
     -------
-    torch.Tensor
-        Spearman rank correlation coefficients between predicted OOE and adaptively coarse-grained OOE. Shape [B, C].
+    If also_divide_by_mean is False:
+        (spearman_corr, pearson_corr, msd) : tuple of torch.Tensor
+    If also_divide_by_mean is True:
+        (spearman_corr, pearson_corr, msd, spearman_corr2, pearson_corr2, msd2) : tuple of torch.Tensor
+        Each of shape [B, C], containing:
+          spearman_corr: Spearman rank correlations
+          pearson_corr: Pearson correlations
+          msd: mean squared differences
+          <something>2: Corresponding values after dividing by mean over channels
     """
+
     # Calculate expected matrix from weights and expected values
     raw, expected_matrix = create_expected_matrix(raw.clone(), weight, exp)
 
@@ -431,9 +459,16 @@ def coarsegrained_spearman_corr(
     ooe[exp_zero_mask] = 0
 
     # Apply adaptive coarsegraining to OOE values using raw counts
-    adapted_ooe = adaptive_coarsegrain_torch(ooe, raw, cutoff=cutoff)
+    adaptive_smoothed_ooe = adaptive_coarsegrain_torch(ooe, raw, cutoff=cutoff)
 
     # Compute Spearman correlation between predicted OOE and adaptively coarse-grained OOE
-    spearman_corr = hic_spearman_corr(pred_ooe, adapted_ooe)
+    corrs = hic_corrs(pred_ooe, adaptive_smoothed_ooe)
 
-    return spearman_corr
+    if also_divide_by_mean:
+        # Divide by mean over channels (but within batch) from both matrices
+        pred_ooe = pred_ooe / pred_ooe.mean(dim=1, keepdim=True)
+        adaptive_smoothed_ooe = adaptive_smoothed_ooe / adaptive_smoothed_ooe.mean(dim=1, keepdim=True)
+        corrs2 = hic_corrs(pred_ooe, adaptive_smoothed_ooe)
+        corrs = list(corrs) + list(corrs2)
+
+    return tuple(corrs)

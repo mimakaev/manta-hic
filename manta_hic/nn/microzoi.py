@@ -7,6 +7,11 @@ Main differences from Borzoi are:
 * Using modern transformer architecture with rotary embeddings and SDPA
 """
 
+import glob
+import json
+import os
+import re
+
 import h5py
 import hdf5plugin
 import numpy as np
@@ -63,7 +68,7 @@ class MicroBorzoi(nn.Module):
         self.maxpool = nn.MaxPool1d(kernel_size=2, stride=2)
 
         # Convolutional layers
-        self.conv0 = nn.Conv1d(4, ch_1d[0], kernel_size=seq_conv_width, padding=10)
+        self.conv0 = nn.Conv1d(4, ch_1d[0], kernel_size=seq_conv_width, padding=seq_conv_width // 2)
 
         self.conv_blocks = nn.ModuleList()
 
@@ -90,7 +95,7 @@ class MicroBorzoi(nn.Module):
 
         # First convolutional layer (possibly checkpointed - it's the biggest)
         first = lambda x: self.maxpool(self.conv0(x))
-        x = checkpoint(first, x, use_reentrant=True) if self.check_first else first(x)
+        x = checkpoint(first, x, use_reentrant=True) if self.check_first and self.training else first(x)
 
         # Convolutional blocks
         for conv_block in self.conv_blocks:
@@ -119,6 +124,23 @@ class MicroBorzoi(nn.Module):
             raise ValueError("Target can be hg38 or mm10")
         x = F.softplus(x)
         return x
+
+
+def load_micrizoi_from_folder(folder, device, index=None, return_type="default"):
+    """Load a MicroBorzoi model from a folder"""
+    params = json.load(open(os.path.join(folder, "params.json")))
+    # parse folder/model_{i}.pth and return the latest one
+    if index is None:
+        pattern = r"model_(\d+).pth"
+        files = os.listdir(folder)
+        index = max([int(re.search(pattern, file).group(1)) for file in files if re.search(pattern, file)])
+        print(f"Loading model from {folder}/model_{index}.pth")
+    path = os.path.join(folder, f"model_{index}.pth")
+
+    model = MicroBorzoi(return_type=return_type, **params["model"])
+    weights = torch.load(path, map_location=device, weights_only=True)
+    model.load_state_dict(weights, strict=False)
+    return model.to(device)
 
 
 def borzoi_loss(output, target, total_weight=0.2):
