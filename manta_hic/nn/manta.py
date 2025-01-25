@@ -1,15 +1,18 @@
 import datetime as dt
+import io
+import json
+import os
 import queue
 import threading
 from contextlib import nullcontext
 
 import h5py
+import hdf5plugin
 import numpy as np
 import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
 
 from manta_hic.nn.layers import (
     ConvolutionalBlock1d,
@@ -19,74 +22,612 @@ from manta_hic.nn.layers import (
     Symmetrize,
     TransformerTower,
 )
+from manta_hic.nn.microzoi import MicroBorzoi
 from manta_hic.ops.hic_ops import (
     coarsegrained_hic_corrs,
     create_expected_matrix,
     hic_hierarchical_loss,
 )
+from manta_hic.ops.seq_ops import make_seq_1hot
 from manta_hic.ops.tensor_ops import list_to_tensor_batch
 from manta_hic.training_meta import assign_fold_type
 
+MICROZOI_RECEPTIVE_FIELD = 2**19 + 2**18
+BIN_BP = 256
+CACHE_OVERHANG_BP = 2**22
 
-def fetch_activations(genome, chrom, start, end, reverse, cache_file="microzoi_cache.h5py"):
+
+def fetch_tile_microzoi_activations(
+    model,
+    fasta_open,
+    chrom,
+    start_bp,
+    end_bp,
+    reverse=False,
+    start_offset_bins=0,
+    shift_bp=0,
+    crop_mha_bins=512,
+    batch_size=4,
+):
     """
-    Fetches the cached activations for a given region.
+    Fetch MicroZoi model activations across a genomic region, optionally reversed.
 
     Parameters
     ----------
-    genome : str
-        Genome assembly (e.g. hg38).
+    model : nn.Module
+        The MicroZoi model (or compatible) that accepts a one-hot encoded sequence
+        of length `MICROZOI_RECEPTIVE_FIELD` and returns activations.
+    fasta_open : PySAM.FastaFile or compatible
+        Opened FASTA file for the reference genome.
     chrom : str
-        Chromosome name.
-    start : int
-        Start coordinate in base pairs.
-    end : int
-        End coordinate in base pairs.
-    reverse : bool
-        Whether to fetch the reverse strand.
-    cache_file : str
-        Path to the cache file.
+        Chromosome name or identifier for the region of interest.
+    start_bp : int
+        Start coordinate (inclusive) in base pairs of the region.
+    end_bp : int
+        End coordinate (exclusive) in base pairs of the region.
+    reverse : bool, optional
+        If True, fetch and process the region in reverse orientation.
+        Defaults to True.
+    start_offset_bins : int, optional
+        Number of bins to discard from the beginning of the first tile
+        in forward orientation, or from the end in reverse orientation.
+        It serves to provide alternative alignment of tiles to diversify inputs for training.
+        Defaults to 0.
+    shift_bp : int, optional
+        Shift in base pairs to apply when fetching the sequence. Does not affect
+        alignment of the output activations, only the underlying input to the model.
+        Serves to further diversify inputs.
+        Defaults to 0.
+    crop_mha_bins : int, optional
+        Number of bins to crop from each side within the model, as those are unreliable.
+        Defaults to 512.
+    batch_size : int, optional
+        Number of tiles to process in a single batch when calling `model`.
+        Defaults to 4.
+
+    Returns
+    -------
+    torch.Tensor
+        A tensor of shape `[channels, num_bins_total]`, where
+        `num_bins_total = (end_bp - start_bp) // BIN_BP`. The activations
+        are concatenated across all tiles, with offsets removed so that
+        the final coverage spans exactly the requested region.
+
+    Raises
+    ------
+    AssertionError
+        If `(end_bp - start_bp)` is not divisible by `BIN_BP`, or if
+        `start_offset_bins < 0`, or if `crop_mha_bins` is large enough
+        to make the tile size zero or negative.
+
+    Notes
+    -----
+    - Each tile is fetched with length `MICROZOI_RECEPTIVE_FIELD` bp, but
+      only the central `(MICROZOI_RECEPTIVE_FIELD - 2 * crop_mha_bins * BIN_BP)`
+      portion is used to form the output. Tiles are stepped by the usable
+      portion to maintain correct coverage and avoid off-by-one errors.
+    - When `reverse=True`, the sequence is fetched in reverse‐complement
+      order, and the final activations are returned in reverse order.
+    - If you need a NumPy array, convert the returned tensor via
+      `activations.detach().cpu().numpy()`.
     """
-    CHUNK_BP = 2**19
-    BIN_BP = 256
-    CHUNK_BINS = CHUNK_BP // BIN_BP
 
-    if start % BIN_BP != 0 or end % BIN_BP != 0:
-        raise ValueError("Start/end must be aligned to 256bp.")
-    if end <= start:
-        raise ValueError("End must be > start.")
+    assert (end_bp - start_bp) % BIN_BP == 0, "End_bp - start_bp is not divisible by bin_bp"
+    assert start_offset_bins >= 0, "start_offset_bins should be a positive number"
 
-    start_bin, end_bin = start // BIN_BP, end // BIN_BP
-    num_bins = end_bin - start_bin
-    chunk_start, chunk_end = start_bin // CHUNK_BINS, (end_bin - 1) // CHUNK_BINS
-    rng = range(chunk_start, chunk_end + 1) if not reverse else range(chunk_end, chunk_start - 1, -1)
-    suffix = "normal" if not reverse else "reverse"
+    num_bins_total = (end_bp - start_bp) // BIN_BP
+    tile_size_bins = MICROZOI_RECEPTIVE_FIELD // BIN_BP - 2 * crop_mha_bins
+    full_tile_bp = MICROZOI_RECEPTIVE_FIELD  # 786432
+    usable_tile_bp = tile_step_bp = tile_size_bins * BIN_BP
 
-    acts = []
-    with h5py.File(cache_file, "r") as f:
-        for cidx in rng:
-            cstart = cidx * CHUNK_BP
-            cend = cstart + CHUNK_BP
-            cstart_bin, cend_bin = cstart // BIN_BP, cend // BIN_BP
+    assert usable_tile_bp > 0, "Crop_mha_bins is too large"
 
-            sbin = max(start_bin, cstart_bin)
-            ebin = min(end_bin, cend_bin)
-            sl = sbin - cstart_bin
-            el = ebin - cstart_bin
-            if reverse:
-                sl, el = CHUNK_BINS - el, CHUNK_BINS - sl
+    # determining the start/end of the tiles we need to fetch
+    tile_activations_start = start_bp - start_offset_bins * BIN_BP
+    num_tiles = (num_bins_total + start_offset_bins + tile_size_bins - 1) // tile_size_bins
+    tile_activations_end = tile_activations_start + num_tiles * tile_size_bins * BIN_BP
+    end_offset_bins = num_tiles * tile_size_bins - num_bins_total - start_offset_bins
 
-            dsname = f"{genome}/{chrom}/{cstart}_{cend}_{suffix}"
-            if dsname not in f:
-                raise KeyError(f"{dsname} not found in cache.")
-            acts.append(f[dsname][:, sl:el])
+    # sequence to fetch
+    seq_start = tile_activations_start - crop_mha_bins * BIN_BP + shift_bp
+    seq_end = tile_activations_end + crop_mha_bins * BIN_BP + shift_bp
 
-    if not acts:
-        raise ValueError("No activation slices fetched. Check coordinates.")
-    out = np.concatenate(acts, axis=1).astype(np.float16)
-    if out.shape[1] != num_bins:
-        raise ValueError(f"Expected {num_bins} bins, got {out.shape[1]}")
-    return out
+    # fetch the sequence and calculate sequence tiles - if reverse, tiles are naturally in reverse order
+    # if reverse, sequence is reversed
+    seq = make_seq_1hot(fasta_open, chrom, seq_start, seq_end, reverse)  # handles negatives and overhangs already
+    tiles = [seq[i : i + full_tile_bp] for i in range(0, len(seq) - (full_tile_bp - tile_step_bp), tile_step_bp)]
+    assert len(tiles) == num_tiles
+    assert all(len(tile) == full_tile_bp for tile in tiles)
+
+    # convert tiles to batches up to batch_size long, and then to lists and then list_to_tensor_batch
+    batches = [tiles[i : i + batch_size] for i in range(0, len(tiles), batch_size)]
+    # avoid last batch of size 1 - move one element from previous batch to last - this is speedup
+    if len(batches[-1]) == 1 and len(batches) > 1 and batch_size > 2:
+        batches[-1] = [batches[-2].pop()] + batches[-1]
+    device = next(model.parameters()).device
+    batches = [list_to_tensor_batch(batch, device) for batch in batches]
+
+    # fetch activations (genome argument actually irrelevant for MHA) and cat them
+    activations = []
+    for batch in batches:
+        batch_activations = model(batch.permute(0, 2, 1), genome="hg38", offset=0, crop_mha=crop_mha_bins)  # [B, C, N]
+        # add 8 channels of x=-1...1 linear function and 3 powers of it to the activations, [B, C+8, N]
+        linear = torch.linspace(-1, 1, batch_activations.shape[2], device=device).unsqueeze(0).unsqueeze(0)
+        linear = linear.repeat(batch_activations.shape[0], 1, 1)
+        linear = torch.cat([linear.pow(i) for i in range(8)], dim=1)
+        batch_activations = torch.cat([batch_activations, linear], dim=1)
+        batch_activations = batch_activations.permute(1, 0, 2).reshape(batch_activations.shape[1], -1)  # [C, B * N]
+        activations.append(batch_activations)
+    activations = torch.cat(activations, dim=1)  # [C, num_bins_total]
+
+    # If reverse, we need to crop the correct amount of bins from the start,end
+    M = activations.shape[1]
+    if reverse:
+        activations = activations[:, end_offset_bins : M - start_offset_bins]
+    else:
+        activations = activations[:, start_offset_bins : M - end_offset_bins]
+
+    assert activations.shape[1] == num_bins_total, f"Activations shape is {activations.shape}, not {num_bins_total}"
+    return activations
+
+
+class MicrozoiStochasticActivationFetcher(object):
+    """
+    A class that fetches MicroZoi model activations across a genomic region, optionally reversed.
+
+    For each fetching, the following things are randomized:
+    * Stochastic shift in basepairs is applied up to `max_shift_bp` in both directions.
+    * The region is cropped to a random size between `crop_mha_range[0]` and `crop_mha_range[1]` bins.
+    * The offset in bins is randomized up to the size of the tile
+    """
+
+    def __init__(self, model, fasta_open, max_shift_bp=128, crop_mha_range=(512, 1024), batch_size=4):
+        self.model = model
+        self.fasta_open = fasta_open
+        self.max_shift_bp = max_shift_bp
+        self.crop_mha_range = crop_mha_range
+        self.batch_size = batch_size
+        self.model.eval()
+
+    def fetch(self, chrom, start_bp, end_bp, reverse=False):
+        """
+        Fetch MicroZoi model activations across a genomic region, with all randomizations applied.
+        """
+
+        shift_bp = np.random.randint(-self.max_shift_bp, self.max_shift_bp + 1)
+        crop_mha_bins = np.random.randint(*self.crop_mha_range)
+        offset_bins = np.random.randint(0, MICROZOI_RECEPTIVE_FIELD // BIN_BP - 2 * crop_mha_bins)
+
+        return fetch_tile_microzoi_activations(
+            self.model,
+            self.fasta_open,
+            chrom,
+            start_bp,
+            end_bp,
+            reverse=reverse,
+            start_offset_bins=offset_bins,
+            shift_bp=shift_bp,
+            crop_mha_bins=crop_mha_bins,
+            batch_size=self.batch_size,
+        )
+
+
+def populate_microzoi_cache(
+    cache_path,
+    params_file,
+    modfile,
+    fasta_open,
+    chromsizes,
+    N_runs=16,
+    crop_mha_range=(768, 1024),
+    max_shift_bp=128,
+    batch_size=4,
+    n_channels=1024 + 8,
+    device="cuda",
+):
+    """
+    Populate a single HDF5 file with MicroZoi activations for N_runs of random parameters.
+    Instead of storing per-block, we create one dataset per chromosome & orientation,
+    of shape [n_channels, total_bins], and fill it in chunks. Each run has its own group.
+
+    For each (run, chrom, orientation), we:
+      - Round the chromsize down to a multiple of BIN_BP
+      - We'll store from [-CACHE_OVERHANG_BP, chrom_len_rounded + CACHE_OVERHANG_BP)
+      - That region, in bins, is total_bins
+      - We create a dataset [n_channels, total_bins], then fill it in increments of up to e.g. 2**23 basepairs if needed
+        (but we do all chunking ourselves).
+      - We do no partial writing at the end; any leftover is just appended.
+        The final shape is always exact.
+      - We check that the returned activation shape for every piece is [n_channels, chunk_bins]
+      - If the activation shape's channels differ from n_channels, we raise an error.
+
+    We also store the entire model with torch.save() in a single "model_blob" dataset.
+    The random parameters for each run are stored in run-group attrs.
+
+    Parameters
+    ----------
+    cache_path : str
+        Path to the HDF5 cache file to create.
+    folder : str
+        Directory containing params.json for the MicroBorzoi model.
+    modfile : str
+        Path to the model file (e.g. "model.pt").
+    chromsizes : dict
+        {chrom_name: chrom_length} dictionary.
+    N_runs : int
+        Number of runs (distinct random shifts, offsets, crop sizes) to store.
+    crop_mha_range : tuple of int
+        (min_bins, max_bins). We create a linspace of length N_runs from this range for crop_mha_bins.
+    max_shift_bp : int
+        Maximum shift in basepairs (±).
+    batch_size : int
+        Batch size for fetch_tile_microzoi_activations.
+    n_channels : int
+        Expected number of channels returned by the model. Default is 1024+8=1032.
+    device : str
+        Torch device to load model and do computations.
+    """
+
+    # Load the microzoi model
+
+    params = json.load(open(params_file, "r"))
+    base_model = MicroBorzoi(return_type="mha", **params["model"]).to(device)
+    sd = torch.load(modfile, map_location=device, weights_only=True)
+    base_model.load_state_dict(sd, strict=False)
+    base_model.eval()
+
+    # We'll store crop values via a linspace
+    crop_values = np.round(np.linspace(crop_mha_range[0], crop_mha_range[1], N_runs)).astype(int)
+
+    with h5py.File(cache_path, "w") as f:
+        # Record some basic attributes
+        f.attrs["CACHE_OVERHANG_BP"] = CACHE_OVERHANG_BP
+        f.attrs["N_runs"] = N_runs
+        f.attrs["BIN_BP"] = BIN_BP
+        f.attrs["max_shift_bp"] = max_shift_bp
+        f.attrs["crop_mha_range"] = crop_mha_range
+        f.attrs["model_params"] = json.dumps(params)
+
+        # Save the entire model as a single blob
+        with io.BytesIO() as buffer:
+            torch.save(base_model, buffer)
+            buffer.seek(0)
+            model_bytes = np.frombuffer(buffer.read(), dtype=np.uint8)
+        f.create_dataset("model_blob", data=model_bytes)
+
+        for run_idx in range(N_runs):
+            run_group = f.create_group(f"run{run_idx}")
+
+            crop_mha_bins = crop_values[run_idx]
+            shift_bp = np.random.randint(-max_shift_bp, max_shift_bp + 1)
+            max_offset = (MICROZOI_RECEPTIVE_FIELD // BIN_BP) - (2 * crop_mha_bins)
+            offset_bins = np.random.randint(0, max_offset)
+
+            run_group.attrs["crop_mha_bins"] = crop_mha_bins
+            run_group.attrs["shift_bp"] = shift_bp
+            run_group.attrs["offset_bins"] = offset_bins
+
+            for chrom, chrom_len in chromsizes.items():
+                print(f"Populating {chrom} ({chrom_len}) for run {run_idx}...")
+                # Round chromosome length down to multiple of BIN_BP
+                chrom_len_rounded = (chrom_len // BIN_BP) * BIN_BP
+                start_of_chrom = -CACHE_OVERHANG_BP
+                end_of_chrom = chrom_len_rounded + CACHE_OVERHANG_BP
+                total_bp = end_of_chrom - start_of_chrom
+                total_bins = total_bp // BIN_BP
+
+                for reverse_bool in [False, True]:
+                    orientation = "reverse" if reverse_bool else "forward"
+                    ds_name = f"{chrom}_{orientation}"
+
+                    # Create dataset of shape [n_channels, total_bins]
+                    # We'll fill it in chunks of up to e.g. 2**23 basepairs if we like,
+                    # but let's do a loop in e.g. 2**23 sized increments if needed.
+                    dset = run_group.create_dataset(
+                        ds_name,
+                        shape=(n_channels, total_bins),
+                        dtype=np.float16,
+                        compression=hdf5plugin.Zstd(clevel=6),
+                        chunks=(n_channels, min(1024, total_bins)),
+                    )
+
+                    block_bp = 2**23
+                    num_blocks = (total_bp + block_bp - 1) // block_bp
+
+                    # We'll accumulate an offset in bins for writing
+                    write_bin_offset = 0
+                    for block_idx in range(num_blocks):
+                        block_start_bp = start_of_chrom + block_idx * block_bp
+                        block_end_bp = min(start_of_chrom + (block_idx + 1) * block_bp, end_of_chrom)
+                        # fetch
+                        with torch.no_grad(), torch.autocast(device):
+                            activ = fetch_tile_microzoi_activations(
+                                model=base_model,
+                                fasta_open=fasta_open,
+                                chrom=chrom,
+                                start_bp=block_start_bp,
+                                end_bp=block_end_bp,
+                                reverse=reverse_bool,
+                                start_offset_bins=offset_bins,
+                                shift_bp=shift_bp,
+                                crop_mha_bins=crop_mha_bins,
+                                batch_size=batch_size,
+                            )
+                        torch.clip_(activ, -65504, 65504)  # clip to float16 range
+                        arr = activ.cpu().numpy().astype(np.float16)
+
+                        if reverse_bool:  # reverse the array - we are saving in forward orientation
+                            arr = arr[:, ::-1]
+
+                        # Check channels
+                        if arr.shape[0] != n_channels:
+                            raise ValueError(f"Expected {n_channels} channels, got {arr.shape[0]}")
+
+                        block_bins = arr.shape[1]
+                        end_bin_offset = write_bin_offset + block_bins
+
+                        # Write to the HDF5 dataset
+                        dset[:, write_bin_offset:end_bin_offset] = arr
+                        write_bin_offset = end_bin_offset
+
+                    if write_bin_offset != total_bins:
+                        raise RuntimeError("Didn't fill the entire dataset - mismatch between chunking and total_bins.")
+
+
+def create_microzoi_model_from_cache(cache_path, device="cuda"):
+    """
+    Create a MicroZoi (MicroBorzoi) model from the 'model_blob' recorded in the HDF5 cache file.
+    This re-creates the exact Torch model used to produce the cached activations.
+
+    Parameters
+    ----------
+    cache_path : str
+        Path to the HDF5 file created by populate_microzoi_cache.
+    device : str
+        Torch device.
+
+    Returns
+    -------
+    model : MicroBorzoi
+        The MicroZoi model, loaded from the blob, set to eval mode.
+    """
+    with h5py.File(cache_path, "r") as f:
+        model_bytes = f["model_blob"][:].tobytes()
+
+    with io.BytesIO(model_bytes) as buf:
+        model = torch.load(buf, map_location=device, weights_only=False)
+    model.eval()
+    return model
+
+
+class CachedStochasticActivationFetcher(object):
+    """
+    Drop-in replacement for MicroziStochasticActivationFetcher,
+    but uses a precomputed HDF5 cache of Microzoi activations.
+
+    Implementation:
+      - We open the cache file in `fetch()`, read the top-level or run-level metadata,
+        pick a random run, then just do a simple slice from the dataset for (chrom, orientation).
+      - The user must ensure that [start_bp, end_bp) is fully contained within
+        [-CACHE_OVERHANG_BP, chrom_len_rounded + CACHE_OVERHANG_BP), and that the
+        region is aligned to BIN_BP. If not, we raise an error.
+    """
+
+    def __init__(self, cache_path):
+        """
+        Parameters
+        ----------
+        cache_path : str
+            Path to the HDF5 file with cached activations.
+        device : str
+            Torch device for returning the final tensor.
+        """
+        self.cache_path = cache_path
+        with h5py.File(self.cache_path, "r") as f:
+            self.N_runs = f.attrs["N_runs"]
+            self.cache_overhang_bp = f.attrs["CACHE_OVERHANG_BP"]
+            self.bin_bp = f.attrs["BIN_BP"]
+
+    def fetch(self, chrom, start_bp, end_bp, reverse=False):
+        """
+        Fetch cached activations for region [start_bp, end_bp).
+        start_bp, end_bp must be multiples of bin_bp, and must lie entirely
+        within the stored dataset region.
+        """
+        if (start_bp % self.bin_bp) != 0 or (end_bp % self.bin_bp) != 0:
+            raise ValueError("start_bp and end_bp must be multiples of BIN_BP")
+        run_idx = np.random.randint(self.N_runs)
+
+        orientation = "reverse" if reverse else "forward"
+        with h5py.File(self.cache_path, "r") as f:
+            run_group = f[f"run{run_idx}"]
+            ds_name = f"{chrom}_{orientation}"
+            if ds_name not in run_group:
+                raise KeyError(f"Dataset not found: run{run_idx}/{ds_name}")
+            dset = run_group[ds_name]
+
+            # The dataset covers [-cache_overhang_bp, chrom_len_rounded + cache_overhang_bp)
+            # in basepairs. So the total length in bins is dset.shape[1].
+            # The start of the region in basepairs is "start_of_chrom" = -cache_overhang_bp.
+            # Let's figure out the slice offset in bins:
+            total_bins = dset.shape[1]
+            region_start_bp = -self.cache_overhang_bp
+            region_end_bp = region_start_bp + total_bins * self.bin_bp
+
+            if start_bp < region_start_bp or end_bp > region_end_bp:
+                raise ValueError(
+                    f"Requested region [{start_bp}, {end_bp}) is outside stored range "
+                    f"[{region_start_bp}, {region_end_bp})."
+                )
+
+            offset_start_bin = (start_bp - region_start_bp) // self.bin_bp
+            offset_end_bin = (end_bp - region_start_bp) // self.bin_bp
+            if offset_start_bin < 0 or offset_end_bin > total_bins:
+                raise ValueError(f"Slice in bins [{offset_start_bin}, {offset_end_bin}) is out of [0, {total_bins}).")
+
+            arr = dset[:, offset_start_bin:offset_end_bin]
+            if reverse:  # reverse the array - we are saving in forward orientation
+                arr = arr[:, ::-1].copy()
+
+        return arr
+
+
+class HybridCachedStochasticFetcher:
+    """
+    A combined fetcher that, on each fetch, does one of the following:
+      1) With probability prob_stochastic, calls a fallback (stochastic) fetcher,
+         which we automatically build from the HDF5 cache attributes if not provided.
+      2) With probability prob_mean, picks a distinct subset of runs (2..max_mean_runs, no replacement) from the cache,
+         and returns their elementwise mean.
+      3) Otherwise, returns a single-run cached activation.
+
+    The fallback fetcher is auto-initialized from:
+        - The microzoi model saved in the cache (via model_blob)
+        - The max_shift_bp from cache attrs
+        - The crop_mha_range from cache attrs
+        - The user-provided fasta_open and batch_size
+        etc.
+
+    Parameters
+    ----------
+    cache_path : str
+        Path to the HDF5 file with cached Microzoi activations (and attributes).
+    fasta_open : pysam.FastaFile or similar
+        FASTA handle for fallback fetcher (model inference).
+    prob_mean : float
+        Probability of returning the mean over multiple runs from the cache.
+    max_mean_runs : int
+        Maximum number of runs to average over. We pick a random n in [2, max_mean_runs],
+        distinct runs for that average.
+    """
+
+    def __init__(
+        self,
+        cache_path,
+        fasta_open,
+        prob_mean=0.1,
+        max_mean_runs=4,
+    ):
+        self.cache_path = cache_path
+        self.fasta_open = fasta_open
+        self.prob_mean = prob_mean
+        self.max_mean_runs = max_mean_runs
+
+        # Open cache, read the relevant attributes, and build the fallback fetcher automatically
+        with h5py.File(self.cache_path, "r") as f:
+            self.N_runs = f.attrs["N_runs"]
+
+    def fetch(self, chrom, start_bp, end_bp, reverse=False):
+        """
+        Fetch activations for [start_bp, end_bp). With probability prob_stochastic, we use the fallback fetcher;
+        with probability prob_mean, we average multiple runs from the cache; else, pick a single run from the cache.
+
+        Parameters
+        ----------
+        chrom : str
+            Chromosome name.
+        start_bp : int
+            Start coordinate (multiple of bin_bp).
+        end_bp : int
+            End coordinate (multiple of bin_bp).
+        reverse : bool, optional
+            If True, return reversed orientation.
+
+        Returns
+        -------
+        torch.Tensor
+            Activation of shape [channels, bins].
+        """
+        r = np.random.rand()
+
+        if r < self.prob_mean:
+            # Multi-run average
+            max_distinct = min(self.max_mean_runs, self.N_runs)
+            if max_distinct < 2:
+                # fallback to single-run if not enough runs in the cache
+                return self._fetch_cached([0], chrom, start_bp, end_bp, reverse)
+            n_runs_to_avg = np.random.randint(2, max_distinct + 1)
+            run_indices = np.random.choice(self.N_runs, size=n_runs_to_avg, replace=False)
+            return self._fetch_cached(run_indices, chrom, start_bp, end_bp, reverse)
+
+        else:
+            # Single-run from the cache
+            run_idx = np.random.randint(self.N_runs)
+            return self._fetch_cached([run_idx], chrom, start_bp, end_bp, reverse)
+
+    def _fetch_cached(self, run_indices, chrom, start_bp, end_bp, reverse):
+        """
+        Fetch (and possibly average) cached activations from the given run indices.
+
+        Parameters
+        ----------
+        run_indices : list of int
+            Run indices to average over. If length==1, returns that run's data.
+        chrom, start_bp, end_bp, reverse : as above
+
+        Returns
+        -------
+        torch.Tensor
+            Activation of shape [channels, bins].
+        """
+        orientation = "reverse" if reverse else "forward"
+
+        arr_accum = None
+        with h5py.File(self.cache_path, "r") as f:
+            region_start_bp = -CACHE_OVERHANG_BP
+            for i, run_idx in enumerate(run_indices):
+                run_group = f[f"run{run_idx}"]
+                ds_name = f"{chrom}_{orientation}"
+                if ds_name not in run_group:
+                    raise KeyError(f"Dataset not found: run{run_idx}/{ds_name}")
+                dset = run_group[ds_name]
+
+                total_bins = dset.shape[1]
+                region_end_bp = region_start_bp + total_bins * BIN_BP
+                if start_bp < region_start_bp or end_bp > region_end_bp:
+                    raise ValueError(
+                        f"Requested region [{start_bp}, {end_bp}) is outside stored range "
+                        f"[{region_start_bp}, {region_end_bp})."
+                    )
+                offset_start_bin = (start_bp - region_start_bp) // BIN_BP
+                offset_end_bin = (end_bp - region_start_bp) // BIN_BP
+
+                arr = dset[:, offset_start_bin:offset_end_bin]
+                # Because you stored each orientation in forward orientation,
+                # but labeled it "chrom_reverse" or "chrom_forward",
+                # we keep the final flip if reverse to replicate the original fetcher logic.
+                if reverse:
+                    arr = arr[:, ::-1]
+
+                arr = arr.astype(np.float32)
+                if arr_accum is None:
+                    arr_accum = arr
+                else:
+                    arr_accum += arr
+        if len(run_indices) > 1:
+            arr_accum /= float(len(run_indices))
+        return arr_accum
+
+
+class SequenceFetcher(object):
+    """
+    A class that fetches sequences from a FASTA file, rather than intermediate activations.
+
+    It can be used for "one shot" models that do not use transfer learning, like Akita.
+    Accepts optional "max_shift_bp" argument to apply a random shift in basepairs.
+    """
+
+    def __init__(self, fasta_open, max_shift_bp=128):
+        self.fasta_open = fasta_open
+        self.max_shift_bp = max_shift_bp
+
+    def fetch(self, chrom, start_bp, end_bp, reverse=True):
+        """
+        Fetch a sequence from a FASTA file, optionally reversed.
+        """
+
+        shift_bp = np.random.randint(-self.max_shift_bp, self.max_shift_bp + 1)
+        return make_seq_1hot(self.fasta_open, chrom, start_bp + shift_bp, end_bp + shift_bp, reverse).T
 
 
 class HiCDataset:
@@ -96,40 +637,23 @@ class HiCDataset:
     ----------
     filename : str
         Path to the HDF5 file containing Hi-C data.
+    fetcher : CachedStochasticActivationFetcher or other fetcher defined above
+        A fetcher object that can retrieve activations for a given region.
     nbins : int
         Number of bins to use for Hi-C data slices.
-    hic_res : int
-        Resolution of Hi-C data in base pairs.
     pad : int
         Padding to add around Hi-C data slices.
+    genome : str
+        Genome name for the dataset - used to assign fold types.
     test_fold : str, optional
         Name of the fold to use for testing data (default is "fold3").
     val_fold : str, optional
         Name of the fold to use for validation data (default is "fold4").
-    training : bool, optional
-        Whether to use the dataset for training (default is True).
+    fold_types_use : Iterable[str] | None, optional
+        Which fold-types to use for the dataset (default is ["train"]). None uses everything.
     random : bool, optional
         Whether to use random starting positions for Hi-C data slices (default is True).
-    cache_file : str, optional
-        Path to the cache file for storing intermediate results (default is "../data_ssd/microzoi_cache.h5py").
-    Attributes
-    ----------
-    filename : str
-        Path to the HDF5 file containing Hi-C data.
-    nbins : int
-        Number of bins to use for Hi-C data slices.
-    hic_res : int
-        Resolution of Hi-C data in base pairs.
-    pad : int
-        Padding to add around Hi-C data slices.
-    random : bool
-        Whether to use random starting positions for Hi-C data slices.
-    cache_file : str
-        Path to the cache file for storing intermediate results.
-    df : polars.DataFrame
-        DataFrame containing metadata and fold information for the dataset.
-    M : int
-        Number of bins in the Hi-C data.
+
     Methods
     -------
     __len__()
@@ -138,67 +662,113 @@ class HiCDataset:
         Retrieves a sample from the dataset at the specified index.
     get_single(idx)
         Retrieves a sample from the dataset at the specified index without random shifts or reverse.
+
+    Notes
+    -----
+
+    The Hi-C dataset class holds Hi-C data in a slightly bigger squares than the requested nbins.
+    The squares are tiled in a way that any map n_bins by n_bins can be extracted from the dataset.
+    (specifically, we save 1.25*n_bins by 1.25*n_bins squares, and save them every 0.25*n_bins).
+
+    The datasets holds 3 arrays that define a (chrom, start, end) dataframe.
+    It also saves:
+
+    *  the Hi-C data in a 3D array (index, 1.25*n_bins, 1.25*n_bins)
+    *  the weights in a 2D array (index, 1.25*n_bins)
+    *  the expected values in a 2D array (index, 1.25*n_bins)
+
+    The expected value was calculated from the entire crhomosomal arm.
     """
 
     def __init__(
         self,
         filename,
+        fetcher,
         nbins,
-        hic_res,
         pad,
+        genome,
         test_fold="fold3",
         val_fold="fold4",
-        training=True,
-        random=True,
-        cache_file="../data_ssd/microzoi_cache.h5py",
+        fold_types_use=("train",),
+        stochastic_offset=True,
+        stochastic_reverse=True,
     ):
         self.filename = filename
         self.nbins = nbins
-        self.hic_res = hic_res
         self.pad = pad
-        self.random = random
-        self.cache_file = cache_file
+        self.stochastic_offset = stochastic_offset
+        self.stochastic_reverse = stochastic_reverse
+        self.fetcher = fetcher
 
         with h5py.File(filename, "r") as f:
             df = pl.DataFrame({"chrom": f["chrom"][:], "start": f["start"][:], "end": f["end"][:]})
             self.M = f["hic"].shape[-1]
-        df = df.with_columns(pl.col("chrom").cast(str))
-        # verify that end-start = hic_res * nbins
-        # assert (df["end"] - df["start"] == hic_res * nbins).all()
+            self.hic_res = (f["end"][0] - f["start"][0]) // self.M  # infer Hi-C resolution from the matrix size
 
-        df = assign_fold_type(df, test_fold=test_fold, val_fold=val_fold, genome="hg38")
-        df = df.with_columns(pl.int_range(pl.len()).alias("index"))
-        if training:
-            df = df.filter(pl.col("fold_type") == "train")
-        else:
-            df = df.filter(pl.col("fold_type") == "test")
+        df = df.with_columns(pl.col("chrom").cast(str), pl.int_range(pl.len()).alias("index"))
+        df = assign_fold_type(df, test_fold=test_fold, val_fold=val_fold, genome=genome)
+
+        if fold_types_use:
+            df = df.filter(pl.col("fold_type").is_in(fold_types_use))
+
         self.df = df
+
+    def get_slice_by_index(self, idx, offset_bins=0, reverse=False):
+        row = self.df.row(idx, named=True)
+        orig_idx = row["index"]
+        map_start_bp = row["start"] + offset_bins * self.hic_res
+        map_end_bp = map_start_bp + self.nbins * self.hic_res
+        fetch_start_bp = map_start_bp - self.pad * self.hic_res
+        fetch_end_bp = map_end_bp + self.pad * self.hic_res
+
+        with h5py.File(self.filename, "r") as f:
+            offset_slice = slice(offset_bins, offset_bins + self.nbins)
+            hic_slice = f["hic"][orig_idx, :, offset_slice, offset_slice]
+            weight_slice = f["weights"][orig_idx, :, offset_slice]
+            exp = f["exp"][orig_idx]
+        if reverse:
+            hic_slice = hic_slice[:, ::-1, ::-1].copy()
+            weight_slice = weight_slice[:, ::-1].copy()
+
+        activations = self.fetcher.fetch(row["chrom"], fetch_start_bp, fetch_end_bp, reverse=reverse)
+
+        result = {
+            "acts": activations,
+            "hic_slice": hic_slice,
+            "weight_slice": weight_slice,
+            "exp": exp,
+            "chrom": row["chrom"],
+            "fetch_start_bp": fetch_start_bp,
+            "fetch_end_bp": fetch_end_bp,
+            "map_start_bp": map_start_bp,
+            "map_end_bp": map_end_bp,
+            "reverse": reverse,
+        }
+
+        return result
+
+    def get_slice_by_coords(self, chrom, start_bp, reverse=False):
+        """
+        Finds which record does the given coordinates belong to and returns the slice.
+        If record is not found (usually if it crosses the centromere) raise an error.
+        """
+        end_bp = start_bp + self.nbins * self.hic_res
+        df = self.df.filter((pl.col("chrom") == chrom) & (pl.col("start") <= start_bp) & (pl.col("end") >= end_bp))
+        if len(df) == 0:
+            raise ValueError("Region not found in the dataset")
+        row = df.row(0, named=True)
+        if (start_bp - row["start"]) % self.hic_res != 0:
+            raise ValueError("Start bp is not multiple of hic resolution")
+        offset = (start_bp - row["start"]) // self.hic_res
+        return self.get_slice_by_index(row["index"], offset_bins=offset, reverse=reverse)
 
     def __len__(self):
         return len(self.df)
 
-    def __getitem__(self, idx, stochastic_reverse=True):
-        row = self.df.row(idx, named=True)
-        orig_idx = row["index"]
-        start = np.random.randint(0, self.M - self.nbins) if self.random else 0
-        start_bp = row["start"] + start * self.hic_res - self.pad * self.hic_res
-        end_bp = start_bp + self.nbins * self.hic_res + 2 * self.pad * self.hic_res
-        use_reverse = stochastic_reverse and np.random.rand() > 0.5
-
-        with h5py.File(self.filename, "r") as f:
-            hic_slice = f["hic"][orig_idx, :, start : start + self.nbins, start : start + self.nbins]
-            weightmat = f["weights"][orig_idx, :, start : start + self.nbins]
-            exp = f["exp"][orig_idx]
-        if use_reverse:
-            hic_slice = hic_slice[:, ::-1, ::-1].copy()
-            weightmat = weightmat[:, ::-1].copy()
-
-        interms = fetch_activations("hg38", row["chrom"], start_bp, end_bp, use_reverse, self.cache_file)
-        return interms, hic_slice, weightmat, exp
-
-    def get_single(self, idx):
-        # direct snippet fetch, no random shifts or reverse
-        return self.__getitem__(idx, stochastic_reverse=False)
+    def __getitem__(self, idx):
+        offset_bins = np.random.randint(0, self.M - self.nbins) if self.stochastic_offset else 0
+        use_reverse = self.stochastic_reverse and np.random.rand() > 0.5
+        return self.get_slice_by_index(idx, offset_bins=offset_bins, reverse=use_reverse)
 
 
 class ThreadedDataLoader:
@@ -242,8 +812,7 @@ class ThreadedDataLoader:
             if len(batch) < self.batch_size:
                 break
             # transpose so that interms, hic_slice, weightmat, exp become separate lists
-            batch_t = list(map(list, zip(*batch)))
-            self.q.put(tuple(batch_t))
+            self.q.put(tuple(batch))
         self.q.put(None)
 
     def __iter__(self):
@@ -260,7 +829,7 @@ class ThreadedDataLoader:
         return ([i] for i in self.dataset.get_single(idx))
 
 
-def run_epoch(model, dataloader, device, is_train=True, optimizer=None, scaler=None):
+def run_epoch(model, dataloader, fetcher, device, is_train=True, optimizer=None, scaler=None):
     corrs = []
 
     model.train() if is_train else model.eval()
@@ -268,24 +837,28 @@ def run_epoch(model, dataloader, device, is_train=True, optimizer=None, scaler=N
     for batch in dataloader:
         t0 = dt.datetime.now()
 
-        batch = [list_to_tensor_batch(i, device) for i in batch]
-        acts, target, weight, exp = batch
-        if is_train:
-            acts.requires_grad = True
-
+        acts = list_to_tensor_batch([i["acts"] for i in batch], device)
+        target = list_to_tensor_batch([i["hic_slice"] for i in batch], device)
+        weight = list_to_tensor_batch([i["weight_slice"] for i in batch], device)
+        exp = list_to_tensor_batch([i["exp"] for i in batch], device)
         target, weightmat = create_expected_matrix(target, weight, exp)
 
-        if is_train:
-            optimizer.zero_grad()
+        # calculating activations
 
-        with autocast(device_type="cuda"), torch.no_grad() if not is_train else nullcontext():
-            output = model(acts)
+        with torch.autocast("cuda"):
+
             if is_train:
-                loss = hic_hierarchical_loss(output, target, weightmat)
-            corr = [i.detach().cpu().numpy() for i in coarsegrained_hic_corrs(output, target, weight, exp)]
-            corr = np.array(corr)
+                acts.requires_grad = True
+                optimizer.zero_grad()
 
-        corrs.append(corr)
+            with torch.no_grad() if not is_train else nullcontext():
+                output = model(acts)
+                if is_train:
+                    loss = hic_hierarchical_loss(output, target, weightmat)
+                corr = [i for i in coarsegrained_hic_corrs(output, target, weight, exp, also_divide_by_mean=True)]
+                corr = np.array([i.detach().cpu().numpy() for i in corr])
+
+            corrs.append(corr)
 
         # Backprop/update only if training
         if is_train:
@@ -374,29 +947,30 @@ class Manta2(nn.Module):
         self,
         *,
         n_bins=1024,
-        bins_pad=64,
-        input_channels=1024,
-        channels_1d=1024,
+        bins_pad=128,
+        input_channels=1024 + 8,
+        channels_1d=512,
         tower_height=2,
-        transformer_layers=10,
+        transformer_layers=8,
         transformer_dropout=0.4,
-        transformer_n_heads=16,
-        direct_2d_input_channels=128,
-        direct_2d_input_width=5,
-        direct_2d_channels=64,
-        tower_2d_input_channels=256,
-        tower_2d_input_width=11,
-        tower_2d_channels=64,
-        tower_2d_width=9,
+        transformer_n_heads=8,
+        direct_2d_input_channels=64,
+        direct_2d_channels=48,
+        tower_2d_input_channels=96,
+        tower_2d_channels=48,
+        tower_2d_width=5,
         tower_2d_dropout=0.2,
-        tower_2d_height=8,
-        final_channels=64,
+        tower_2d_height=9,
+        final_channels=32,
         output_channels=2,
     ):
         super(Manta2, self).__init__()
         self.n_bins = n_bins
         self.bins_pad = bins_pad
         self.channels_1d = channels_1d
+
+        if final_channels < 2.5 * output_channels:
+            raise ValueError("Final channels must be at least 2.5 times the output channels.")
 
         # Precompute distance matrices for full (n_bins x n_bins) and half ((n_bins//2) x (n_bins//2))
         dist_mat_full = calculate_distance_matrix(n_bins)
@@ -405,7 +979,7 @@ class Manta2(nn.Module):
         self.register_buffer("dist_mat_half", dist_mat_half, persistent=False)
 
         # 1D backbone
-        self.first_conv_1d = nn.Conv1d(input_channels, channels_1d, kernel_size=5, padding=2)
+        self.first_conv_1d = nn.Conv1d(input_channels, channels_1d, kernel_size=3, padding=1)
         self.maxpool1d = nn.MaxPool1d(kernel_size=2, stride=2)
 
         # Multiple conv blocks + pooling
@@ -425,16 +999,12 @@ class Manta2(nn.Module):
         # Direct 2D branch
         # Reserve some channels for the extra distance/upper-lower features in FeaturesTo2D
         self.conv_direct_1d = ConvolutionalBlock1d(channels_1d, 2 * direct_2d_input_channels - 8, 1)
-        self.features_to_2d_direct = FeaturesTo2D(
-            direct_2d_input_channels, direct_2d_channels, kernel_size=direct_2d_input_width
-        )
+        self.features_to_2d_direct = FeaturesTo2D(direct_2d_input_channels, direct_2d_channels, kernel_size=3)
 
         # Tower 2D branch
         self.conv_tower_1d = ConvolutionalBlock1d(channels_1d, 2 * tower_2d_input_channels - 8, 1)
         self.maxpool1d_tower = nn.MaxPool1d(kernel_size=2, stride=2)
-        self.features_to_2d_tower = FeaturesTo2D(
-            tower_2d_input_channels, tower_2d_channels, kernel_size=tower_2d_input_width
-        )
+        self.features_to_2d_tower = FeaturesTo2D(tower_2d_input_channels, tower_2d_channels, kernel_size=3)
 
         # Residual dilated tower
         self.residual_dilated_tower = FibonacciResidualTower(
@@ -447,9 +1017,9 @@ class Manta2(nn.Module):
         self.gn_deconv = nn.GroupNorm(tower_2d_channels // 8, tower_2d_channels)
 
         # Final join
-        self.join_conv = ConvolutionalBlock2d(direct_2d_channels + tower_2d_channels, final_channels, kernel_size=5)
+        self.join_conv = ConvolutionalBlock2d(direct_2d_channels + tower_2d_channels, final_channels, kernel_size=3)
         self.join_conv_2 = ConvolutionalBlock2d(final_channels, final_channels // 2, kernel_size=5, groups=4)
-        self.final_conv = nn.Conv2d(final_channels // 2, output_channels, kernel_size=5, padding=2)
+        self.final_conv = nn.Conv2d(final_channels // 2, output_channels, kernel_size=3, padding=2)
 
         # Symmetrization helper
         self.symm = Symmetrize()

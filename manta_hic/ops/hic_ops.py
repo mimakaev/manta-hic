@@ -408,7 +408,8 @@ def coarsegrained_hic_corrs(
     raw: torch.Tensor,
     weight: torch.Tensor,
     exp: torch.Tensor,
-    cutoff: int = 5,
+    cutoff: int = 10,
+    also_divide_by_mean: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Computes Spearman rank correlations between predicted OOE and adaptively coarse-grained OOE from raw data.
@@ -430,15 +431,22 @@ def coarsegrained_hic_corrs(
         Expected value tensor. Shape [B, C, N * 5 / 4].
     cutoff : int, optional
         Minimum number of raw counts per pixel required to stop 2x2 pooling in adaptive coarsegraining. Default is 5.
+    also_divide_by_mean : bool, optional
+        Whether to also divide the matrices by their mean over channels (but within batch). Default is False.
 
     Returns
     -------
-    (spearman_corr, pearson_corr, msd) : tuple of torch.Tensor
+    If also_divide_by_mean is False:
+        (spearman_corr, pearson_corr, msd) : tuple of torch.Tensor
+    If also_divide_by_mean is True:
+        (spearman_corr, pearson_corr, msd, spearman_corr2, pearson_corr2, msd2) : tuple of torch.Tensor
         Each of shape [B, C], containing:
           spearman_corr: Spearman rank correlations
           pearson_corr: Pearson correlations
           msd: mean squared differences
+          <something>2: Corresponding values after dividing by mean over channels
     """
+
     # Calculate expected matrix from weights and expected values
     raw, expected_matrix = create_expected_matrix(raw.clone(), weight, exp)
 
@@ -456,4 +464,11 @@ def coarsegrained_hic_corrs(
     # Compute Spearman correlation between predicted OOE and adaptively coarse-grained OOE
     corrs = hic_corrs(pred_ooe, adaptive_smoothed_ooe)
 
-    return corrs
+    if also_divide_by_mean:
+        # Divide by mean over channels (but within batch) from both matrices
+        pred_ooe = pred_ooe / pred_ooe.mean(dim=1, keepdim=True)
+        adaptive_smoothed_ooe = adaptive_smoothed_ooe / adaptive_smoothed_ooe.mean(dim=1, keepdim=True)
+        corrs2 = hic_corrs(pred_ooe, adaptive_smoothed_ooe)
+        corrs = list(corrs) + list(corrs2)
+
+    return tuple(corrs)
