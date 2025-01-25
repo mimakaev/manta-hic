@@ -353,6 +353,12 @@ def populate_microzoi_cache(
 
                     # We'll accumulate an offset in bins for writing
                     write_bin_offset = 0
+
+                    def write_item(dset, idx, idx2, data):
+                        dset[:, idx:idx2] = data
+
+                    last_thread = None
+
                     for block_idx in range(num_blocks):
                         block_start_bp = start_of_chrom + block_idx * block_bp
                         block_end_bp = min(start_of_chrom + (block_idx + 1) * block_bp, end_of_chrom)
@@ -383,12 +389,20 @@ def populate_microzoi_cache(
                         block_bins = arr.shape[1]
                         end_bin_offset = write_bin_offset + block_bins
 
+                        if last_thread is not None:
+                            last_thread.join()
+
                         # Write to the HDF5 dataset
-                        dset[:, write_bin_offset:end_bin_offset] = arr
+                        # dset[:, write_bin_offset:end_bin_offset] = arr
+                        last_thread = threading.Thread(
+                            target=write_item, args=(dset, write_bin_offset, end_bin_offset, arr)
+                        )
+                        last_thread.start()
                         write_bin_offset = end_bin_offset
 
                     if write_bin_offset != total_bins:
                         raise RuntimeError("Didn't fill the entire dataset - mismatch between chunking and total_bins.")
+                    last_thread.join()
 
 
 def create_microzoi_model_from_cache(cache_path, device="cuda", return_type="mha", **kwargs):
