@@ -344,7 +344,7 @@ def populate_microzoi_cache(
                         ds_name,
                         shape=(n_channels, total_bins),
                         dtype=np.float16,
-                        compression=hdf5plugin.Zstd(clevel=12),
+                        compression=hdf5plugin.Zstd(clevel=9),
                         chunks=(n_channels, min(1024, total_bins)),
                     )
 
