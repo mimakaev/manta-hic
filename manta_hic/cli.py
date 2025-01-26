@@ -4,10 +4,11 @@ import click
 
 from .io.cool_io import process_mcools as process_mcools_original
 from .nn.manta import populate_microzoi_cache as fill_cache_original
+from .nn.train_manta import train_manta_click
 from .nn.train_microzoi import train_microzoi
 
 
-@click.command()
+@click.command(context_settings={"show_default": True})
 @click.option("--manifest-path", "-m", type=click.Path(exists=True), required=True, help="Path to the manifest CSV.")
 @click.option(
     "--output-folder",
@@ -27,7 +28,7 @@ def process_mcools(manifest_path, output_folder, resolutions, target_size, step_
     process_mcools_original(manifest_path, output_folder, resolutions, target_size, step_bins)
 
 
-@click.command()
+@click.command(context_settings={"show_default": True})
 @click.option("--cache-path", "-c", type=click.Path(), required=True, help="Path to the cachefile.")
 @click.option("--modfile", "-m", type=click.Path(exists=True), required=True, help="Path to the mod file.")
 @click.option("--fasta", "-f", type=click.Path(exists=True), required=True, help="Path to the FASTA file.")
@@ -80,6 +81,7 @@ def train():
 
 
 train.add_command(train_microzoi)
+train.add_command(train_manta_click)
 
 
 @cli.group()

@@ -678,9 +678,9 @@ class HiCDataset:
         Path to the HDF5 file containing Hi-C data.
     fetcher : CachedStochasticActivationFetcher or other fetcher defined above
         A fetcher object that can retrieve activations for a given region.
-    nbins : int
+    n_bins : int
         Number of bins to use for Hi-C data slices.
-    pad : int
+    bins_pad : int
         Padding to add around Hi-C data slices.
     genome : str
         Genome name for the dataset - used to assign fold types.
@@ -723,8 +723,8 @@ class HiCDataset:
         self,
         filename,
         fetcher,
-        nbins,
-        pad,
+        n_bins,
+        bins_pad,
         genome,
         test_fold="fold3",
         val_fold="fold4",
@@ -733,8 +733,8 @@ class HiCDataset:
         stochastic_reverse=True,
     ):
         self.filename = filename
-        self.nbins = nbins
-        self.pad = pad
+        self.n_bins = n_bins
+        self.bins_pad = bins_pad
         self.stochastic_offset = stochastic_offset
         self.stochastic_reverse = stochastic_reverse
         self.fetcher = fetcher
@@ -742,6 +742,7 @@ class HiCDataset:
         with h5py.File(filename, "r") as f:
             df = pl.DataFrame({"chrom": f["chrom"][:], "start": f["start"][:], "end": f["end"][:]})
             self.M = f["hic"].shape[-1]
+            self.n_channels = f["hic"].shape[1]
             self.hic_res = (f["end"][0] - f["start"][0]) // self.M  # infer Hi-C resolution from the matrix size
 
         df = df.with_columns(pl.col("chrom").cast(str), pl.int_range(pl.len()).alias("index"))
@@ -756,12 +757,12 @@ class HiCDataset:
         row = self.df.row(idx, named=True)
         orig_idx = row["index"]
         map_start_bp = row["start"] + offset_bins * self.hic_res
-        map_end_bp = map_start_bp + self.nbins * self.hic_res
-        fetch_start_bp = map_start_bp - self.pad * self.hic_res
-        fetch_end_bp = map_end_bp + self.pad * self.hic_res
+        map_end_bp = map_start_bp + self.n_bins * self.hic_res
+        fetch_start_bp = map_start_bp - self.bins_pad * self.hic_res
+        fetch_end_bp = map_end_bp + self.bins_pad * self.hic_res
 
         with h5py.File(self.filename, "r") as f:
-            offset_slice = slice(offset_bins, offset_bins + self.nbins)
+            offset_slice = slice(offset_bins, offset_bins + self.n_bins)
             hic_slice = f["hic"][orig_idx, :, offset_slice, offset_slice]
             weight_slice = f["weights"][orig_idx, :, offset_slice]
             exp = f["exp"][orig_idx]
@@ -791,7 +792,7 @@ class HiCDataset:
         Finds which record does the given coordinates belong to and returns the slice.
         If record is not found (usually if it crosses the centromere) raise an error.
         """
-        end_bp = start_bp + self.nbins * self.hic_res
+        end_bp = start_bp + self.n_bins * self.hic_res
         df = self.df.filter((pl.col("chrom") == chrom) & (pl.col("start") <= start_bp) & (pl.col("end") >= end_bp))
         if len(df) == 0:
             raise ValueError("Region not found in the dataset")
@@ -805,7 +806,7 @@ class HiCDataset:
         return len(self.df)
 
     def __getitem__(self, idx):
-        offset_bins = np.random.randint(0, self.M - self.nbins) if self.stochastic_offset else 0
+        offset_bins = np.random.randint(0, self.M - self.n_bins) if self.stochastic_offset else 0
         use_reverse = self.stochastic_reverse and np.random.rand() > 0.5
         return self.get_slice_by_index(idx, offset_bins=offset_bins, reverse=use_reverse)
 
@@ -868,7 +869,7 @@ class ThreadedDataLoader:
         return ([i] for i in self.dataset.get_single(idx))
 
 
-def run_epoch(model, dataloader, fetcher, device, is_train=True, optimizer=None, scaler=None):
+def run_epoch(model, dataloader, device, is_train=True, optimizer=None, scaler=None):
     corrs = []
 
     model.train() if is_train else model.eval()
@@ -1058,7 +1059,7 @@ class Manta2(nn.Module):
         # Final join
         self.join_conv = ConvolutionalBlock2d(direct_2d_channels + tower_2d_channels, final_channels, kernel_size=3)
         self.join_conv_2 = ConvolutionalBlock2d(final_channels, final_channels // 2, kernel_size=5, groups=4)
-        self.final_conv = nn.Conv2d(final_channels // 2, output_channels, kernel_size=3, padding=2)
+        self.final_conv = nn.Conv2d(final_channels // 2, output_channels, kernel_size=1, padding=0)
 
         # Symmetrization helper
         self.symm = Symmetrize()

@@ -14,7 +14,7 @@ import numpy as np
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
-@click.command(name="microzoi")
+@click.command(name="microzoi", context_settings={"show_default": True})
 @click.option("--gpu", "-g", default="0", help="GPU number")
 @click.option("--param_file", "-p", help="JSON file with parameters file")
 @click.option("--output_folder", "-o", help="Output folder")
