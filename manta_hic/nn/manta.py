@@ -739,6 +739,10 @@ class HiCDataset:
         self.stochastic_reverse = stochastic_reverse
         self.fetcher = fetcher
 
+        allowed_fold_types = ["train", "val", "test", "discard"]
+        if fold_types_use is not None:
+            assert all(fold_type in allowed_fold_types for fold_type in fold_types_use), "Invalid fold type"
+
         with h5py.File(filename, "r") as f:
             df = pl.DataFrame({"chrom": f["chrom"][:], "start": f["start"][:], "end": f["end"][:]})
             self.M = f["hic"].shape[-1]

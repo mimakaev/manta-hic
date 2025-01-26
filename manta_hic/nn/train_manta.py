@@ -53,8 +53,8 @@ file = click.Path(exists=True, dir_okay=False)
 @click.option("--save-every", default=10, help="Save model every n epochs.")
 @click.option("--n-bins", default=1024, help="Number of bins in the Hi-C map")
 @click.option("--bins-pad", default=128, help="Number of padding bins.")
-@click.option("--test-fold", default="fold3", help="Test fold")
-@click.option("--val-fold", default="fold4", help="Validation fold")
+@click.option("--val-fold", default="fold3", help="Validation fold")
+@click.option("--test-fold", default="fold4", help="Test fold")
 def train_manta_click(
     input_file,
     cache_path,
@@ -71,8 +71,8 @@ def train_manta_click(
     save_every=10,
     n_bins=1024,
     bins_pad=128,
-    test_fold="fold3",
-    val_fold="fold4",
+    val_fold="fold3",
+    test_fold="fold4",
 ):
     if os.path.exists(output_folder):
         if overwrite:
@@ -122,8 +122,8 @@ def train_manta(
     save_every=10,
     n_bins=1024,
     bins_pad=128,
-    test_fold="fold3",
-    val_fold="fold4",
+    val_fold="fold3",
+    test_fold="fold4",
 ):
     if params is None:
         params = {}
@@ -148,12 +148,15 @@ def train_manta(
         n_bins=n_bins,
         bins_pad=bins_pad,
         genome=genome,
-        fold_types_use=[val_fold],
+        fold_types_use=["val"],
         test_fold=test_fold,
         val_fold=val_fold,
         stochastic_offset=False,
         stochastic_reverse=False,
     )
+
+    assert len(ds_train) > 0, "No training data"
+    assert len(ds_val) > 0, "No validation data"
 
     train_dl = ThreadedDataLoader(ds_train, batch_size=batch_size, shuffle=True, fraction=0.5)
     val_dl = ThreadedDataLoader(ds_val, batch_size=batch_size * 2, shuffle=False, fraction=1)
