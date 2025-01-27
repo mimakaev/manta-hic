@@ -80,6 +80,7 @@ def train_manta_click(
             shutil.rmtree(output_folder)
         else:
             raise ValueError(f"Output folder {output_folder} already exists.")
+    os.makedirs(output_folder, exist_ok=True)
 
     if params is not None:
         params = json.load(open(params))
