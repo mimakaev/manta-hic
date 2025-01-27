@@ -1013,8 +1013,8 @@ class Manta2(nn.Module):
         self.bins_pad = bins_pad
         self.channels_1d = channels_1d
 
-        if final_channels < 2.5 * output_channels:
-            raise ValueError("Final channels must be at least 2.5 times the output channels.")
+        if final_channels < 2 * output_channels:
+            raise ValueError("Final channels must be at least 2 times the output channels.")
 
         # Precompute distance matrices for full (n_bins x n_bins) and half ((n_bins//2) x (n_bins//2))
         dist_mat_full = calculate_distance_matrix(n_bins)
