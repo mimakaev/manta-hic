@@ -1,6 +1,7 @@
 import json
 import os
 import pickle
+import random
 import shutil
 from contextlib import contextmanager, nullcontext
 
@@ -48,7 +49,7 @@ file = click.Path(exists=True, dir_okay=False)
 @click.option("--work-dir", default=None, help="Working directory in a fast location to store the datafile.")
 @click.option("--overwrite", is_flag=True, help="Overwrite the output folder.")
 @click.option("--params", type=click.Path(exists=True), help="Path to the parameters file JSON file")
-@click.option("--batch-size", default=4, help="Batch size.")
+@click.option("--batch-size", default=2, help="Batch size.")
 @click.option("--lr", default=0.0001, help="Learning rate.")
 @click.option("--save-every", default=10, help="Save model every n epochs.")
 @click.option("--n-bins", default=1024, help="Number of bins in the Hi-C map")
@@ -84,7 +85,8 @@ def train_manta_click(
         params = json.load(open(params))
 
     if work_dir is not None:  # need to copy the datafile to the work_dir in a safe way
-        copied_input_file = os.path.join(work_dir, os.path.basename(input_file))
+        random_suffix = str(random.randint(0, 1000000)) + "_"
+        copied_input_file = os.path.join(work_dir, random_suffix + os.path.basename(input_file))
         manager = ephemeral_copy(input_file, copied_input_file)
     else:
         manager = nullcontext(input_file)
@@ -168,7 +170,7 @@ def train_manta(
     # microzoi (256bp) -> maxpool (512bp) -> MHA (512bp) -> last conv block + maxpool (1024bp) -> Hi-C map (1024bp))
     params["tower_height"] = int(np.round(np.log2(hic_res))) - 9
 
-    res_epoch_dict = {1024: 30, 2048: 50, 4096: 80, 8192: 100, 16384: 150}
+    res_epoch_dict = {1024: 20, 2048: 30, 4096: 40, 8192: 50, 16384: 80}
     if n_epochs == 0:
         n_epochs = res_epoch_dict[hic_res]
 
