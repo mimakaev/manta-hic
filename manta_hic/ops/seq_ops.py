@@ -4,6 +4,7 @@ Utilities for working with DNA sequences, including fast onehot and reverse comp
 
 import numpy as np
 import pysam
+from typing import Optional
 
 
 def open_fasta_chromsizes(
@@ -59,7 +60,10 @@ ar = np.zeros(256, dtype=np.int32) + 4  # 4 for unknown characters - last row is
 ar[np.array(["ACGTacgt"], dtype="S").view(np.int8)] = np.array([0, 1, 2, 3, 0, 1, 2, 3])
 
 
-def onehot_turbo(seq_string: str) -> np.ndarray:
+def onehot_turbo(
+    seq_string: str,
+    mutate: Optional[list[tuple[str, int, str] | tuple[str, int, int]]] = None,
+) -> np.ndarray:
     """
     A turbocharged make one hot function. Possibly the fastest you can do without Cython
     (will buy you a drink if you beat it). Uses coding ACGT as rows 0123, so reverse complement is just flipping.
@@ -71,6 +75,8 @@ def onehot_turbo(seq_string: str) -> np.ndarray:
 
     seq_string : str
         A string containing the DNA sequence.
+    mutate : list of tuples, optional
+        List of tuple ("replace", position, sequence) or ("invert", position, position2). Default is None.
 
     Returns
     -------
@@ -79,7 +85,16 @@ def onehot_turbo(seq_string: str) -> np.ndarray:
     """
     if not seq_string:
         return np.empty((0, 4), dtype=bool)
-    np_string = np.array([seq_string], dtype="S")
+    np_string = np.array([seq_string], dtype="S").view(dtype="S1")
+    if mutate:
+        for m in mutate:
+            if m[0] == "replace":
+                np_string[m[1] : m[1] + len(m[2])] = np.array([m[2]], dtype="S").view(dtype="S1")
+            elif m[0] == "invert":
+                np_string[m[1] : m[2]] = np_string[m[1] : m[2]][::-1]
+            else:
+                raise ValueError(f"Unknown mutation type {m[0]}.")
+
     np_int = np_string.view(np.int8)
     N = len(np_int)
     new_onehot = np.zeros((N, 5), dtype=bool)  # last row is discarded
@@ -94,7 +109,27 @@ def make_seq_1hot(
     start: int,
     end: int,
     reverse: bool = False,
+    mutate: Optional[list[tuple[str, int, str] | tuple[str, int, int]]] = None,
 ) -> np.ndarray:
+    """
+    Fetches a sequence from a genome and converts it to one-hot encoding.
+
+    Parameters
+    ----------
+    genome_open : pysam.FastaFile
+        An open pysam.FastaFile object.
+    chrm : str
+        Chromosome name.
+    start : int
+        Start position of the sequence.
+    end : int
+        End position of the sequence.
+    reverse : bool, optional
+        If True, the sequence is reverse complemented. Default is False.
+    mutate : list of tuples, optional
+        List of tuple ("replace", position, sequence) or ("invert", position, position2). Default is None.
+
+    """
 
     seq_len = end - start
 
@@ -107,7 +142,25 @@ def make_seq_1hot(
         if len(seq_dna) < seq_len:
             seq_dna += "N" * (seq_len - len(seq_dna))
 
-    seq_1hot = onehot_turbo(seq_dna)
+    # making sure mutations are not beyond the sequence, and making positions relative
+
+    mutate_new = []
+    if mutate:
+        for m in mutate:
+            if m[0] == "replace":
+                if m[1] < start:
+                    raise ValueError(f"Mutation position {m[1]} is before the sequence start {start}.")
+                if m[1] + len(m[2]) >= end:
+                    raise ValueError(f"Mutation position {m[1]} is beyond the sequence end {end}.")
+                mutate_new.append(("replace", m[1] - start, m[2]))
+            elif m[0] == "invert":
+                if m[1] < start or m[2] >= end:
+                    raise ValueError(f"Mutation positions {m[1]} and {m[2]} are beyond the sequence.")
+                mutate_new.append(("invert", m[1] - start, m[2] - start))
+            else:
+                raise ValueError(f"Unknown mutation type {m[0]}.")
+
+    seq_1hot = onehot_turbo(seq_dna, mutate=mutate_new)
     assert len(seq_1hot) == end - start
 
     if reverse:

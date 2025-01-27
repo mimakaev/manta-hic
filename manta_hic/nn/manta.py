@@ -545,11 +545,13 @@ class HybridCachedStochasticFetcher:
         cache_path,
         fasta_open,
         prob_mean=0.1,
+        min_mean_runs=2,
         max_mean_runs=4,
     ):
         self.cache_path = cache_path
         self.fasta_open = fasta_open
         self.prob_mean = prob_mean
+        self.min_mean_runs = min_mean_runs
         self.max_mean_runs = max_mean_runs
 
         # Open cache, read the relevant attributes, and build the fallback fetcher automatically
@@ -582,10 +584,11 @@ class HybridCachedStochasticFetcher:
         if r < self.prob_mean:
             # Multi-run average
             max_distinct = min(self.max_mean_runs, self.N_runs)
+            min_distinct = self.min_mean_runs
             if max_distinct < 2:
                 # fallback to single-run if not enough runs in the cache
                 return self._fetch_cached([0], chrom, start_bp, end_bp, reverse)
-            n_runs_to_avg = np.random.randint(2, max_distinct + 1)
+            n_runs_to_avg = np.random.randint(min_distinct, max_distinct + 1)
             run_indices = np.random.choice(self.N_runs, size=n_runs_to_avg, replace=False)
             return self._fetch_cached(run_indices, chrom, start_bp, end_bp, reverse)
 
