@@ -91,7 +91,7 @@ class MicroBorzoi(nn.Module):
             self.final_conv_human = nn.Conv1d(self.last_chanels, self.output_channels_human, kernel_size=1)
             self.final_conv_mouse = nn.Conv1d(self.last_chanels, self.output_channels_mouse, kernel_size=1)
 
-    def forward(self, x, genome="hg38", offset=0, crop_mha=0):
+    def forward(self, x, genome="hg38", offset=0, crop_mha=0, crop_result=True):
 
         # First convolutional layer (possibly checkpointed - it's the biggest)
         first = lambda x: self.maxpool(self.conv0(x))
@@ -107,8 +107,9 @@ class MicroBorzoi(nn.Module):
             return x[:, :, crop_mha : x.shape[2] - crop_mha]  # crop on device to make it faster
 
         # Crop after transformers - the rest is just local convolutions
-        crop_st, crop_end = self.crop + offset, x.shape[2] - self.crop + offset
-        x = x[:, :, crop_st:crop_end]
+        if crop_result:
+            crop_st, crop_end = self.crop + offset, x.shape[2] - self.crop + offset
+            x = x[:, :, crop_st:crop_end]
 
         x = self.output_conv_block(x)  # groups=1, w=1
         x = self.dropout(x)
