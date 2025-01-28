@@ -2,9 +2,11 @@
 Utilities for working with DNA sequences, including fast onehot and reverse complement functions.
 """
 
+from typing import Optional
+
 import numpy as np
 import pysam
-from typing import Optional
+import ushuffle
 
 
 def open_fasta_chromsizes(
@@ -91,7 +93,18 @@ def onehot_turbo(
             if m[0] == "replace":
                 np_string[m[1] : m[1] + len(m[2])] = np.array([m[2]], dtype="S").view(dtype="S1")
             elif m[0] == "invert":
-                np_string[m[1] : m[2]] = np_string[m[1] : m[2]][::-1]
+                seq_rc = reverse_complement(seq_string[m[1] : m[2]])
+                np_string[m[1] : m[2]] = np.array([seq_rc], dtype="S").view(dtype="S1")
+            elif "shuffle" in m[0]:
+                if m[0] == "shuffle":
+                    shuffle_by = 2
+                else:  # xtract shuffle out of "shuffle2" etc.
+                    shuffle_by = int(m[0].split("shuffle")[1])
+                start, end = m[1], m[2]
+                seq_to_shuffle = seq_string[start:end].encode()
+                shuffled_seq = ushuffle.shuffle(seq_to_shuffle, shuffle_by).decode()
+                assert len(shuffled_seq) == end - start
+                np_string[start:end] = np.array([shuffled_seq], dtype="S").view(dtype="S1")
             else:
                 raise ValueError(f"Unknown mutation type {m[0]}.")
 
@@ -127,7 +140,12 @@ def make_seq_1hot(
     reverse : bool, optional
         If True, the sequence is reverse complemented. Default is False.
     mutate : list of tuples, optional
-        List of tuple ("replace", position, sequence) or ("invert", position, position2). Default is None.
+        List of tuple ("replace", pos, seq), ("invert", pos1, pos2), or ("shuffle[1..9]", pos, pos2) Default is None.
+
+    Notes
+    -----
+    Shuffling is done with ushuffle. Shuffle2 is dinucleotide shuffling (most frequent)
+    so "shuffle" is a shorthand for "shuffle2".
 
     """
 
@@ -150,13 +168,13 @@ def make_seq_1hot(
             if m[0] == "replace":
                 if m[1] < start:
                     raise ValueError(f"Mutation position {m[1]} is before the sequence start {start}.")
-                if m[1] + len(m[2]) >= end:
+                if m[1] + len(m[2]) > end:
                     raise ValueError(f"Mutation position {m[1]} is beyond the sequence end {end}.")
                 mutate_new.append(("replace", m[1] - start, m[2]))
-            elif m[0] == "invert":
-                if m[1] < start or m[2] >= end:
+            elif m[0] == "invert" or "shuffle" in m[0]:
+                if m[1] < start or m[2] > end:
                     raise ValueError(f"Mutation positions {m[1]} and {m[2]} are beyond the sequence.")
-                mutate_new.append(("invert", m[1] - start, m[2] - start))
+                mutate_new.append((m[0], m[1] - start, m[2] - start))
             else:
                 raise ValueError(f"Unknown mutation type {m[0]}.")
 

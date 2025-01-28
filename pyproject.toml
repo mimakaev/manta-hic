@@ -27,7 +27,7 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = ["torch", "numpy", "pysam","polars", "click", "hdf5plugin", "h5py", "bioframe", "cooler", "cooltools"]
+dependencies = ["torch", "numpy", "pysam","polars", "click", "hdf5plugin", "h5py", "bioframe", "cooler", "cooltools", "ushuffle"]
 requires-python = ">=3.10"
 
 [project.scripts]
