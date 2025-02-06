@@ -4,6 +4,7 @@ import os
 import click
 import numpy as np
 import polars as pl
+import polars.selectors as cs
 import torch
 from ushuffle import shuffle
 
@@ -103,13 +104,16 @@ def manta_mutate_file(device, filename, out_filename, microzoi_file, fasta_file,
         logratio = ((x[::2] + offset) / (x[1::2] + offset)).log10()
 
         mut_pos = 512
-        for off in 3, 10, 30, 100, 200:
+        for off in 0, 3, 10, 30, 100, 200:
             changes = {}
-            slice_at = slice(mut_pos - off, mut_pos + off + 1)
-            changes["betw"] = logratio[:, :, mut_pos - off : mut_pos, mut_pos + 1 : mut_pos + 1 + off]
-            changes["up"] = logratio[:, :, slice_at, mut_pos + off + 1 :]
-            changes["down"] = logratio[:, :, slice_at, : mut_pos - off]
-            changes["at"] = logratio[:, :, slice_at, slice_at]
+            if off == 0:
+                changes["all"] = logratio
+            else:
+                slice_at = slice(mut_pos - off, mut_pos + off + 1)
+                changes["betw"] = logratio[:, :, mut_pos - off : mut_pos, mut_pos + 1 : mut_pos + 1 + off]
+                changes["up"] = logratio[:, :, slice_at, mut_pos + off + 1 :]
+                changes["down"] = logratio[:, :, slice_at, : mut_pos - off]
+                changes["at"] = logratio[:, :, slice_at, slice_at]
 
             means = {i: j.mean(axis=(2, 3)).cpu().numpy() for i, j in changes.items()}
             abses = {i: j.abs().mean(axis=(2, 3)).cpu().numpy() for i, j in changes.items()}
@@ -195,5 +199,5 @@ def manta_mutate_file(device, filename, out_filename, microzoi_file, fasta_file,
                 quantify_difference(res, names, model_name, records)
         all_dfs.append(pl.DataFrame(records))
         print(chrom, start, end)
-    megadf = pl.concat(all_dfs)
+    megadf = pl.concat(all_dfs).with_columns(cs.integer().cast(pl.Int32), cs.float().cast(pl.Float32))
     megadf.write_parquet(out_filename, compression_level=16)
