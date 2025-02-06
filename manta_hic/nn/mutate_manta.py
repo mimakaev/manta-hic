@@ -130,6 +130,7 @@ def manta_mutate_file(device, filename, out_filename, microzoi_file, fasta_file,
                             record["name"] = name_list[name_ind]
                             record["metric"] = metric
                             record["avg"] = avg_name
+                            record["offset"] = off
                             record["value"] = ar[metric][rep, name_ind]
                             record["model_name"] = model_name
                             record_list.append(record)
