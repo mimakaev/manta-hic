@@ -9,6 +9,7 @@ import cooltools
 import h5py
 import numpy as np
 import pandas as pd
+import polars as pl
 
 
 def get_bad_bin_masks(uri):
@@ -79,6 +80,7 @@ def save_coolers_for_manta(
     resolution,
     target_size,
     step_bins,
+    min_fraction=0.1,
 ):
     """
     Convert one or more .cool / .mcool URIs at a given resolution into an HDF5 file
@@ -188,7 +190,7 @@ def save_coolers_for_manta(
             bad_mask = bad_bin_masks[cooler_uris[clr_i]][start_bin:end_bin]
             bad_fracs.append(bad_mask.mean())
 
-        if np.sqrt(np.mean(np.array(bad_fracs) ** 2)) < 0.1:
+        if np.sqrt(np.mean(np.array(bad_fracs) ** 2)) < min_fraction:
             regs_final.append((chrom, start_, end_))
 
     # Convert regs_final to a DataFrame
@@ -260,14 +262,40 @@ def save_coolers_for_manta(
     print(f"Saved {n_snips_final} snippets to {output_filename}")
 
 
-def process_mcools(manifest_path, output_folder, resolutions, target_size, step_bins):
+def process_mcools(
+    manifest_path: str | pl.DataFrame,
+    output_folder: str,
+    resolutions: str | list[int],
+    target_size: int,
+    step_bins: int,
+) -> None:
+    """
+    Process a manifest file with cooler URIs and group names, and save the results into HDF5 files.
 
-    resolutions = [int(r) for r in resolutions.split(",")]
-    df = pd.read_csv(manifest_path)
+    Parameters
+    ----------
+    manifest_path : str or pl.DataFrame
+        Path to the manifest file, or a DataFrame with the same structure.
+    output_folder : str
+        Folder to save the output HDF5 files into.
+    resolutions : str or list of int
+        Comma-separated list of resolutions to process.
+    target_size : int
+        Size of the final window in bins. (We actually fetch bigger internally if needed.)
+    step_bins : int
+        Step size in bins, used for generating tiled windows across the genome.
+    """
+
+    if isinstance(resolutions, str):
+        resolutions = [int(r) for r in resolutions.split(",")]
+    if isinstance(manifest_path, str):
+        df = pl.read_csv(manifest_path)
+    else:
+        df = manifest_path
 
     # Group by 'group_name'. Each group_name -> one file per resolution in output_folder.
-    for group_name, group_df in df.groupby("group_name", observed=True):
-        genome_vals = group_df["genome"].unique()
+    for (group_name,), group_df in df.partition_by("group_name", as_dict=True).items():
+        genome_vals = group_df["genome"].unique().to_list()
         if len(genome_vals) != 1:
             raise ValueError(f"Multiple genomes for group {group_name} - not supported.")
         genome = genome_vals[0]
@@ -275,7 +303,7 @@ def process_mcools(manifest_path, output_folder, resolutions, target_size, step_
         # Build output filenames for each resolution
         for res in resolutions:
             out_filename = os.path.join(output_folder, f"{group_name}_{res}.h5")
-            cooler_uris = [f"{row['filepath']}::resolutions/{res}" for _, row in group_df.iterrows()]
+            cooler_uris = [f"{row['filepath']}::resolutions/{res}" for row in group_df.iter_rows(named=True)]
 
             # Call the function from Part 2
             save_coolers_for_manta(

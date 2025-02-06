@@ -4,6 +4,7 @@ import json
 import queue
 import threading
 from contextlib import nullcontext
+from typing import Optional
 
 import h5py
 import hdf5plugin
@@ -12,6 +13,7 @@ import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from manta_hic.nn.layers import (
     ConvolutionalBlock1d,
@@ -42,6 +44,7 @@ def fetch_tile_microzoi_activations(
     chrom,
     start_bp,
     end_bp,
+    mutate: Optional[list[tuple[str, int, str] | tuple[str, int, int]]] = None,
     reverse=False,
     start_offset_bins=0,
     shift_bp=0,
@@ -64,6 +67,8 @@ def fetch_tile_microzoi_activations(
         Start coordinate (inclusive) in base pairs of the region.
     end_bp : int
         End coordinate (exclusive) in base pairs of the region.
+    mutate : list of tuples, optional
+        List of tuple ("replace", position, sequence) or ("invert"/"scramble", position, position2). Default is None.
     reverse : bool, optional
         If True, fetch and process the region in reverse orientation.
         Defaults to True.
@@ -132,8 +137,8 @@ def fetch_tile_microzoi_activations(
     seq_end = tile_activations_end + crop_mha_bins * BIN_BP + shift_bp
 
     # fetch the sequence and calculate sequence tiles - if reverse, tiles are naturally in reverse order
-    # if reverse, sequence is reversed
-    seq = make_seq_1hot(fasta_open, chrom, seq_start, seq_end, reverse)  # handles negatives and overhangs already
+    # if reverse, sequence is reversed - it also handles negatives and overhangs
+    seq = make_seq_1hot(fasta_open, chrom, seq_start, seq_end, reverse, mutate=mutate)
     tiles = [seq[i : i + full_tile_bp] for i in range(0, len(seq) - (full_tile_bp - tile_step_bp), tile_step_bp)]
     assert len(tiles) == num_tiles
     assert all(len(tile) == full_tile_bp for tile in tiles)
@@ -180,35 +185,41 @@ class MicrozoiStochasticActivationFetcher(object):
     * The offset in bins is randomized up to the size of the tile
     """
 
-    def __init__(self, model, fasta_open, max_shift_bp=128, crop_mha_range=(512, 1024), batch_size=4):
+    def __init__(self, model, fasta_open, max_shift_bp=128, crop_mha_range=(512, 1024), batch_size=4, n_runs=1):
         self.model = model
         self.fasta_open = fasta_open
         self.max_shift_bp = max_shift_bp
         self.crop_mha_range = crop_mha_range
         self.batch_size = batch_size
+        self.n_runs = n_runs
         self.model.eval()
 
     def fetch(self, chrom, start_bp, end_bp, reverse=False):
         """
         Fetch MicroZoi model activations across a genomic region, with all randomizations applied.
         """
-
-        shift_bp = np.random.randint(-self.max_shift_bp, self.max_shift_bp + 1)
-        crop_mha_bins = np.random.randint(*self.crop_mha_range)
-        offset_bins = np.random.randint(0, MICROZOI_RECEPTIVE_FIELD // BIN_BP - 2 * crop_mha_bins)
-
-        return fetch_tile_microzoi_activations(
-            self.model,
-            self.fasta_open,
-            chrom,
-            start_bp,
-            end_bp,
-            reverse=reverse,
-            start_offset_bins=offset_bins,
-            shift_bp=shift_bp,
-            crop_mha_bins=crop_mha_bins,
-            batch_size=self.batch_size,
-        )
+        results = []
+        for _ in range(self.n_runs):
+            shift_bp = np.random.randint(-self.max_shift_bp, self.max_shift_bp + 1)
+            crop_mha_bins = np.random.randint(*self.crop_mha_range)
+            offset_bins = np.random.randint(0, MICROZOI_RECEPTIVE_FIELD // BIN_BP - 2 * crop_mha_bins)
+            res = fetch_tile_microzoi_activations(
+                self.model,
+                self.fasta_open,
+                chrom,
+                start_bp,
+                end_bp,
+                reverse=reverse,
+                start_offset_bins=offset_bins,
+                shift_bp=shift_bp,
+                crop_mha_bins=crop_mha_bins,
+                batch_size=self.batch_size,
+            )
+            results.append(res)
+        if self.n_runs > 1:
+            # average the results
+            res = torch.stack(results).mean(dim=0)
+        return res
 
 
 def populate_microzoi_cache(
@@ -672,6 +683,13 @@ class SequenceFetcher(object):
         return make_seq_1hot(self.fasta_open, chrom, start_bp + shift_bp, end_bp + shift_bp, reverse).T
 
 
+class DummyFetcher(object):
+    """A dummy fetcher that returns None for all fetches."""
+
+    def fetch(self, *args, **kwargs):
+        return None
+
+
 class HiCDataset:
     """
     A dataset class for handling Hi-C data.
@@ -800,14 +818,16 @@ class HiCDataset:
         If record is not found (usually if it crosses the centromere) raise an error.
         """
         end_bp = start_bp + self.n_bins * self.hic_res
-        df = self.df.filter((pl.col("chrom") == chrom) & (pl.col("start") <= start_bp) & (pl.col("end") >= end_bp))
+        df = self.df.with_row_count(name="new_index").filter(
+            (pl.col("chrom") == chrom) & (pl.col("start") <= start_bp) & (pl.col("end") >= end_bp)
+        )
         if len(df) == 0:
             raise ValueError("Region not found in the dataset")
         row = df.row(0, named=True)
         if (start_bp - row["start"]) % self.hic_res != 0:
             raise ValueError("Start bp is not multiple of hic resolution")
         offset = (start_bp - row["start"]) // self.hic_res
-        return self.get_slice_by_index(row["index"], offset_bins=offset, reverse=reverse)
+        return self.get_slice_by_index(row["new_index"], offset_bins=offset, reverse=reverse)
 
     def __len__(self):
         return len(self.df)
@@ -957,9 +977,7 @@ class Manta2(nn.Module):
     channels_1d : int
         Channel dimension for the 1D backbone.
     tower_height : int
-        Number of 1D conv+pool blocks (in total) before the final pool that leads to n_bins + 2*bins_pad.
-        Effectively, this sets the number of half-pool operations. A value of H requires an input length
-        2^(H+1) * (n_bins + 2*bins_pad). Cannot be zero.
+        Number of 1D conv+pool blocks (in total). Rescales the input by a factor 2^(H+1).
     transformer_layers : int
         Number of transformer layers in the TransformerTower.
     transformer_dropout : float
@@ -988,6 +1006,29 @@ class Manta2(nn.Module):
         Channel dimension after joining the two 2D branches.
     output_channels : int
         Number of output channels in the final 2D convolution.
+    checkpoint_first : bool
+        If True, checkpoint the first 1D convolutions.
+    conv_blocks_checkpoint : int
+        Number of 1D conv blocks to checkpoint GN part (starting from the first one).
+
+    Notes
+    -----
+    We perform the transformer tower at the hic_resolution/2. This is because the Hi-C map is generally not more than
+    1024x1024, and transformers can totally handle 2000-3000 bins with not much overhead. The hope is that at lower
+    resolution transformers will be able to perform more "compute".
+
+    The first convolution and maxpool is technically not the part of the "tower" because it has a fixed and special
+    input dimension, and because our convolutional blocks start with GN+GELU, and we can't start with a nonlinearity
+    directly following the activations from the previous network, Microzoi.
+
+    To allow for the resolution of 512bp, we have a special case - if the tower height is 0, the maxpool is not
+    applied after the first convolution and the tower height is set to 1. So we convolve from input_channels to
+    channels_1d, immediately do a transformer tower, and convolve/maxpool down to 512bp resolution.
+
+    We have checkpointing logic as follows. The first convolution is checkpointed as a whole convolution, as it's
+    output is the largest activation in the network. The rest of the convolutions have an option to checkpoint only
+    their groupnorm part, as it is "cheaper" than the convolution itself. It is possible to add more checkpointing
+    logic in the future, specifically for "Akita-like" networks, and be checkpointing whole convolutions.
     """
 
     def __init__(
@@ -1010,11 +1051,15 @@ class Manta2(nn.Module):
         tower_2d_height=9,
         final_channels=32,
         output_channels=2,
+        checkpoint_first=False,
+        conv_blocks_checkpoint=0,
     ):
         super(Manta2, self).__init__()
         self.n_bins = n_bins
         self.bins_pad = bins_pad
         self.channels_1d = channels_1d
+        self.checkpoint_first = checkpoint_first
+        self.conv_blocks_checkpoint = conv_blocks_checkpoint
 
         if final_channels < 2 * output_channels:
             raise ValueError("Final channels must be at least 2 times the output channels.")
@@ -1028,11 +1073,16 @@ class Manta2(nn.Module):
         # 1D backbone
         self.first_conv_1d = nn.Conv1d(input_channels, channels_1d, kernel_size=3, padding=1)
         self.maxpool1d = nn.MaxPool1d(kernel_size=2, stride=2)
+        self.tower_height = tower_height
 
         # Multiple conv blocks + pooling
+        # We have to have at least one block, so if tower_height is zero
+        # we instead don't do maxpool after the "initial" convolution.
         self.conv_blocks_1d = nn.ModuleList()
-        for _ in range(tower_height):
-            self.conv_blocks_1d.append(ConvolutionalBlock1d(channels_1d, channels_1d, 3, groups=1))
+        for i in range(max(tower_height, 1)):
+            do_checkpoint = i < self.conv_blocks_checkpoint and self.training
+            cblock = ConvolutionalBlock1d(channels_1d, channels_1d, 3, groups=1, checkpoint_gn=do_checkpoint)
+            self.conv_blocks_1d.append(cblock)
 
         # Transformer tower (assume it has RMSNorm inside or appended)
         self.mha_tower = TransformerTower(
@@ -1088,9 +1138,11 @@ class Manta2(nn.Module):
             Shape: [B, output_channels, n_bins, n_bins]
         """
 
-        # 1) First 1D conv + pool
-        x = self.first_conv_1d(x)  # [B, channels_1d, ...]
-        x = self.maxpool1d(x)  # [B, channels_1d, half of previous]
+        # 1) First 1D conv + pool [B, channels_1d, ...]
+        do_checkpoint = self.checkpoint_first and self.training
+        x = checkpoint(self.first_conv_1d, x, use_reentrant=True) if do_checkpoint else self.first_conv_1d(x)
+        if self.tower_height > 0:  # if we want 512bp resolution, we simply don't maxpool here and keep 1 convolution
+            x = self.maxpool1d(x)  # [B, channels_1d, half of previous]
 
         # 2) A few conv blocks, each with an extra pool
         for block in self.conv_blocks_1d[:-1]:
