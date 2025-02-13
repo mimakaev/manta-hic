@@ -31,6 +31,8 @@ def list_to_tensor_batch(ars, device, dtype=torch.float32):
         Concatenated tensor containing all input arrays, with an added dimension,
         moved to the specified device and converted to the specified dtype.
     """
+    if isinstance(ars[0], torch.Tensor):
+        return torch.stack(ars).to(device=device, dtype=dtype)
     ars2 = [torch.tensor(i, device=device).unsqueeze(0) for i in ars]
     ar = torch.cat(ars2).to(dtype=dtype)
     for i in ars2:

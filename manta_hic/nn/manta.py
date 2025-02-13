@@ -50,7 +50,8 @@ def fetch_tile_microzoi_activations(
     shift_bp=0,
     crop_mha_bins=512,
     batch_size=4,
-):
+    require_grad=False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, int, int]:
     """
     Fetch MicroZoi model activations across a genomic region, optionally reversed.
 
@@ -88,6 +89,10 @@ def fetch_tile_microzoi_activations(
     batch_size : int, optional
         Number of tiles to process in a single batch when calling `model`.
         Defaults to 4.
+    require_grad : bool, optional
+        If True, returns the activations and the input sequence as a tensor with
+        `requires_grad=True`. Defaults to False.
+
 
     Returns
     -------
@@ -96,6 +101,10 @@ def fetch_tile_microzoi_activations(
         `num_bins_total = (end_bp - start_bp) // BIN_BP`. The activations
         are concatenated across all tiles, with offsets removed so that
         the final coverage spans exactly the requested region.
+
+    torch.Tensor, torch.Tensor, start_bp, end_bp
+        If require_grad is set to true, returns activations and input sequence together
+        with the start and end of the sequence.
 
     Raises
     ------
@@ -112,8 +121,6 @@ def fetch_tile_microzoi_activations(
       portion to maintain correct coverage and avoid off-by-one errors.
     - When `reverse=True`, the sequence is fetched in reverse‐complement
       order, and the final activations are returned in reverse order.
-    - If you need a NumPy array, convert the returned tensor via
-      `activations.detach().cpu().numpy()`.
     """
 
     assert (end_bp - start_bp) % BIN_BP == 0, "End_bp - start_bp is not divisible by bin_bp"
@@ -139,6 +146,9 @@ def fetch_tile_microzoi_activations(
     # fetch the sequence and calculate sequence tiles - if reverse, tiles are naturally in reverse order
     # if reverse, sequence is reversed - it also handles negatives and overhangs
     seq = make_seq_1hot(fasta_open, chrom, seq_start, seq_end, reverse, mutate=mutate)
+    if require_grad:
+        seq = torch.from_numpy(seq)
+        seq.requires_grad = True
     tiles = [seq[i : i + full_tile_bp] for i in range(0, len(seq) - (full_tile_bp - tile_step_bp), tile_step_bp)]
     assert len(tiles) == num_tiles
     assert all(len(tile) == full_tile_bp for tile in tiles)
@@ -154,7 +164,14 @@ def fetch_tile_microzoi_activations(
     # fetch activations (genome argument actually irrelevant for MHA) and cat them
     activations = []
     for batch in batches:
-        batch_activations = model(batch.permute(0, 2, 1), genome="hg38", offset=0, crop_mha=crop_mha_bins)  # [B, C, N]
+
+        def fun(x):
+            return model(x.permute(0, 2, 1), genome="hg38", offset=0, crop_mha=crop_mha_bins)  # [B, C, N]
+
+        if require_grad:
+            batch_activations = checkpoint(fun, batch)
+        else:
+            batch_activations = fun(batch)
         # add 8 channels of x=-1...1 linear function and 3 powers of it to the activations, [B, C+8, N]
         linear = torch.linspace(-1, 1, batch_activations.shape[2], device=device).unsqueeze(0).unsqueeze(0)
         linear = linear.repeat(batch_activations.shape[0], 1, 1)
@@ -172,6 +189,8 @@ def fetch_tile_microzoi_activations(
         activations = activations[:, start_offset_bins : M - end_offset_bins]
 
     assert activations.shape[1] == num_bins_total, f"Activations shape is {activations.shape}, not {num_bins_total}"
+    if require_grad:
+        return activations, seq, seq_start, seq_end
     return activations
 
 
@@ -463,7 +482,7 @@ class CachedStochasticActivationFetcher(object):
         region is aligned to BIN_BP. If not, we raise an error.
     """
 
-    def __init__(self, cache_path):
+    def __init__(self, cache_path, fasta_open=None, batch_size=4):
         """
         Parameters
         ----------
@@ -473,20 +492,25 @@ class CachedStochasticActivationFetcher(object):
             Torch device for returning the final tensor.
         """
         self.cache_path = cache_path
+        self.fasta_open = fasta_open
+        self.batch_size = batch_size
         with h5py.File(self.cache_path, "r") as f:
             self.N_runs = f.attrs["N_runs"]
             self.cache_overhang_bp = f.attrs["CACHE_OVERHANG_BP"]
             self.bin_bp = f.attrs["BIN_BP"]
 
-    def fetch(self, chrom, start_bp, end_bp, reverse=False):
+    def fetch(self, chrom, start_bp, end_bp, reverse=False, return_full=False, run_idx=None):
         """
         Fetch cached activations for region [start_bp, end_bp).
         start_bp, end_bp must be multiples of bin_bp, and must lie entirely
         within the stored dataset region.
+
+        If return_full, returns the slice, together with shift_bins, crop_mha, and shift_bp.
         """
         if (start_bp % self.bin_bp) != 0 or (end_bp % self.bin_bp) != 0:
             raise ValueError("start_bp and end_bp must be multiples of BIN_BP")
-        run_idx = np.random.randint(self.N_runs)
+        if run_idx is None:
+            run_idx = np.random.randint(self.N_runs)
 
         orientation = "reverse" if reverse else "forward"
         with h5py.File(self.cache_path, "r") as f:
@@ -519,7 +543,113 @@ class CachedStochasticActivationFetcher(object):
             if reverse:  # reverse the array - we are saving in forward orientation
                 arr = arr[:, ::-1].copy()
 
+        if return_full:
+            with h5py.File(self.cache_path, "r") as f:
+                run_group = f[f"run{run_idx}"]
+                crop_mha_bins = run_group.attrs["crop_mha_bins"]
+                shift_bp = run_group.attrs["shift_bp"]
+                offset_bins = run_group.attrs["offset_bins"]
+            return arr, offset_bins, crop_mha_bins, shift_bp
         return arr
+
+    def _fetch_microzoi_model(self, device):
+        """
+        Fetch the microzoi model. Only create model the first time this is called
+        """
+        if not hasattr(self, "_model"):
+            with h5py.File(self.cache_path, "r") as f:
+                model_bytes = f["model_blob"][:].tobytes()
+                params = json.loads(f.attrs["model_params"])
+            self._model = MicroBorzoi(return_type="mha", **params["model"]).to(device)
+            self._model.load_state_dict(torch.load(io.BytesIO(model_bytes), map_location=device, weights_only=True))
+            self._model.eval()
+        return self._model
+
+    def fetch_matched_pairs(self, chrom, start_bp, end_bp, device, reverse=False, mutates=[]):
+        """
+        Fetch a pair of activations for the same region, but with different mutations applied.
+
+        Fetches a whole region from cache, and then "patches" it with microzoi activations calculated for the
+        regions that needed to be recalculated due to overlap with mutations.
+
+        Note thta we should use the same random run for both of the activations, and we need to patch
+        both the original and the mutated activation.
+
+        returns 2*len(mutates) activations, each of shape [channels, bins]
+
+        """
+
+        assert all([len(i) == 1 for i in mutates]), "Only single mutations are supported"
+        assert all([i[0][1] == mutates[0][0][1] for i in mutates]), "All mutations should be on the same position"
+
+        N_pairs = len(mutates)
+
+        # position of mutation in the sequence to fetch
+        mut_pos = mutates[0][0][1]
+        mut_pos_bins = (mut_pos - start_bp) // BIN_BP
+
+        # calculating microzoi window for the tile to patch
+        window_start = mut_pos - MICROZOI_RECEPTIVE_FIELD // 2
+        window_end = window_start + MICROZOI_RECEPTIVE_FIELD
+
+        all_acts = []
+        all_seqs = []
+        for pair in range(N_pairs):
+            acts, offset_bins, crop_mha_bins, shift_bp = self.fetch(
+                chrom, start_bp, end_bp, reverse=reverse, return_full=True
+            )
+            all_acts.append(acts)
+
+            # adjust window to use shift_bp
+            window_start += shift_bp
+            window_end += shift_bp
+
+            # fetch sequences for the window
+            seq = make_seq_1hot(self.fasta_open, chrom, window_start, window_end, reverse)
+            seq_mutate = make_seq_1hot(self.fasta_open, chrom, window_start, window_end, reverse, mutate=mutates[pair])
+            all_seqs.append(seq)
+            all_seqs.append(seq_mutate)
+
+        # fetch the model
+        model = self._fetch_microzoi_model(device)
+
+        # split seqs into batches
+        batches = [all_seqs[i : i + self.batch_size] for i in range(0, len(all_seqs), self.batch_size)]
+        batches = [list_to_tensor_batch(batch, device) for batch in batches]
+
+        # fetch activations to patch
+        all_patches = []
+        for batch in batches:
+            with torch.no_grad(), torch.autocast(device):
+                patch = model(batch.permute(0, 2, 1), genome="hg38", offset=0, crop_mha=768)
+                # add linear function and its powers to the activations
+                linear = torch.linspace(-1, 1, patch.shape[2], device=device).unsqueeze(0).unsqueeze(0)
+                linear = linear.repeat(patch.shape[0], 1, 1)
+                linear = torch.cat([linear.pow(i) for i in range(8)], dim=1)
+                patch = torch.cat([patch, linear], dim=1)
+            for i in patch.detach().cpu().numpy():
+                all_patches.append(i)
+
+        # patch the activations
+        tile_size_bins = MICROZOI_RECEPTIVE_FIELD // BIN_BP - 2 * 768
+        insert_start_bins = mut_pos_bins - tile_size_bins // 2
+        insert_end_bins = insert_start_bins + tile_size_bins
+
+        final_acts = []  # activations to retur
+        for pair in range(N_pairs):
+            acts = all_acts[pair].copy()
+            patch_wt = all_patches[2 * pair]
+            patch_mut = all_patches[2 * pair + 1]
+
+            # insert the patch
+            acts[:, insert_start_bins:insert_end_bins] = patch_wt
+            acts_mut = acts.copy()
+            acts_mut[:, insert_start_bins:insert_end_bins] = patch_mut
+
+            final_acts.append(acts)
+            final_acts.append(acts_mut)
+
+        return final_acts
 
 
 class HybridCachedStochasticFetcher:

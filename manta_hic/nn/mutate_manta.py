@@ -59,6 +59,15 @@ seqq = [
 seqq = "".join(seqq).encode()
 
 
+def make_quiescent_seq(seq_len):
+    stmp = shuffle(seqq, 4).decode()
+    st = len(seqq) // 2 - seq_len // 2
+    ed = st + seq_len
+    if ed >= len(stmp):
+        raise ValueError(f"Cannot make sequences longer than {len(stmp)}")
+    return stmp[st:ed]
+
+
 @click.command()
 @click.option("--device", default="cuda:0")
 @click.option("--filename", required=True)
@@ -134,14 +143,6 @@ def manta_mutate_file(device, filename, out_filename, microzoi_file, fasta_file,
                             record["value"] = ar[metric][rep, name_ind]
                             record["model_name"] = model_name
                             record_list.append(record)
-
-    def make_quiescent_seq(seq_len):
-        stmp = shuffle(seqq, 4).decode()
-        st = len(seqq) // 2 - seq_len // 2
-        ed = st + seq_len
-        if ed >= len(stmp):
-            raise ValueError(f"Cannot make sequences longer than {len(stmp)}")
-        return stmp[st:ed]
 
     in_df = pl.read_parquet(filename)
 
