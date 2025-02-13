@@ -106,7 +106,7 @@ def get_strand_pair(genome, version="2023"):
         raise ValueError(f"Genome {genome} not supported. Must be 'hg38' or 'mm10'.")
 
 
-def assign_fold_type(df, val_fold, test_fold, genome, overlap_threshold=0.8):
+def assign_fold_type(df, val_fold, test_fold, genome, overlap_threshold=0.8, verify_all_present=True):
     """
     Assigns folds to the given dataframe based on the specified validation and test folds.
 
@@ -129,6 +129,8 @@ def assign_fold_type(df, val_fold, test_fold, genome, overlap_threshold=0.8):
     overlap_threshold : float
         The minimum fraction of overlap between the fold and the data for it to be assigned the fold type.
         Default is 0.8.
+    verify_all_present : bool
+        If True, verifies that all 3 fold types are present in the dataframe. Default is True.
 
     Returns
     -------
@@ -179,7 +181,8 @@ def assign_fold_type(df, val_fold, test_fold, genome, overlap_threshold=0.8):
     )
 
     # verify that all 3 fold types are present
-    assert df_with_folds["fold_type"].n_unique() == 3
+    if verify_all_present:
+        assert df_with_folds["fold_type"].n_unique() == 3
 
     # Join the assignments back into the original dataframe
     df2 = df.join(df_with_folds, on=["chrom", "start", "end"], how="left")
