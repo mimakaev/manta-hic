@@ -61,6 +61,7 @@ seqs_hg38 = pl.read_parquet(os.path.join(files("manta_hic"), "data", "borzoi_seq
 seqs_mm10 = pl.read_parquet(os.path.join(files("manta_hic"), "data", "borzoi_seqs_mm10.pq"))
 targs_hg38 = pl.read_parquet(os.path.join(files("manta_hic"), "data", "borzoi_targs_hg38.pq"))
 targs_mm10 = pl.read_parquet(os.path.join(files("manta_hic"), "data", "borzoi_targs_mm10.pq"))
+fold_df = pl.read_parquet(os.path.join(files("manta_hic"), "data", "borzoi_folds.pq"))
 
 strand_pair_hg38 = targs_hg38["strand_pair"].to_numpy()
 strand_pair_mm10 = targs_mm10["strand_pair"].to_numpy()
@@ -145,7 +146,6 @@ def assign_fold_type(df, val_fold, test_fold, genome, overlap_threshold=0.8, ver
     """
 
     df = pl.DataFrame(df)
-    fold_df = pl.read_parquet(os.path.join(files("manta_hic"), "data", "borzoi_folds.pq"))
 
     # check if val_fold and test_fold are present in the fold_df
     unique_folds = fold_df["fold"].unique().to_list()
@@ -153,7 +153,7 @@ def assign_fold_type(df, val_fold, test_fold, genome, overlap_threshold=0.8, ver
         raise ValueError(f"Validation fold {val_fold} or test fold {test_fold} not found in {unique_folds}")
 
     # assign fold_type to the fold_df dataframe
-    fold_df = fold_df.filter(pl.col("genome") == genome).with_columns(
+    fold_df_filt = fold_df.filter(pl.col("genome") == genome).with_columns(
         pl.when(pl.col("fold") == val_fold)
         .then(pl.lit("val"))
         .otherwise(pl.when(pl.col("fold") == test_fold).then(pl.lit("test")).otherwise(pl.lit("train")))
@@ -163,7 +163,7 @@ def assign_fold_type(df, val_fold, test_fold, genome, overlap_threshold=0.8, ver
     # overlap, add overlap length, overlap fraction, filter out rows with multiple fold types
     df_with_folds = (
         df.join_where(
-            fold_df,
+            fold_df_filt,
             pl.col("chrom") == pl.col("chrom_right"),
             pl.col("start") < pl.col("end_right"),
             pl.col("start_right") < pl.col("end"),

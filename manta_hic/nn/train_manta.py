@@ -171,7 +171,7 @@ def train_manta(
     # microzoi (256bp) -> maxpool (512bp) -> MHA (512bp) -> last conv block + maxpool (1024bp) -> Hi-C map (1024bp))
     params["tower_height"] = int(np.round(np.log2(hic_res))) - 9
 
-    res_epoch_dict = {512: 20, 1024: 20, 2048: 30, 4096: 40, 8192: 50, 16384: 80}
+    res_epoch_dict = {512: 30, 1024: 40, 2048: 50, 4096: 60, 8192: 70, 16384: 80}
     if n_epochs == 0:
         n_epochs = res_epoch_dict[hic_res]
 

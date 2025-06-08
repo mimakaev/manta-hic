@@ -60,12 +60,16 @@ seqq = "".join(seqq).encode()
 
 
 def make_quiescent_seq(seq_len):
-    stmp = shuffle(seqq, 4).decode()
-    st = len(seqq) // 2 - seq_len // 2
+    n_seqs_needed = (seq_len) // len(seqq) + 1
+    stmp = "".join([shuffle(seqq, 4).decode() for _ in range(n_seqs_needed)])
+
+    st = len(stmp) // 2 - seq_len // 2
     ed = st + seq_len
-    if ed >= len(stmp):
-        raise ValueError(f"Cannot make sequences longer than {len(stmp)}")
-    return stmp[st:ed]
+    val = stmp[st:ed]
+    assert st > 0
+    assert ed < len(stmp)
+    assert len(val) == seq_len
+    return val
 
 
 @click.command()
