@@ -147,6 +147,46 @@ class FibonacciResidualTower(nn.Module):
         return x
 
 
+class ConvolutionalTransposeBlock2d(nn.Module):
+    """
+    Group-norm → GELU → ConvTranspose2d.
+    Designed as a drop-in “undo” for a 2×2/stride-2 MaxPool.
+
+    Parameters
+    ----------
+    in_channels : int
+        Number of channels in the input tensor.
+    out_channels : int
+        Number of channels produced by the transposed convolution.
+    kernel_size : int, optional
+        Kernel size of the transposed convolution (default 2 == exact inverse of 2×2 MaxPool).
+    stride : int, optional
+        Stride of the transposed convolution (default 2 == 2× up-sample).
+    groups : int, optional
+        Groups for the convolution (default 1).
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, *, kernel_size: int = 2, stride: int = 2, groups: int = 1):
+        super().__init__()
+        num_groups = max(1, min(in_channels // 8, in_channels))
+        self.gn = nn.GroupNorm(num_groups, in_channels, eps=1e-6)
+        # padding chosen so output spatial dims = input * stride
+        padding = (kernel_size - stride) // 2
+        self.deconv = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=0,
+            groups=groups,
+            bias=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # [B, in_C, H, W] → [B, out_C, 2H, 2W]  (for default params)
+        return self.deconv(F.gelu(self.gn(x)))
+
+
 # --------------------Hi-C specific modules (features to 2D, distance matrices, symmetrize) -----------------
 
 
@@ -202,6 +242,50 @@ class FeaturesTo2D(nn.Module):
         x2d = torch.cat((two_d, triu, dist, dist**2, dist * triu), dim=1)  # wide intermediate
         x2d = self.conv(x2d)
         return x2d
+
+
+class Reduce2DTo1D(nn.Module):
+    r"""
+    Collapse a 2-D (N × N) contact-style map into per-locus 1-D features by aggregating
+    row-wise and column-wise signal.
+
+    The layer first applies a pointwise 2-D convolution to mix/expand the input channels,
+    then returns
+
+    .. math::
+        y_{b,\,2c,\,i} = \sum_j x'_{b,\,c,\,i,\,j},\qquad
+        y_{b,\,2c+1,\,i} = \sum_j x'_{b,\,c,\,j,\,i}
+
+    so every locus *i* keeps both its “outgoing” (row-sum) and “incoming” (col-sum) activations.
+    Channel count doubles; sequence length is preserved.
+
+    Parameters
+    ----------
+    in_C : int
+        Number of input channels.
+    C : int
+        Number of output channels *after* the preliminary 2-D convolution (final output has 2 × C).
+    kernel_size : int, optional
+        Kernel size of the preliminary 2-D convolution (default 3).
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor of shape ``[B, 2 * C, N]`` suitable as input to a 1-D stack (e.g. Transformer).
+    """
+
+    def __init__(self, in_C: int, C: int, kernel_size: int = 3) -> None:
+        super().__init__()
+        self.conv = ConvolutionalBlock2d(in_C, C, kernel_size=kernel_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: [B, in_C, N, N]
+        x = self.conv(x)  # -> [B, C, N, N]
+
+        row = x.sum(dim=3)  # [B, C, N]
+        col = x.sum(dim=2)  # [B, C, N]
+
+        y = torch.stack((row, col), dim=2).flatten(start_dim=1, end_dim=2)  # [B, 2*C, N]
+        return y
 
 
 class Symmetrize(nn.Module):

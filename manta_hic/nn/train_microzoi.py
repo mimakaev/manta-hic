@@ -19,7 +19,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 @click.option("--param_file", "-p", help="JSON file with parameters file")
 @click.option("--output_folder", "-o", help="Output folder")
 @click.option("--continue_training", "-c", is_flag=True, help="Continue training from last epoch")
-@click.option("--val_fold", "-v", default=3, help="Validation fold")
+@click.option("--val_fold", "-v", default=3, help="Validation fold, or `-1` to skip validation")
 @click.option("--test_fold", "-t", default=4, help="Test fold")
 def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, test_fold):
     print(f"Training with GPU: {gpu}")
@@ -129,30 +129,34 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
             run_corr = (1 / (E := 100 * (epoch + 1))) * float(mean_corr) + ((E - 1) / E) * run_corr
             print(f"Epoch [{epoch}/{num_epochs}], queue len {que_len}, {genome} loss={loss.item():.3g}", end="")
             print(f"corr={mean_corr:.3g} running {run_corr:.3g} ", end="")
-            print("duration: ", (dt.datetime.now() - current) / dt.timedelta(seconds=1))
+            print("duration: ", (dt.datetime.now() - current) / dt.timedelta(seconds=1), end="\r")
+        print()
 
         loader_thread.join()
 
         gc.collect()
         # validation loop
-        print(f"Epoch {epoch} validation")
-        model.eval()
-        loader_thread = threading.Thread(target=data_loader_thread, args=(data_queue, validation_params))
-        loader_thread.start()
-        while (dta := data_queue.get()) is not None:
-            (in_data, target), global_meta, meta = dta
-            genome, shift_bins = global_meta["genome"], global_meta["shift_bins"]
+        if val_fold.lower() != -1:
+            print(f"Epoch {epoch} validation")
+            model.eval()
+            loader_thread = threading.Thread(target=data_loader_thread, args=(data_queue, validation_params))
+            loader_thread.start()
+            while (dta := data_queue.get()) is not None:
+                (in_data, target), global_meta, meta = dta
+                genome, shift_bins = global_meta["genome"], global_meta["shift_bins"]
 
-            in_data = list_to_tensor_batch(in_data, DEVICE, dtype=torch.float32).permute(0, 2, 1)
-            target = list_to_tensor_batch(target, DEVICE, dtype=torch.float32).permute(0, 2, 1)
-            target.requires_grad = False
+                in_data = list_to_tensor_batch(in_data, DEVICE, dtype=torch.float32).permute(0, 2, 1)
+                target = list_to_tensor_batch(target, DEVICE, dtype=torch.float32).permute(0, 2, 1)
+                target.requires_grad = False
 
-            with torch.no_grad(), autocast("cuda"):
-                assert shift_bins == 0
-                output = model(in_data, genome=genome, offset=shift_bins)
-                val_corrs_epoch.append(mean_corr := float(corr(target, output)))
-                print(f"Epoch [{epoch}/{num_epochs}], {genome} val corr={mean_corr:.3g}")
-        loader_thread.join()
+                with torch.no_grad(), autocast("cuda"):
+                    assert shift_bins == 0
+                    output = model(in_data, genome=genome, offset=shift_bins)
+                    val_corrs_epoch.append(mean_corr := float(corr(target, output)))
+                    print(f"Epoch [{epoch}/{num_epochs}], {genome} val corr={mean_corr:.3g}")
+            loader_thread.join()
+        else:
+            val_corrs_epoch = [0]
 
         torch.save(model.state_dict(), f"{folder}/model_{epoch}.pth")
         pickle.dump((train_corrs_epoch, val_corrs_epoch), open(f"{folder}/corrs_{epoch}.pkl", "wb"))

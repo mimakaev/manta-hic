@@ -406,8 +406,15 @@ def populate_microzoi_cache(
                                 crop_mha_bins=crop_mha_bins,
                                 batch_size=batch_size,
                             )
-                        torch.clip_(activ, -65504, 65504)  # clip to float16 range
+                        torch.clip_(activ, -25000, 25000)  # clip to float16 range minus a bit
+
+                        if (~torch.isfinite(activ)).sum() > 0:
+                            activ[~torch.isfinite(activ)] = 0
+                            assert (~torch.isfinite(activ)).sum() == 0
+                            print("Non-finite activations detected!!!")
+
                         arr = activ.cpu().numpy().astype(np.float16)
+                        assert (~np.isfinite(arr)).sum() == 0
 
                         if reverse_bool:  # reverse the array - we are saving in forward orientation
                             arr = arr[:, ::-1]
@@ -1215,10 +1222,11 @@ class Manta2(nn.Module):
             self.conv_blocks_1d.append(cblock)
 
         # Transformer tower (assume it has RMSNorm inside or appended)
+        mha_bins = (2 if self.tower_height > -1 else 1) * (n_bins + 2 * bins_pad)  # for 256bp resolution model
         self.mha_tower = TransformerTower(
             n_layers=transformer_layers,
             d_model=channels_1d,
-            n_bins=2 * (n_bins + 2 * bins_pad),
+            n_bins=mha_bins,
             n_heads=transformer_n_heads,
             drop_p=transformer_dropout,
         )
@@ -1284,7 +1292,9 @@ class Manta2(nn.Module):
 
         # 4) Final conv block + pool => dimension is now (n_bins + 2 * bins_pad)
         x = self.conv_blocks_1d[-1](x)  # [B, channels_1d, 2 * (n_bins + 2 * bins_pad)]
-        x = self.maxpool1d(x)  # [B, channels_1d, n_bins + 2 * bins_pad]
+
+        if self.tower_height > -1:  # shortcut for 256bp resolution models
+            x = self.maxpool1d(x)  # [B, channels_1d, n_bins + 2 * bins_pad]
 
         # 5) Direct 2D branch
         x_direct = self.conv_direct_1d(x)  # [B, 2*direct_2d_input_channels - 8, n_bins + 2 * bins_pad]
@@ -1301,6 +1311,7 @@ class Manta2(nn.Module):
 
         # 7) Residual tower in 2D
         x_tower = self.residual_dilated_tower(x_tower)  # [B, tower_2d_channels, n_bins//2, n_bins//2]
+        # This is an oversight, this batchnorm should be gone, but we are sticking to it due to the pre-trained models.
         x_tower = self.batchnorm_tower(x_tower)  # [B, tower_2d_channels, n_bins//2, n_bins//2]
         x_tower = F.gelu(x_tower)
         x_tower = self.deconv(x_tower)  # [B, tower_2d_channels, n_bins, n_bins]
