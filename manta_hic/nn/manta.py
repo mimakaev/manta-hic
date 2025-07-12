@@ -213,7 +213,7 @@ class MicrozoiStochasticActivationFetcher(object):
         self.n_runs = n_runs
         self.model.eval()
 
-    def fetch(self, chrom, start_bp, end_bp, reverse=False):
+    def fetch(self, chrom, start_bp, end_bp, reverse=False, mutate=None):
         """
         Fetch MicroZoi model activations across a genomic region, with all randomizations applied.
         """
@@ -233,6 +233,7 @@ class MicrozoiStochasticActivationFetcher(object):
                 shift_bp=shift_bp,
                 crop_mha_bins=crop_mha_bins,
                 batch_size=self.batch_size,
+                mutate=mutate,
             )
             results.append(res)
         if self.n_runs > 1:
