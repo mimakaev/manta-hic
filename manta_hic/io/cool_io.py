@@ -7,9 +7,11 @@ import bioframe
 import cooler
 import cooltools
 import h5py
+import multiprocess as mp
 import numpy as np
 import pandas as pd
 import polars as pl
+from funktools import partial
 
 
 def get_bad_bin_masks(uri):
@@ -207,9 +209,15 @@ def save_coolers_for_manta(
         hf.create_dataset("weights", shape=weight_shape, dtype=np.float32)
         hf.create_dataset("exp", shape=weight_shape, dtype=np.float32)
 
-    # Fill the datasets (main loop - repeating the loop above)
-    counter = 0
-    for chrom, start_, end_ in regs_final.itertuples(index=False):
+    # Fill the datasets (main loop - using mp and lock for writing)
+    with h5py.File(output_filename, "a") as hf:
+        for col in ["chrom", "start", "end"]:
+            hf.create_dataset(col, data=regs_final[col].values)
+
+    regs_to_process = enumerate(regs_final.itertuples(index=False))
+
+    def process_one(reg):
+        counter, (chrom, start_, end_) = reg
         group_cur = expgroups[
             (expgroups["chrom"] == chrom) & (expgroups["start"] <= start_) & (expgroups["end"] >= end_)
         ]
@@ -247,17 +255,19 @@ def save_coolers_for_manta(
             arr[0:2] = 0  # zero out the first two diagonals
             exp_list.append(arr)
 
-        with h5py.File(output_filename, "a") as hf:
+        with lock, h5py.File(output_filename, "a") as hf:
             hf["hic"][counter] = np.array(snippet_list, dtype=np.int16)
             hf["weights"][counter] = np.array(weight_list, dtype=np.float32)
             hf["exp"][counter] = np.array(exp_list, dtype=np.float32)
 
-        counter += 1
+    mp_lock = mp.Lock()
 
-    # Store region info
-    with h5py.File(output_filename, "a") as hf:
-        for col in ["chrom", "start", "end"]:
-            hf.create_dataset(col, data=regs_final[col].values)
+    def init(mp_lock):
+        global lock
+        lock = mp_lock
+
+    with mp.Pool(16, initializer=init, initargs=(mp_lock,)) as mypool:
+        list(mypool.imap_unordered(process_one, regs_to_process))
 
     print(f"Saved {n_snips_final} snippets to {output_filename}")
 
