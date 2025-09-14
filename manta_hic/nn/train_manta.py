@@ -141,31 +141,20 @@ def train_manta(
 
     fetcher = HybridCachedStochasticFetcher(cache_path, fasta_path, prob_mean=0.1, max_mean_runs=6)
 
-    if use_all_data:
-        ds_train = HiCDataset(
-            input_file,
-            fetcher,
-            n_bins=n_bins,
-            bins_pad=bins_pad,
-            genome=genome,
-            fold_types_use=["all"],
-            stochastic_offset=True,
-            stochastic_reverse=True,
-        )
+    
+    ds_train = HiCDataset(
+        input_file,
+        fetcher,
+        n_bins=n_bins,
+        bins_pad=bins_pad,
+        genome=genome,
+        fold_types_use=None if use_all_data else ["train"],
+        stochastic_offset=True,
+        stochastic_reverse=True,
+        
+    )
 
-    else:
-        ds_train = HiCDataset(
-            input_file,
-            fetcher,
-            n_bins=n_bins,
-            bins_pad=bins_pad,
-            genome=genome,
-            test_fold=test_fold,
-            val_fold=val_fold,
-            stochastic_offset=True,
-            stochastic_reverse=True,
-        )
-
+    if not use_all_data:
         ds_val = HiCDataset(
             input_file,
             fetcher,
@@ -178,12 +167,17 @@ def train_manta(
             stochastic_offset=False,
             stochastic_reverse=False,
         )
+        assert len(ds_val) > 0, "No validation data"
+    else:
+        ds_val = None
+
 
     assert len(ds_train) > 0, "No training data"
-    assert len(ds_val) > 0, "No validation data"
+    
 
     train_dl = ThreadedDataLoader(ds_train, batch_size=batch_size, shuffle=True, fraction=0.5)
-    val_dl = ThreadedDataLoader(ds_val, batch_size=batch_size * 2, shuffle=False, fraction=1)
+    
+
 
     hic_res = ds_train.hic_res
     # resolution of microzoi is 256bp, which has log2(256)=8. plus one because we maxpool after the first convolution
@@ -215,7 +209,10 @@ def train_manta(
 
         # -- Validate
         if not use_all_data:
+            val_dl = ThreadedDataLoader(ds_val, batch_size=batch_size * 2, shuffle=False, fraction=1)            
             corrs_val = run_epoch(model, val_dl, device=device, is_train=False)
+        else:
+            corrs_val = np.zeros((1, 1, 1, 1))
 
         if (epoch + 1) % save_every == 0:
             torch.save(model.state_dict(), f"{output_folder}/model_{epoch}.pth")
