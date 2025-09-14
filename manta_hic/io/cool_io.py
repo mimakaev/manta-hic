@@ -11,7 +11,6 @@ import multiprocess as mp
 import numpy as np
 import pandas as pd
 import polars as pl
-from funktools import partial
 
 
 def get_bad_bin_masks(uri):

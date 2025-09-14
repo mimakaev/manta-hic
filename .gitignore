@@ -164,3 +164,9 @@ cython_debug/
 
 # temporary ignored 
 environment.yml
+
+# AI stuff
+CLAUDE.md
+node_modules
+package-lock.json
+package.json

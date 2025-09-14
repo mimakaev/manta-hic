@@ -56,6 +56,8 @@ file = click.Path(exists=True, dir_okay=False)
 @click.option("--bins-pad", default=128, help="Number of padding bins.")
 @click.option("--val-fold", default="fold3", help="Validation fold")
 @click.option("--test-fold", default="fold4", help="Test fold")
+@click.option("--use-all-data", is_flag=True, help="Use all data without train/test splits")
+@click.option("--epoch-multiplier", default=1.0, type=float, help="Multiplier for number of epochs")
 def train_manta_click(
     input_file,
     cache_path,
@@ -74,6 +76,8 @@ def train_manta_click(
     bins_pad=128,
     val_fold="fold3",
     test_fold="fold4",
+    use_all_data=False,
+    epoch_multiplier=1.0,
 ):
     if os.path.exists(output_folder):
         if overwrite:
@@ -108,6 +112,8 @@ def train_manta_click(
             bins_pad,
             test_fold,
             val_fold,
+            use_all_data,
+            epoch_multiplier,
         )
 
 
@@ -127,36 +133,51 @@ def train_manta(
     bins_pad=128,
     val_fold="fold3",
     test_fold="fold4",
+    use_all_data=False,
+    epoch_multiplier=1.0,
 ):
     if params is None:
         params = {}
 
     fetcher = HybridCachedStochasticFetcher(cache_path, fasta_path, prob_mean=0.1, max_mean_runs=6)
 
-    ds_train = HiCDataset(
-        input_file,
-        fetcher,
-        n_bins=n_bins,
-        bins_pad=bins_pad,
-        genome=genome,
-        test_fold=test_fold,
-        val_fold=val_fold,
-        stochastic_offset=True,
-        stochastic_reverse=True,
-    )
+    if use_all_data:
+        ds_train = HiCDataset(
+            input_file,
+            fetcher,
+            n_bins=n_bins,
+            bins_pad=bins_pad,
+            genome=genome,
+            fold_types_use=["all"],
+            stochastic_offset=True,
+            stochastic_reverse=True,
+        )
 
-    ds_val = HiCDataset(
-        input_file,
-        fetcher,
-        n_bins=n_bins,
-        bins_pad=bins_pad,
-        genome=genome,
-        fold_types_use=["val"],
-        test_fold=test_fold,
-        val_fold=val_fold,
-        stochastic_offset=False,
-        stochastic_reverse=False,
-    )
+    else:
+        ds_train = HiCDataset(
+            input_file,
+            fetcher,
+            n_bins=n_bins,
+            bins_pad=bins_pad,
+            genome=genome,
+            test_fold=test_fold,
+            val_fold=val_fold,
+            stochastic_offset=True,
+            stochastic_reverse=True,
+        )
+
+        ds_val = HiCDataset(
+            input_file,
+            fetcher,
+            n_bins=n_bins,
+            bins_pad=bins_pad,
+            genome=genome,
+            fold_types_use=["val"],
+            test_fold=test_fold,
+            val_fold=val_fold,
+            stochastic_offset=False,
+            stochastic_reverse=False,
+        )
 
     assert len(ds_train) > 0, "No training data"
     assert len(ds_val) > 0, "No validation data"
@@ -174,6 +195,7 @@ def train_manta(
     res_epoch_dict = {256: 20, 512: 30, 1024: 40, 2048: 50, 4096: 60, 8192: 70, 16384: 80}
     if n_epochs == 0:
         n_epochs = res_epoch_dict[hic_res]
+    n_epochs = int(n_epochs * epoch_multiplier)
 
     model = Manta2(**params, output_channels=ds_train.n_channels).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -192,7 +214,8 @@ def train_manta(
         )
 
         # -- Validate
-        corrs_val = run_epoch(model, val_dl, device=device, is_train=False)
+        if not use_all_data:
+            corrs_val = run_epoch(model, val_dl, device=device, is_train=False)
 
         if (epoch + 1) % save_every == 0:
             torch.save(model.state_dict(), f"{output_folder}/model_{epoch}.pth")
