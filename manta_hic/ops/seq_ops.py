@@ -78,7 +78,8 @@ def onehot_turbo(
     seq_string : str
         A string containing the DNA sequence.
     mutate : list of tuples, optional
-        List of tuple ("replace", position, sequence) or ("invert", position, position2). Default is None.
+        List of tuple ("replace", position, sequence), ("invert", position, position2),
+        ("insert", position, sequence), or ("shuffle[1-9]", position, position2). Default is None.
 
     Returns
     -------
@@ -87,6 +88,49 @@ def onehot_turbo(
     """
     if not seq_string:
         return np.empty((0, 4), dtype=bool)
+
+    # Handle insertions first by modifying the sequence string
+    if mutate:
+        insertions = [(i, m) for i, m in enumerate(mutate) if m[0] == "insert"]
+        if insertions:
+            # Sort insertions by position in reverse order to avoid position shifting issues
+            insertions_sorted = sorted(insertions, key=lambda x: x[1][1], reverse=True)
+            seq_list = list(seq_string)
+            for _, ins in insertions_sorted:
+                pos, ins_seq = ins[1], ins[2]
+                # Insert the sequence at the specified position
+                for j, char in enumerate(reversed(ins_seq)):
+                    seq_list.insert(pos, char)
+            seq_string = ''.join(seq_list)
+
+            # Adjust positions of other mutations to account for insertions
+            mutate_adjusted = []
+            for i, m in enumerate(mutate):
+                if m[0] == "insert":
+                    continue  # Skip insertions as they're already processed
+                # Calculate offset from all insertions before this position
+                offset = 0
+                for _, ins in insertions:
+                    ins_pos, ins_seq = ins[1], ins[2]
+                    if m[0] in ["replace", "invert"] or "shuffle" in m[0]:
+                        if ins_pos <= m[1]:
+                            offset += len(ins_seq)
+                        if len(m) > 2 and isinstance(m[2], int) and ins_pos <= m[2]:
+                            # For mutations with two positions (invert, shuffle)
+                            pass  # End position also needs adjustment
+
+                # Create adjusted mutation
+                if m[0] == "replace":
+                    mutate_adjusted.append(("replace", m[1] + offset, m[2]))
+                elif m[0] == "invert" or "shuffle" in m[0]:
+                    # Calculate offset for end position
+                    end_offset = sum(len(ins[2]) for _, ins in insertions if ins[1] <= m[2])
+                    mutate_adjusted.append((m[0], m[1] + offset, m[2] + end_offset))
+                else:
+                    mutate_adjusted.append(m)
+
+            mutate = mutate_adjusted
+
     np_string = np.array([seq_string], dtype="S").view(dtype="S1")
     if mutate:
         for m in mutate:
@@ -105,6 +149,9 @@ def onehot_turbo(
                 shuffled_seq = ushuffle.shuffle(seq_to_shuffle, shuffle_by).decode()
                 assert len(shuffled_seq) == end - start
                 np_string[start:end] = np.array([shuffled_seq], dtype="S").view(dtype="S1")
+            elif m[0] == "insert":
+                # Already handled above
+                pass
             else:
                 raise ValueError(f"Unknown mutation type {m[0]}.")
 
@@ -140,12 +187,16 @@ def make_seq_1hot(
     reverse : bool, optional
         If True, the sequence is reverse complemented. Default is False.
     mutate : list of tuples, optional
-        List of tuple ("replace", pos, seq), ("invert", pos1, pos2), or ("shuffle[1..9]", pos, pos2) Default is None.
+        List of tuple ("replace", pos, seq), ("invert", pos1, pos2), ("insert", pos, seq),
+        or ("shuffle[1..9]", pos, pos2) Default is None.
 
     Notes
     -----
     Shuffling is done with ushuffle. Shuffle2 is dinucleotide shuffling (most frequent)
     so "shuffle" is a shorthand for "shuffle2".
+
+    Insert operation inserts a sequence at a given position, shifting the rest of the sequence.
+    The sequence length will be increased by the length of the inserted sequence.
 
     """
 
@@ -171,6 +222,10 @@ def make_seq_1hot(
                 if m[1] + len(m[2]) > end:
                     raise ValueError(f"Mutation position {m[1]} is beyond the sequence end {end}.")
                 mutate_new.append(("replace", m[1] - start, m[2]))
+            elif m[0] == "insert":
+                if m[1] < start or m[1] > end:
+                    raise ValueError(f"Insert position {m[1]} is outside the sequence range [{start}, {end}].")
+                mutate_new.append(("insert", m[1] - start, m[2]))
             elif m[0] == "invert" or "shuffle" in m[0]:
                 if m[1] < start or m[2] > end:
                     raise ValueError(f"Mutation positions {m[1]} and {m[2]} are beyond the sequence.")
@@ -179,7 +234,15 @@ def make_seq_1hot(
                 raise ValueError(f"Unknown mutation type {m[0]}.")
 
     seq_1hot = onehot_turbo(seq_dna, mutate=mutate_new)
-    assert len(seq_1hot) == end - start
+
+    # Calculate expected length accounting for insertions
+    expected_len = end - start
+    if mutate_new:
+        for m in mutate_new:
+            if m[0] == "insert":
+                expected_len += len(m[2])
+
+    assert len(seq_1hot) == expected_len, f"Expected length {expected_len}, got {len(seq_1hot)}"
 
     if reverse:
         return seq_1hot[::-1, ::-1].astype(np.float32)

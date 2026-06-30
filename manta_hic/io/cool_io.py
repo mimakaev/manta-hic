@@ -134,6 +134,7 @@ def save_coolers_for_manta(
             }
         )
     arms = arms.reset_index(drop=True)
+    arms = arms[arms["chrom"] != "chrM"]
 
     # Build a dict of "bad bin masks" for each cooler
     bad_bin_masks = {}
