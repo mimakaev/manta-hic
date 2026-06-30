@@ -11,8 +11,8 @@ import torch
 import torch.optim as optim
 
 from manta_hic.nn.manta import (
+    CachedStochasticActivationFetcher,
     HiCDataset,
-    HybridCachedStochasticFetcher,
     Manta2,
     ThreadedDataLoader,
     run_epoch,
@@ -139,9 +139,13 @@ def train_manta(
     if params is None:
         params = {}
 
-    fetcher = HybridCachedStochasticFetcher(cache_path, fasta_path, prob_mean=0.1, max_mean_runs=6)
+    fetcher = CachedStochasticActivationFetcher(cache_path, fasta_path)
 
-    
+    # Run-averaging augmentation policy lives here (the fetcher just averages whatever n_runs it is given):
+    # for ~10% of training samples average a random 2-6 cached runs (tilings/sub-bp shifts), else use 1.
+    def sample_n_runs(prob_mean=0.1, min_runs=2, max_runs=6):
+        return int(np.random.randint(min_runs, max_runs + 1)) if np.random.rand() < prob_mean else 1
+
     ds_train = HiCDataset(
         input_file,
         fetcher,
@@ -151,7 +155,7 @@ def train_manta(
         fold_types_use=None if use_all_data else ["train"],
         stochastic_offset=True,
         stochastic_reverse=True,
-        
+        n_runs=sample_n_runs,
     )
 
     if not use_all_data:
@@ -171,13 +175,9 @@ def train_manta(
     else:
         ds_val = None
 
-
     assert len(ds_train) > 0, "No training data"
-    
 
     train_dl = ThreadedDataLoader(ds_train, batch_size=batch_size, shuffle=True, fraction=0.5)
-    
-
 
     hic_res = ds_train.hic_res
     # resolution of microzoi is 256bp, which has log2(256)=8. plus one because we maxpool after the first convolution
@@ -209,7 +209,7 @@ def train_manta(
 
         # -- Validate
         if not use_all_data:
-            val_dl = ThreadedDataLoader(ds_val, batch_size=batch_size * 2, shuffle=False, fraction=1)            
+            val_dl = ThreadedDataLoader(ds_val, batch_size=batch_size * 2, shuffle=False, fraction=1)
             corrs_val = run_epoch(model, val_dl, device=device, is_train=False)
         else:
             corrs_val = np.zeros((1, 1, 1, 1))
