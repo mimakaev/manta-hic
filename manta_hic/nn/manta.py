@@ -3,6 +3,7 @@ import io
 import json
 import queue
 import threading
+import warnings
 from contextlib import nullcontext
 from typing import Optional
 
@@ -192,54 +193,6 @@ def fetch_tile_microzoi_activations(
     if require_grad:
         return activations, seq, seq_start, seq_end
     return activations
-
-
-class MicrozoiStochasticActivationFetcher(object):
-    """
-    A class that fetches MicroZoi model activations across a genomic region, optionally reversed.
-
-    For each fetching, the following things are randomized:
-    * Stochastic shift in basepairs is applied up to `max_shift_bp` in both directions.
-    * The region is cropped to a random size between `crop_mha_range[0]` and `crop_mha_range[1]` bins.
-    * The offset in bins is randomized up to the size of the tile
-    """
-
-    def __init__(self, model, fasta_open, max_shift_bp=128, crop_mha_range=(512, 1024), batch_size=4, n_runs=1):
-        self.model = model
-        self.fasta_open = fasta_open
-        self.max_shift_bp = max_shift_bp
-        self.crop_mha_range = crop_mha_range
-        self.batch_size = batch_size
-        self.n_runs = n_runs
-        self.model.eval()
-
-    def fetch(self, chrom, start_bp, end_bp, reverse=False, mutate=None):
-        """
-        Fetch MicroZoi model activations across a genomic region, with all randomizations applied.
-        """
-        results = []
-        for _ in range(self.n_runs):
-            shift_bp = np.random.randint(-self.max_shift_bp, self.max_shift_bp + 1)
-            crop_mha_bins = np.random.randint(*self.crop_mha_range)
-            offset_bins = np.random.randint(0, MICROZOI_RECEPTIVE_FIELD // BIN_BP - 2 * crop_mha_bins)
-            res = fetch_tile_microzoi_activations(
-                self.model,
-                self.fasta_open,
-                chrom,
-                start_bp,
-                end_bp,
-                reverse=reverse,
-                start_offset_bins=offset_bins,
-                shift_bp=shift_bp,
-                crop_mha_bins=crop_mha_bins,
-                batch_size=self.batch_size,
-                mutate=mutate,
-            )
-            results.append(res)
-        if self.n_runs > 1:
-            # average the results
-            res = torch.stack(results).mean(dim=0)
-        return res
 
 
 def populate_microzoi_cache(
@@ -479,15 +432,16 @@ def create_microzoi_model_from_cache(cache_path, device="cuda", return_type="mha
 
 class CachedStochasticActivationFetcher(object):
     """
-    Drop-in replacement for MicroziStochasticActivationFetcher,
-    but uses a precomputed HDF5 cache of Microzoi activations.
+    Reads MicroZoi activations from a precomputed HDF5 cache, and can locally recompute MicroZoi to apply
+    mutations (see ``fetch_activations`` / ``fetch_matched_pair``).
 
-    Implementation:
-      - We open the cache file in `fetch()`, read the top-level or run-level metadata,
-        pick a random run, then just do a simple slice from the dataset for (chrom, orientation).
-      - The user must ensure that [start_bp, end_bp) is fully contained within
-        [-CACHE_OVERHANG_BP, chrom_len_rounded + CACHE_OVERHANG_BP), and that the
-        region is aligned to BIN_BP. If not, we raise an error.
+    The cache stores ``N_runs`` stochastic runs (each a different sub-bp shift / crop / tile offset) per
+    chromosome and orientation, over [-CACHE_OVERHANG_BP, chrom_len_rounded + CACHE_OVERHANG_BP). Requested
+    regions must be bin-aligned and inside that range.
+
+    Every read takes an ``n_runs`` argument and averages that many distinct cached runs (``n_runs=1`` =
+    one random run). When and how often to use ``n_runs > 1`` is the caller's policy -- e.g. a training
+    loop may pass a per-sample sampler to ``HiCDataset``; this class holds no probabilities.
     """
 
     def __init__(self, cache_path, fasta_open=None, batch_size=4):
@@ -496,8 +450,10 @@ class CachedStochasticActivationFetcher(object):
         ----------
         cache_path : str
             Path to the HDF5 file with cached activations.
-        device : str
-            Torch device for returning the final tensor.
+        fasta_open : pysam.FastaFile or compatible, optional
+            FASTA handle; required only for the mutation-patching methods.
+        batch_size : int
+            Batch size for the MicroZoi recompute during mutation patching.
         """
         self.cache_path = cache_path
         self.fasta_open = fasta_open
@@ -507,58 +463,65 @@ class CachedStochasticActivationFetcher(object):
             self.cache_overhang_bp = f.attrs["CACHE_OVERHANG_BP"]
             self.bin_bp = f.attrs["BIN_BP"]
 
-    def fetch(self, chrom, start_bp, end_bp, reverse=False, return_full=False, run_idx=None):
+    def _read_runs(self, chrom, start_bp, end_bp, reverse, run_indices, device):
         """
-        Fetch cached activations for region [start_bp, end_bp).
-        start_bp, end_bp must be multiples of bin_bp, and must lie entirely
-        within the stored dataset region.
+        Read cached activations for one or more runs and return their elementwise mean as a float16 torch
+        tensor on ``device``.
 
-        If return_full, returns the slice, together with shift_bins, crop_mha, and shift_bp.
+        h5py hands us float16 numpy (unavoidable); everything after is torch on ``device`` -- on GPU
+        float16 is native, so averaging is cheap and the result can be fed straight into Manta. A single
+        run is returned as-is; several runs are averaged in float32 then cast back to float16 (the model
+        sees float16 under autocast anyway, and on real data the float32-vs-float16 averaging difference is
+        ~400x below the genuine run-to-run variation -- see docs/SESSION_LOG).
         """
         if (start_bp % self.bin_bp) != 0 or (end_bp % self.bin_bp) != 0:
             raise ValueError("start_bp and end_bp must be multiples of BIN_BP")
-        if run_idx is None:
-            run_idx = np.random.randint(self.N_runs)
-
         orientation = "reverse" if reverse else "forward"
+        region_start_bp = -self.cache_overhang_bp
+        tensors = []
         with h5py.File(self.cache_path, "r") as f:
-            run_group = f[f"run{run_idx}"]
-            ds_name = f"{chrom}_{orientation}"
-            if ds_name not in run_group:
-                raise KeyError(f"Dataset not found: run{run_idx}/{ds_name}")
-            dset = run_group[ds_name]
+            for run_idx in run_indices:
+                run_group = f[f"run{int(run_idx)}"]
+                ds_name = f"{chrom}_{orientation}"
+                if ds_name not in run_group:
+                    raise KeyError(f"Dataset not found: run{int(run_idx)}/{ds_name}")
+                dset = run_group[ds_name]
+                total_bins = dset.shape[1]
+                region_end_bp = region_start_bp + total_bins * self.bin_bp
+                if start_bp < region_start_bp or end_bp > region_end_bp:
+                    raise ValueError(
+                        f"Requested region [{start_bp}, {end_bp}) is outside stored range "
+                        f"[{region_start_bp}, {region_end_bp})."
+                    )
+                i0 = (start_bp - region_start_bp) // self.bin_bp
+                i1 = (end_bp - region_start_bp) // self.bin_bp
+                arr = dset[:, i0:i1]
+                if reverse:  # cache is stored forward; flip (copy: torch.from_numpy needs positive strides)
+                    arr = arr[:, ::-1]
+                tensors.append(torch.from_numpy(np.ascontiguousarray(arr)).to(device))
+        if len(tensors) == 1:
+            return tensors[0]
+        return torch.stack(tensors).float().mean(dim=0).half()
 
-            # The dataset covers [-cache_overhang_bp, chrom_len_rounded + cache_overhang_bp)
-            # in basepairs. So the total length in bins is dset.shape[1].
-            # The start of the region in basepairs is "start_of_chrom" = -cache_overhang_bp.
-            # Let's figure out the slice offset in bins:
-            total_bins = dset.shape[1]
-            region_start_bp = -self.cache_overhang_bp
-            region_end_bp = region_start_bp + total_bins * self.bin_bp
+    def fetch(self, chrom, start_bp, end_bp, reverse=False, return_full=False, run_idx=None, n_runs=1, device="cpu"):
+        """
+        Fetch cached activations for [start_bp, end_bp) (bin-aligned, within the stored range) as a float16
+        torch tensor on ``device`` (default "cpu").
 
-            if start_bp < region_start_bp or end_bp > region_end_bp:
-                raise ValueError(
-                    f"Requested region [{start_bp}, {end_bp}) is outside stored range "
-                    f"[{region_start_bp}, {region_end_bp})."
-                )
-
-            offset_start_bin = (start_bp - region_start_bp) // self.bin_bp
-            offset_end_bin = (end_bp - region_start_bp) // self.bin_bp
-            if offset_start_bin < 0 or offset_end_bin > total_bins:
-                raise ValueError(f"Slice in bins [{offset_start_bin}, {offset_end_bin}) is out of [0, {total_bins}).")
-
-            arr = dset[:, offset_start_bin:offset_end_bin]
-            if reverse:  # reverse the array - we are saving in forward orientation
-                arr = arr[:, ::-1].copy()
-
-        if return_full:
-            with h5py.File(self.cache_path, "r") as f:
-                run_group = f[f"run{run_idx}"]
-                crop_mha_bins = run_group.attrs["crop_mha_bins"]
-                shift_bp = run_group.attrs["shift_bp"]
-                offset_bins = run_group.attrs["offset_bins"]
-            return arr, offset_bins, crop_mha_bins, shift_bp
-        return arr
+        - ``run_idx`` given: that exact run.
+        - ``return_full``: also return that single run's (offset_bins, crop_mha_bins, shift_bp).
+        - otherwise: average ``n_runs`` distinct random runs (``n_runs=1`` = one random run).
+        """
+        if return_full or run_idx is not None:
+            if run_idx is None:
+                run_idx = int(np.random.randint(self.N_runs))
+            arr = self._read_runs(chrom, start_bp, end_bp, reverse, [run_idx], device)
+            if return_full:
+                with h5py.File(self.cache_path, "r") as f:
+                    g = f[f"run{run_idx}"]
+                    return arr, g.attrs["offset_bins"], g.attrs["crop_mha_bins"], g.attrs["shift_bp"]
+            return arr
+        return self._read_runs(chrom, start_bp, end_bp, reverse, self._pick_runs(n_runs), device)
 
     def _fetch_microzoi_model(self, device):
         """
@@ -573,231 +536,333 @@ class CachedStochasticActivationFetcher(object):
             self._model.eval()
         return self._model
 
-    def fetch_matched_pairs(self, chrom, start_bp, end_bp, device, reverse=False, mutates=[]):
+    # ------------------------------------------------------------------ #
+    # Mutation patching (single window, WT + mutant batched together)     #
+    # ------------------------------------------------------------------ #
+    #
+    # Start from cached wild-type (WT) activations for [start_bp, end_bp) (one random "run"), then locally
+    # recompute MicroZoi over the single bounding window the mutations touch and splice it back in.
+    #
+    # Matched-pair invariant: outside the patched window, WT and mutant share the *identical* cached
+    # background; inside, both come from the *same* recompute (their MicroZoi tiles run in one batch),
+    # differing only by the mutated bases. Hence ``mutant - WT`` is clean and the recompute-vs-cache seam
+    # cancels in the difference. (Subtracting two ``fetch_activations`` calls is NOT clean -- one side is
+    # the cached WT, the other a recompute -- so use ``fetch_matched_pair`` for differences.)
+    #
+    # All mutations of a call are applied together and covered by one window [min - flank, max + flank];
+    # if it is wider than one MicroZoi tile it is tiled automatically. Only length-preserving ops
+    # (``replace`` of equal length, ``invert``, ``shuffle``) are allowed; ``insert``/deletions are
+    # rejected because the cache is a fixed genomic bin grid and an indel would make the WT/mutant maps
+    # non-bin-comparable (use a re-anchored uncached window instead).
+
+    @staticmethod
+    def _mut_span(m):
+        """Return (start_bp, end_bp) genomic span touched by a single mutation tuple."""
+        op = m[0]
+        if op == "replace":
+            return m[1], m[1] + len(m[2])
+        if op == "invert" or op.startswith("shuffle"):
+            return m[1], m[2]
+        raise ValueError(f"Unknown/unsupported mutation op '{op}'")
+
+    @classmethod
+    def _validate_mutations(cls, mutations, start_bp, end_bp):
+        """Reject length-changing mutations and out-of-window positions."""
+        for m in mutations:
+            if m[0] == "insert":
+                raise ValueError(
+                    "Length-changing mutation 'insert' is not supported in the cached-patch path: the "
+                    "cache is on a fixed genomic bin grid, so the wild-type and mutant Hi-C maps would no "
+                    "longer be bin-comparable. Recompute a whole re-anchored window without the cache "
+                    "(e.g. build a synthetic FASTA) for indels."
+                )
+            lo, hi = cls._mut_span(m)  # also raises on unknown ops
+            if lo < start_bp or hi > end_bp:
+                raise ValueError(f"Mutation {m[0]} span [{lo}, {hi}) is outside the window [{start_bp}, {end_bp}).")
+
+    def _mutation_window(self, mutations, start_bp, end_bp, flank_bp):
+        """Single bin-aligned, window-clipped recompute window covering all mutations plus flank."""
+        spans = [self._mut_span(m) for m in mutations]
+        lo = min(s[0] for s in spans) - flank_bp
+        hi = max(s[1] for s in spans) + flank_bp
+        win_lo = max(start_bp, (lo // BIN_BP) * BIN_BP)
+        win_hi = min(end_bp, -(-hi // BIN_BP) * BIN_BP)  # ceil to BIN_BP
+        return win_lo, win_hi
+
+    def _recompute_patches(self, model, chrom, win_lo, win_hi, jobs, reverse, crop_mha_bins, device):
         """
-        Fetch a pair of activations for the same region, but with different mutations applied.
+        Recompute MicroZoi activations (with the +8 positional channels) over [win_lo, win_hi) for a list
+        of ``jobs``, running ALL their tiles through MicroZoi in shared batches (so e.g. a WT+mutant pair
+        over a single-tile window costs ~one forward pass).
 
-        Fetches a whole region from cache, and then "patches" it with microzoi activations calculated for the
-        regions that needed to be recalculated due to overlap with mutations.
-
-        Note thta we should use the same random run for both of the activations, and we need to patch
-        both the original and the mutated activation.
-
-        returns 2*len(mutates) activations, each of shape [channels, bins]
-
+        Each job is ``(mutate, shift_bp, start_offset_bins)``: ``mutate`` is the mutation list (or ``None``
+        for wild type), ``shift_bp`` shifts the input sequence (sub-bin/bp sampling), and
+        ``start_offset_bins`` shifts the tile alignment (a slightly different receptive field). Geometry
+        per job mirrors ``fetch_tile_microzoi_activations``. Returns one [n_channels, (win_hi-win_lo)//BIN]
+        float16 torch tensor on ``device`` per job, all spliceable at the same window position.
         """
+        num_bins_total = (win_hi - win_lo) // BIN_BP
+        tile_size_bins = MICROZOI_RECEPTIVE_FIELD // BIN_BP - 2 * crop_mha_bins
+        tile_step_bp = tile_size_bins * BIN_BP
 
-        assert all([len(i) == 1 for i in mutates]), "Only single mutations are supported"
-        assert all([i[0][1] == mutates[0][0][1] for i in mutates]), "All mutations should be on the same position"
+        metas = []  # (num_tiles, start_offset_bins, end_offset_bins) per job
+        tiles = []
+        for mutate, shift_bp, soff in jobs:
+            num_tiles = (num_bins_total + soff + tile_size_bins - 1) // tile_size_bins
+            end_off = num_tiles * tile_size_bins - num_bins_total - soff
+            tile_start_bp = win_lo - soff * BIN_BP
+            seq_start = tile_start_bp - crop_mha_bins * BIN_BP + shift_bp
+            seq_end = tile_start_bp + num_tiles * tile_step_bp + crop_mha_bins * BIN_BP + shift_bp
+            seq = make_seq_1hot(self.fasta_open, chrom, seq_start, seq_end, reverse, mutate=mutate)
+            job_tiles = [
+                seq[i : i + MICROZOI_RECEPTIVE_FIELD]
+                for i in range(0, len(seq) - (MICROZOI_RECEPTIVE_FIELD - tile_step_bp), tile_step_bp)
+            ]
+            assert len(job_tiles) == num_tiles
+            metas.append((num_tiles, soff, end_off))
+            tiles.extend(job_tiles)
 
-        N_pairs = len(mutates)
+        # torch.autocast wants a device *type* ("cuda"/"cpu"); a torch.device("cuda:0") would raise. Tensor
+        # placement still uses the full device.
+        device_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
+        outs = []
+        for i in range(0, len(tiles), self.batch_size):
+            batch = list_to_tensor_batch(tiles[i : i + self.batch_size], device)
+            with torch.no_grad(), torch.autocast(device_type):
+                act = model(batch.permute(0, 2, 1), genome="hg38", offset=0, crop_mha=crop_mha_bins)  # [B, C, N]
+                linear = torch.linspace(-1, 1, act.shape[2], device=device).unsqueeze(0).unsqueeze(0)
+                linear = linear.repeat(act.shape[0], 1, 1)
+                linear = torch.cat([linear.pow(p) for p in range(8)], dim=1)
+                act = torch.cat([act, linear], dim=1)  # [B, C + 8, N]
+            outs.append(act.detach())  # stay on device -- patches are consumed on-device by the splice
+        outs = torch.cat(outs, dim=0)  # [total_tiles, C + 8, tile_size_bins]
 
-        # position of mutation in the sequence to fetch
-        mut_pos = mutates[0][0][1]
-        mut_pos_bins = (mut_pos - start_bp) // BIN_BP
+        results = []
+        pos = 0
+        for num_tiles, soff, end_off in metas:
+            arr = outs[pos : pos + num_tiles].permute(1, 0, 2).reshape(outs.shape[1], -1)  # [C, num_tiles * N]
+            pos += num_tiles
+            length = arr.shape[1]
+            arr = arr[:, end_off : length - soff] if reverse else arr[:, soff : length - end_off]
+            results.append(arr.half())
+        return results
 
-        # calculating microzoi window for the tile to patch
-        window_start = mut_pos - MICROZOI_RECEPTIVE_FIELD // 2
-        window_end = window_start + MICROZOI_RECEPTIVE_FIELD
-
-        all_acts = []
-        all_seqs = []
-        for pair in range(N_pairs):
-            acts, offset_bins, crop_mha_bins, shift_bp = self.fetch(
-                chrom, start_bp, end_bp, reverse=reverse, return_full=True
-            )
-            all_acts.append(acts)
-
-            # adjust window to use shift_bp
-            window_start += shift_bp
-            window_end += shift_bp
-
-            # fetch sequences for the window
-            seq = make_seq_1hot(self.fasta_open, chrom, window_start, window_end, reverse)
-            seq_mutate = make_seq_1hot(self.fasta_open, chrom, window_start, window_end, reverse, mutate=mutates[pair])
-            all_seqs.append(seq)
-            all_seqs.append(seq_mutate)
-
-        # fetch the model
-        model = self._fetch_microzoi_model(device)
-
-        # split seqs into batches
-        batches = [all_seqs[i : i + self.batch_size] for i in range(0, len(all_seqs), self.batch_size)]
-        batches = [list_to_tensor_batch(batch, device) for batch in batches]
-
-        # fetch activations to patch
-        all_patches = []
-        for batch in batches:
-            with torch.no_grad(), torch.autocast(device):
-                patch = model(batch.permute(0, 2, 1), genome="hg38", offset=0, crop_mha=768)
-                # add linear function and its powers to the activations
-                linear = torch.linspace(-1, 1, patch.shape[2], device=device).unsqueeze(0).unsqueeze(0)
-                linear = linear.repeat(patch.shape[0], 1, 1)
-                linear = torch.cat([linear.pow(i) for i in range(8)], dim=1)
-                patch = torch.cat([patch, linear], dim=1)
-            for i in patch.detach().cpu().numpy():
-                all_patches.append(i)
-
-        # patch the activations
-        tile_size_bins = MICROZOI_RECEPTIVE_FIELD // BIN_BP - 2 * 768
-        insert_start_bins = mut_pos_bins - tile_size_bins // 2
-        insert_end_bins = insert_start_bins + tile_size_bins
-
-        final_acts = []  # activations to retur
-        for pair in range(N_pairs):
-            acts = all_acts[pair].copy()
-            patch_wt = all_patches[2 * pair]
-            patch_mut = all_patches[2 * pair + 1]
-
-            # insert the patch
-            acts[:, insert_start_bins:insert_end_bins] = patch_wt
-            acts_mut = acts.copy()
-            acts_mut[:, insert_start_bins:insert_end_bins] = patch_mut
-
-            final_acts.append(acts)
-            final_acts.append(acts_mut)
-
-        return final_acts
-
-
-class HybridCachedStochasticFetcher:
-    """
-    A combined fetcher that, on each fetch, does one of the following:
-      1) With probability prob_stochastic, calls a fallback (stochastic) fetcher,
-         which we automatically build from the HDF5 cache attributes if not provided.
-      2) With probability prob_mean, picks a distinct subset of runs (2..max_mean_runs, no replacement) from the cache,
-         and returns their elementwise mean.
-      3) Otherwise, returns a single-run cached activation.
-
-    The fallback fetcher is auto-initialized from:
-        - The microzoi model saved in the cache (via model_blob)
-        - The max_shift_bp from cache attrs
-        - The crop_mha_range from cache attrs
-        - The user-provided fasta_open and batch_size
-        etc.
-
-    Parameters
-    ----------
-    cache_path : str
-        Path to the HDF5 file with cached Microzoi activations (and attributes).
-    fasta_open : pysam.FastaFile or similar
-        FASTA handle for fallback fetcher (model inference).
-    prob_mean : float
-        Probability of returning the mean over multiple runs from the cache.
-    max_mean_runs : int
-        Maximum number of runs to average over. We pick a random n in [2, max_mean_runs],
-        distinct runs for that average.
-    """
-
-    def __init__(
-        self,
-        cache_path,
-        fasta_open,
-        prob_mean=0.1,
-        min_mean_runs=2,
-        max_mean_runs=4,
-    ):
-        self.cache_path = cache_path
-        self.fasta_open = fasta_open
-        self.prob_mean = prob_mean
-        self.min_mean_runs = min_mean_runs
-        self.max_mean_runs = max_mean_runs
-
-        # Open cache, read the relevant attributes, and build the fallback fetcher automatically
-        with h5py.File(self.cache_path, "r") as f:
-            self.N_runs = f.attrs["N_runs"]
-
-    def fetch(self, chrom, start_bp, end_bp, reverse=False):
-        """
-        Fetch activations for [start_bp, end_bp). With probability prob_stochastic, we use the fallback fetcher;
-        with probability prob_mean, we average multiple runs from the cache; else, pick a single run from the cache.
-
-        Parameters
-        ----------
-        chrom : str
-            Chromosome name.
-        start_bp : int
-            Start coordinate (multiple of bin_bp).
-        end_bp : int
-            End coordinate (multiple of bin_bp).
-        reverse : bool, optional
-            If True, return reversed orientation.
-
-        Returns
-        -------
-        torch.Tensor
-            Activation of shape [channels, bins].
-        """
-        r = np.random.rand()
-
-        if r < self.prob_mean:
-            # Multi-run average
-            max_distinct = min(self.max_mean_runs, self.N_runs)
-            min_distinct = self.min_mean_runs
-            if max_distinct < 2:
-                # fallback to single-run if not enough runs in the cache
-                return self._fetch_cached([0], chrom, start_bp, end_bp, reverse)
-            n_runs_to_avg = np.random.randint(min_distinct, max_distinct + 1)
-            run_indices = np.random.choice(self.N_runs, size=n_runs_to_avg, replace=False)
-            return self._fetch_cached(run_indices, chrom, start_bp, end_bp, reverse)
-
+    def _splice(self, acts, win_lo, win_hi, patch, start_bp, end_bp, reverse):
+        """Splice a recomputed window ``patch`` into a full-window activation tensor, in place."""
+        if reverse:
+            i0, i1 = (end_bp - win_hi) // BIN_BP, (end_bp - win_lo) // BIN_BP
         else:
-            # Single-run from the cache
-            run_idx = np.random.randint(self.N_runs)
-            return self._fetch_cached([run_idx], chrom, start_bp, end_bp, reverse)
+            i0, i1 = (win_lo - start_bp) // BIN_BP, (win_hi - start_bp) // BIN_BP
+        acts[:, i0:i1] = patch
 
-    def _fetch_cached(self, run_indices, chrom, start_bp, end_bp, reverse):
+    def _resolve_n_runs(self, n_runs):
+        """Resolve the ``n_runs`` argument, warning (once) when it was left unset."""
+        if n_runs is None:
+            warnings.warn(
+                "n_runs not specified; defaulting to 1 (a single MicroZoi run/tiling -- fast). Pass "
+                "n_runs=2 or 4 for deeper inference (averages cached runs, tilings and sub-bp shifts), or "
+                "n_runs=1 to silence this warning.",
+                stacklevel=3,
+            )
+            return 1
+        return int(n_runs)
+
+    def _pick_runs(self, n_runs, run_idx=None):
+        """Pick ``n_runs`` distinct cached run indices (or the pinned ``run_idx`` when n_runs == 1)."""
+        if n_runs <= 1:
+            return [int(run_idx) if run_idx is not None else int(np.random.randint(self.N_runs))]
+        n = min(int(n_runs), int(self.N_runs))
+        return [int(i) for i in np.random.choice(self.N_runs, size=n, replace=False)]
+
+    @staticmethod
+    def _rand_offset(max_abs):
+        return 0 if max_abs <= 0 else int(np.random.randint(-max_abs, max_abs + 1))
+
+    @staticmethod
+    def _rand_offset_bins(max_bins):
+        return 0 if max_bins <= 0 else int(np.random.randint(0, max_bins + 1))
+
+    def _averaged_patched(
+        self,
+        chrom,
+        start_bp,
+        end_bp,
+        device,
+        runs,
+        mutations,
+        variants,
+        reverse,
+        flank_bp,
+        crop_mha_bins,
+        patch_max_offset_bp,
+        patch_max_offset_bins,
+    ):
         """
-        Fetch (and possibly average) cached activations from the given run indices.
+        Core of the mutation-patching methods. For each run in ``runs``: read its cached background and
+        recompute one patch per entry in ``variants`` (all sharing that run's sampling), splice each into a
+        copy of the background; then average over runs. All patches of all runs go through MicroZoi in
+        shared batches. ``variants`` are ``mutate`` args (``None`` = wild type); ``mutations`` only defines
+        the recompute window. Everything stays as torch tensors on ``device`` (the patches are already
+        there from MicroZoi). Returns one [n_channels, n_bins] float16 tensor per variant.
+        """
+        if self.fasta_open is None:
+            raise ValueError("Mutation patching requires the fetcher to be created with a fasta_open handle.")
+        if device is None:
+            raise ValueError("device is required for mutation patching.")
+        if flank_bp is None:
+            flank_bp = MICROZOI_RECEPTIVE_FIELD // 4  # 196,608 bp = 768 bins
+        self._validate_mutations(mutations, start_bp, end_bp)
+        model = self._fetch_microzoi_model(device)
+        win_lo, win_hi = self._mutation_window(mutations, start_bp, end_bp, flank_bp)
+
+        single = len(runs) == 1
+        backgrounds, jobs = [], []
+        for r in runs:
+            bg, _off, _crop, shift_bp = self.fetch(
+                chrom, start_bp, end_bp, reverse=reverse, return_full=True, run_idx=r, device=device
+            )
+            backgrounds.append(bg if single else bg.float())  # float32 for the averaging accumulation
+            sh = int(shift_bp) + self._rand_offset(patch_max_offset_bp)
+            soff = self._rand_offset_bins(patch_max_offset_bins)
+            jobs.extend((variant, sh, soff) for variant in variants)  # all variants share this run's sampling
+        patches = self._recompute_patches(model, chrom, win_lo, win_hi, jobs, reverse, crop_mha_bins, device)
+
+        n_var = len(variants)
+        accs = [None] * n_var
+        for run_i, bg in enumerate(backgrounds):
+            for var_i in range(n_var):
+                arr = bg.clone()
+                patch = patches[run_i * n_var + var_i]
+                self._splice(arr, win_lo, win_hi, patch if single else patch.float(), start_bp, end_bp, reverse)
+                if accs[var_i] is None:
+                    accs[var_i] = arr
+                else:
+                    accs[var_i] += arr  # in-place accumulate on device
+        if single:
+            return accs
+        return [(acc / len(runs)).half() for acc in accs]
+
+    def fetch_activations(
+        self,
+        chrom,
+        start_bp,
+        end_bp,
+        device=None,
+        mutations=None,
+        *,
+        reverse=False,
+        n_runs=None,
+        run_idx=None,
+        flank_bp=None,
+        crop_mha_bins=768,
+        patch_max_offset_bp=0,
+        patch_max_offset_bins=0,
+    ):
+        """
+        Fetch a single activation tensor [n_channels, n_bins] for [start_bp, end_bp), on ``device``.
+
+        With ``mutations=None`` this returns cached wild-type activations (mean of ``n_runs`` distinct
+        runs; ``device`` defaults to "cpu"). Otherwise the mutations (applied together) are recomputed over
+        their bounding window and spliced into each run's cached background, then averaged; ``device`` is
+        then required.
+
+        See :meth:`fetch_matched_pair` for parameter meanings. Note: do NOT difference two
+        ``fetch_activations`` calls -- one side would be cached and the other recomputed. Use
+        :meth:`fetch_matched_pair` for clean differences.
+        """
+        n_runs = self._resolve_n_runs(n_runs)
+        runs = self._pick_runs(n_runs, run_idx)
+        if not mutations:
+            return self._read_runs(chrom, start_bp, end_bp, reverse, runs, device or "cpu")
+        (mut_acts,) = self._averaged_patched(
+            chrom,
+            start_bp,
+            end_bp,
+            device,
+            runs,
+            mutations,
+            [mutations],
+            reverse,
+            flank_bp,
+            crop_mha_bins,
+            patch_max_offset_bp,
+            patch_max_offset_bins,
+        )
+        return mut_acts
+
+    def fetch_matched_pair(
+        self,
+        chrom,
+        start_bp,
+        end_bp,
+        device,
+        mutations,
+        *,
+        reverse=False,
+        n_runs=None,
+        run_idx=None,
+        flank_bp=None,
+        crop_mha_bins=768,
+        patch_max_offset_bp=0,
+        patch_max_offset_bins=0,
+    ):
+        """
+        Fetch a matched ``(wt_acts, mut_acts)`` pair, optionally averaged over ``n_runs``.
+
+        ``mutations`` is one list applied together (most often a single block). For each run, WT and mutant
+        are recomputed over the mutations' bounding window using the SAME sampling (so their difference is
+        clean), and the per-run results are averaged. All WT+mutant tiles across all runs go through
+        MicroZoi in shared batches.
 
         Parameters
         ----------
-        run_indices : list of int
-            Run indices to average over. If length==1, returns that run's data.
-        chrom, start_bp, end_bp, reverse : as above
+        chrom, start_bp, end_bp : str, int, int
+            Manta input window (bin-aligned), as produced by ``HiCDataset`` fetch coordinates.
+        device : str
+            Torch device for the MicroZoi recompute.
+        mutations : list[mutation]
+            Tuples applied together: ("replace", pos, seq), ("invert", p1, p2), ("shuffle[k]", p1, p2).
+            Length-preserving only; ``insert``/deletions are rejected.
+        reverse : bool
+            Reverse-complement orientation.
+        n_runs : int, optional
+            Number of distinct cached runs (each a different MicroZoi tiling / sub-bp shift) to average.
+            ``None`` warns and uses 1; pass 2-4 for deeper inference, 1 for speed.
+        run_idx : int, optional
+            Pin the single run when ``n_runs == 1`` (ignored for n_runs > 1).
+        flank_bp : int, optional
+            Context recomputed on each side of the mutated span. Default RF/4 (= 196,608 bp = 768 bins).
+        crop_mha_bins : int
+            MicroZoi crop for the recompute (within the cache's training crop range).
+        patch_max_offset_bp, patch_max_offset_bins : int
+            Extra per-run randomization of the patch on top of the run's own bp shift: an additional
+            sub-bin shift up to +-``patch_max_offset_bp`` and a tile-alignment offset up to
+            ``patch_max_offset_bins`` (a slightly different receptive field per run). 0 disables.
 
         Returns
         -------
-        torch.Tensor
-            Activation of shape [channels, bins].
+        (wt_acts, mut_acts) : (torch.Tensor, torch.Tensor)
+            Each [n_channels, n_bins], float16, on ``device``.
         """
-        orientation = "reverse" if reverse else "forward"
-
-        arr_accum = None
-        with h5py.File(self.cache_path, "r") as f:
-            region_start_bp = -CACHE_OVERHANG_BP
-            for i, run_idx in enumerate(run_indices):
-                run_group = f[f"run{run_idx}"]
-                ds_name = f"{chrom}_{orientation}"
-                if ds_name not in run_group:
-                    raise KeyError(f"Dataset not found: run{run_idx}/{ds_name}")
-                dset = run_group[ds_name]
-
-                total_bins = dset.shape[1]
-                region_end_bp = region_start_bp + total_bins * BIN_BP
-                if start_bp < region_start_bp or end_bp > region_end_bp:
-                    raise ValueError(
-                        f"Requested region [{start_bp}, {end_bp}) is outside stored range "
-                        f"[{region_start_bp}, {region_end_bp})."
-                    )
-                offset_start_bin = (start_bp - region_start_bp) // BIN_BP
-                offset_end_bin = (end_bp - region_start_bp) // BIN_BP
-
-                arr = dset[:, offset_start_bin:offset_end_bin]
-                # Because you stored each orientation in forward orientation,
-                # but labeled it "chrom_reverse" or "chrom_forward",
-                # we keep the final flip if reverse to replicate the original fetcher logic.
-                if reverse:
-                    arr = arr[:, ::-1]
-
-                arr = arr.astype(np.float32)
-                if arr_accum is None:
-                    arr_accum = arr
-                else:
-                    arr_accum += arr
-        if len(run_indices) > 1:
-            arr_accum /= float(len(run_indices))
-        return arr_accum
+        if not mutations:
+            raise ValueError("fetch_matched_pair requires at least one mutation.")
+        n_runs = self._resolve_n_runs(n_runs)
+        runs = self._pick_runs(n_runs, run_idx)
+        wt_acts, mut_acts = self._averaged_patched(
+            chrom,
+            start_bp,
+            end_bp,
+            device,
+            runs,
+            mutations,
+            [None, mutations],
+            reverse,
+            flank_bp,
+            crop_mha_bins,
+            patch_max_offset_bp,
+            patch_max_offset_bins,
+        )
+        return wt_acts, mut_acts
 
 
 class SequenceFetcher(object):
@@ -890,6 +955,8 @@ class HiCDataset:
         fold_types_use=("train",),
         stochastic_offset=True,
         stochastic_reverse=True,
+        n_runs=1,
+        device="cpu",
     ):
         self.filename = filename
         self.n_bins = n_bins
@@ -897,6 +964,12 @@ class HiCDataset:
         self.stochastic_offset = stochastic_offset
         self.stochastic_reverse = stochastic_reverse
         self.fetcher = fetcher
+        # n_runs: int, or a zero-arg callable returning an int per sample (lets the training loop own the
+        # run-averaging augmentation policy -- e.g. "average 2-6 runs 10% of the time, else 1").
+        self.n_runs = n_runs
+        # device for the fetcher's torch output; "cpu" keeps the (threaded) loader off the GPU so its
+        # disk IO overlaps with training compute on the main thread.
+        self.device = device
 
         allowed_fold_types = ["train", "val", "test", "discard"]
         if fold_types_use is not None:
@@ -933,7 +1006,10 @@ class HiCDataset:
             hic_slice = hic_slice[:, ::-1, ::-1].copy()
             weight_slice = weight_slice[:, ::-1].copy()
 
-        activations = self.fetcher.fetch(row["chrom"], fetch_start_bp, fetch_end_bp, reverse=reverse)
+        n_runs = self.n_runs() if callable(self.n_runs) else self.n_runs
+        activations = self.fetcher.fetch(
+            row["chrom"], fetch_start_bp, fetch_end_bp, reverse=reverse, n_runs=n_runs, device=self.device
+        )
 
         result = {
             "acts": activations,
