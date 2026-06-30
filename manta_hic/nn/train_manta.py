@@ -94,23 +94,24 @@ def train_manta_click(
     else:
         manager = nullcontext(input_file)
     with manager as input_file:
+        # keyword args: a previous positional call had val_fold/test_fold swapped (now fixed)
         train_manta(
             input_file,
             cache_path,
             output_folder,
-            device,
-            genome,
-            params,
-            batch_size,
-            n_epochs,
-            lr,
-            save_every,
-            n_bins,
-            bins_pad,
-            test_fold,
-            val_fold,
-            use_all_data,
-            epoch_multiplier,
+            device=device,
+            genome=genome,
+            params=params,
+            batch_size=batch_size,
+            n_epochs=n_epochs,
+            lr=lr,
+            save_every=save_every,
+            n_bins=n_bins,
+            bins_pad=bins_pad,
+            val_fold=val_fold,
+            test_fold=test_fold,
+            use_all_data=use_all_data,
+            epoch_multiplier=epoch_multiplier,
         )
 
 
