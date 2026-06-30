@@ -42,7 +42,6 @@ file = click.Path(exists=True, dir_okay=False)
 @click.option("--input-file", "-i", type=file, required=True, help="Path to the datafile.")
 @click.option("--cache-path", "-c", type=file, required=True, help="Path to the cachefile, should be on SSD")
 @click.option("--output-folder", "-o", type=click.Path(file_okay=False), required=True, help="Output folder.")
-@click.option("--fasta-path", "-f", type=file, required=True, help="Path to the FASTA file.")
 @click.option("--device", "-d", default="cuda:0", help="Torch device")
 @click.option("--genome", "-g", default="hg38", help="Genome")
 @click.option("--n-epochs", "-e", default=0, help="Number of epochs. (0 is auto)")
@@ -62,7 +61,6 @@ def train_manta_click(
     input_file,
     cache_path,
     output_folder,
-    fasta_path,
     device="cuda:0",
     genome="hg38",
     params=None,
@@ -100,7 +98,6 @@ def train_manta_click(
             input_file,
             cache_path,
             output_folder,
-            fasta_path,
             device,
             genome,
             params,
@@ -121,7 +118,6 @@ def train_manta(
     input_file,
     cache_path,
     output_folder,
-    fasta_path,
     device="cuda:0",
     genome="hg38",
     params=None,
@@ -139,7 +135,8 @@ def train_manta(
     if params is None:
         params = {}
 
-    fetcher = CachedStochasticActivationFetcher(cache_path, fasta_path)
+    # training only reads cached activations (no mutation patching), so no fasta handle is needed
+    fetcher = CachedStochasticActivationFetcher(cache_path)
 
     # Run-averaging augmentation policy lives here (the fetcher just averages whatever n_runs it is given):
     # for ~10% of training samples average a random 2-6 cached runs (tilings/sub-bp shifts), else use 1.

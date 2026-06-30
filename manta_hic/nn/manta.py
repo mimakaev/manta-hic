@@ -599,7 +599,7 @@ class CachedStochasticActivationFetcher(object):
         for wild type), ``shift_bp`` shifts the input sequence (sub-bin/bp sampling), and
         ``start_offset_bins`` shifts the tile alignment (a slightly different receptive field). Geometry
         per job mirrors ``fetch_tile_microzoi_activations``. Returns one [n_channels, (win_hi-win_lo)//BIN]
-        float16 array per job, all spliceable at the same window position.
+        float16 torch tensor on ``device`` per job, all spliceable at the same window position.
         """
         num_bins_total = (win_hi - win_lo) // BIN_BP
         tile_size_bins = MICROZOI_RECEPTIVE_FIELD // BIN_BP - 2 * crop_mha_bins
@@ -622,10 +622,13 @@ class CachedStochasticActivationFetcher(object):
             metas.append((num_tiles, soff, end_off))
             tiles.extend(job_tiles)
 
+        # torch.autocast wants a device *type* ("cuda"/"cpu"); a torch.device("cuda:0") would raise. Tensor
+        # placement still uses the full device.
+        device_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
         outs = []
         for i in range(0, len(tiles), self.batch_size):
             batch = list_to_tensor_batch(tiles[i : i + self.batch_size], device)
-            with torch.no_grad(), torch.autocast(device):
+            with torch.no_grad(), torch.autocast(device_type):
                 act = model(batch.permute(0, 2, 1), genome="hg38", offset=0, crop_mha=crop_mha_bins)  # [B, C, N]
                 linear = torch.linspace(-1, 1, act.shape[2], device=device).unsqueeze(0).unsqueeze(0)
                 linear = linear.repeat(act.shape[0], 1, 1)
@@ -838,8 +841,8 @@ class CachedStochasticActivationFetcher(object):
 
         Returns
         -------
-        (wt_acts, mut_acts) : (np.ndarray, np.ndarray)
-            Each [n_channels, n_bins], float16.
+        (wt_acts, mut_acts) : (torch.Tensor, torch.Tensor)
+            Each [n_channels, n_bins], float16, on ``device``.
         """
         if not mutations:
             raise ValueError("fetch_matched_pair requires at least one mutation.")

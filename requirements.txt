@@ -1,0 +1,23 @@
+# manta-hic dependencies.
+#
+# POLICY: no backwards compatibility. We do NOT support old Python or old library versions — newest is
+# preferred, especially when it keeps the code simpler. These are modern *minimum* floors only: no upper
+# caps, no legacy pins, no compatibility shims. Requires Python >= 3.12.
+#
+# Install note: this is not a plain `pip install -r`. See ../setup_env.sh — `ushuffle` ships a
+# pre-Cythonized C file that must be rebuilt on Python 3.12 (longintrepr.h was made private), and the
+# `numba>=0.60` floor below stops the resolver backtracking to numba 0.53 (which won't build on 3.12).
+
+torch>=2.6
+numpy>=2.0
+pandas>=2.2
+polars>=1.0
+pysam>=0.23
+click>=8.1
+h5py>=3.11
+hdf5plugin>=4.4
+bioframe>=0.7
+cooler>=0.10
+cooltools>=0.7
+numba>=0.60
+ushuffle>=1.1.2

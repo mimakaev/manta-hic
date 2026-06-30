@@ -18,17 +18,30 @@ authors = [{ name = "Max Imakaev", email = "mimakaev@gmail.com" }]
 classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python",
-    "Programming Language :: Python :: 3",    
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Operating System :: OS Independent",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = ["torch", "pandas", "numpy", "pysam","polars", "click", "hdf5plugin", "h5py", "bioframe", "cooler", "cooltools", "ushuffle"]
-requires-python = ">=3.10"
+# Modern floors only -- no backwards compatibility, no old Python/library support (see CLAUDE.md / requirements.txt).
+dependencies = [
+    "torch>=2.6",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "polars>=1.0",
+    "pysam>=0.23",
+    "click>=8.1",
+    "hdf5plugin>=4.4",
+    "h5py>=3.11",
+    "bioframe>=0.7",
+    "cooler>=0.10",
+    "cooltools>=0.7",
+    "numba>=0.60",
+    "ushuffle>=1.1.2",
+]
+requires-python = ">=3.12"
 
 [project.scripts]
 manta_hic = "manta_hic.cli:cli"
