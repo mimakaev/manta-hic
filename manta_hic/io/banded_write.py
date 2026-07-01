@@ -86,24 +86,42 @@ def compute_bad_bins(clr, *, cov_cutoff_div=30000.0):
 # --------------------------------------------------------------------------- #
 # Per-chromosome band from cooler pixels                                       #
 # --------------------------------------------------------------------------- #
-def chrom_band_from_pixels(clr, chrom, n_diag):
+def _band_block(sel, chrom, lo, n_bins, b0, b1, n_diag, resolution, clen):
     """
-    Build the raw-count band ``[n_bins, n_diag]`` for one chromosome straight from cooler pixels.
+    Build one int16 band block ``[b1-b0, n_diag]`` for rows ``[b0, b1)`` of a chromosome.
 
-    Pixels are sparse and upper-triangular (bin1 <= bin2), so we read only this chromosome's pixels, keep
-    ``d = bin2 - bin1 < n_diag``, and scatter into ``band[bin1_local, d]``. Far cheaper than fetching dense
-    squares. Counts are clipped to int16 range.
+    Fetches only the band-limited rectangle (rows ``[b0, b1)`` x cols up to ``b1+n_diag``), so far-cis
+    pixels (``d >= n_diag``) are never read -- the win on dense micro-C -- and memory is bounded by the
+    block, not the chromosome. ``sel`` is ``clr.matrix(balance=False, as_pixels=True, join=False)``.
+    """
+    col_hi = min(b1 + n_diag, n_bins)
+    px = sel.fetch(
+        f"{chrom}:{b0*resolution}-{min(b1*resolution, clen)}", f"{chrom}:{b0*resolution}-{min(col_hi*resolution, clen)}"
+    )
+    r = px["bin1_id"].values - (lo + b0)
+    d = px["bin2_id"].values - px["bin1_id"].values
+    keep = (d >= 0) & (d < n_diag) & (r >= 0) & (r < b1 - b0)
+    chunk = np.zeros((b1 - b0, n_diag), dtype=np.int16)
+    chunk[r[keep], d[keep]] = np.clip(px["count"].values[keep], 0, COUNT_CLIP).astype(np.int16)
+    return chunk
+
+
+def chrom_band_from_pixels(clr, chrom, n_diag, block=8192):
+    """
+    Build the raw-count band ``[n_bins, n_diag]`` for one chromosome (int16), band-limited and in blocks.
+
+    Assembles per-block bands (see :func:`_band_block`) so transient memory is ``block x n_diag`` rather
+    than the whole chromosome, and only near-diagonal pixels are read. ``band[x, d] = M[x, x+d]``.
     """
     lo, hi = clr.extent(chrom)
     n_bins = hi - lo
-    px = clr.matrix(balance=False, as_pixels=True, join=False).fetch(chrom)
-    b1 = px["bin1_id"].values - lo
-    d = px["bin2_id"].values - px["bin1_id"].values
-    keep = d < n_diag
-    band = np.zeros((n_bins, n_diag), dtype=np.int32)
-    band[b1[keep], d[keep]] = px["count"].values[keep]
-    np.clip(band, 0, COUNT_CLIP, out=band)
-    return band.astype(np.int16)
+    clen = int(clr.chromsizes[chrom])
+    sel = clr.matrix(balance=False, as_pixels=True, join=False)
+    band = np.zeros((n_bins, n_diag), dtype=np.int16)
+    for b0 in range(0, n_bins, block):
+        b1 = min(b0 + block, n_bins)
+        band[b0:b1] = _band_block(sel, chrom, lo, n_bins, b0, b1, n_diag, clr.binsize, clen)
+    return band
 
 
 # --------------------------------------------------------------------------- #
@@ -118,7 +136,9 @@ def chromarms(genome):
         )
     else:
         arms = bioframe.make_chromarms(chromsizes, bioframe.fetch_centromeres(genome))
-    arms = arms[arms["chrom"] != "chrM"].reset_index(drop=True)
+    # Exclude chrM and chrY: chrY is marked all-bad (compute_bad_bins) so it yields no usable windows;
+    # keeping it in arms would store an all-bad chrY band and drag down the eligible-fraction denominator.
+    arms = arms[~arms["chrom"].isin(["chrM", "chrY"])].reset_index(drop=True)
     arms.columns = ["chrom", "start", "end", "name"][: arms.shape[1]]
     return arms
 
@@ -241,7 +261,9 @@ def coolers_to_banded(
     """
     coolers = [cooler.Cooler(u) for u in cooler_uris]  # opening validates the resolution exists
     C = len(coolers)
-    assert all(c.binsize == resolution for c in coolers), "resolution mismatch"
+    mismatched = [u for u, c in zip(cooler_uris, coolers) if c.binsize != resolution]
+    if mismatched:
+        raise ValueError(f"binsize != {resolution} for: {mismatched}")  # not assert: must hold under python -O
     if len(shortnames) != C:
         raise ValueError(f"{len(shortnames)} shortnames for {C} coolers")
     # All channels must share one bin grid: weights/bad are sliced with coolers[0]'s offsets, so a
@@ -328,14 +350,28 @@ def coolers_to_banded(
         av.create_dataset("end", data=arms["end"].values.astype(np.int64))
         f.create_dataset("exp", data=exp)
 
+        block = 8192
         for chrom in use_chroms:
             lo, hi = coolers[0].extent(chrom)
+            nb = hi - lo
+            clen = int(coolers[0].chromsizes[chrom])
             g = f.create_group(chrom)
-            band = np.stack([chrom_band_from_pixels(c, chrom, n_diag) for c in coolers])  # [C, nb, n_diag]
-            g.create_dataset("band", data=band, compression="lzf", chunks=(1, min(2048, band.shape[1]), n_diag))
+            # Create the band dataset empty and fill it block-by-block per channel: transient memory is one
+            # (block x n_diag) int16 chunk (~16 MB), never the whole [C, nb, n_diag] chromosome (~GBs at
+            # 256 bp). Each (channel, block) is an independent read+write, so this also parallelizes.
+            band_ds = g.create_dataset(
+                "band", shape=(C, nb, n_diag), dtype=np.int16, compression="lzf", chunks=(1, min(block, nb), n_diag)
+            )
+            for ci, clr in enumerate(coolers):
+                sel = clr.matrix(balance=False, as_pixels=True, join=False)
+                for b0 in range(0, nb, block):
+                    b1 = min(b0 + block, nb)
+                    band_ds[ci, b0:b1, :] = _band_block(sel, chrom, lo, nb, b0, b1, n_diag, resolution, clen)
             g.create_dataset("weights", data=weight_all[:, lo:hi])
             g.create_dataset("bad", data=bad_all[:, lo:hi])
             g.create_dataset("arm_id", data=arm_id_all[lo:hi])
             g.create_dataset("fold_id", data=fold_id_all[lo:hi])
+
+        f.attrs["complete"] = True  # written last: a killed/partial file lacks this, so resume rebuilds it
 
     return output_path

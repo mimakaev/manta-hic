@@ -17,11 +17,10 @@ import torch
 from manta_hic.io.banded import BandedHicStore, band_from_dense, square_from_band
 from manta_hic.ops.hic_ops import create_expected_matrix
 
-rng = np.random.default_rng(0)
-
 
 def _symmetric_counts(L, C):
     """A small Hi-C-like symmetric count matrix [C, L, L] that decays with distance."""
+    rng = np.random.default_rng(L * 100 + C)  # local + seeded: deterministic, order-independent
     out = np.zeros((C, L, L), dtype=np.float32)
     for c in range(C):
         a = rng.poisson(3.0, size=(L, L)).astype(np.float32)
@@ -56,6 +55,7 @@ def test_band_rejects_out_of_range():
 # Fixture: a small chromosome with an excluded centromere, two arms, folds     #
 # --------------------------------------------------------------------------- #
 def _make_store(n_bins=200, C=2, n_diag=24):
+    rng = np.random.default_rng(1234)  # local + seeded: deterministic, order-independent
     M = _symmetric_counts(n_bins, C)
     weights = rng.uniform(0.2, 1.0, size=(C, n_bins)).astype(np.float32)
     bad = rng.random((C, n_bins)) < 0.05
