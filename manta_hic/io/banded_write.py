@@ -8,7 +8,8 @@ over the whole genome:
   ``[C, n_bins]`` (balancing weight, bad bins -> 0), ``bad`` ``[C, n_bins]`` bool, ``arm_id`` / ``fold_id``;
 - ``exp`` ``[C, n_arms, n_diag]`` per-arm per-distance expected (first 2 diagonals zeroed);
 - provenance so the file is autonomous (no manifest needed): source URIs, channel shortnames, file sizes,
-  optional md5, genome / resolution / arms / chromsizes.
+  cooler ``sum`` + ``nnz`` (which together identify a cooler -- no hashing needed), genome / resolution /
+  arms / chromsizes.
 
 The band stores RAW counts (not zeroed at bad bins): the loss masks bad bins via the zeroed weights ->
 expected, and keeping raw counts means display shows real data everywhere. Tile eligibility is computed at
@@ -19,7 +20,6 @@ See docs/HIC_STORAGE.md. The build side reads real coolers + cooltools, so it is
 for the full en-masse conversion; this module is the (tested) reference, prototyped on 4dn-diff @ 16384.
 """
 
-import hashlib
 import os
 
 import bioframe
@@ -159,23 +159,42 @@ def zero_bad_in_weights(weights, bad):
     return w
 
 
+def eligible_start_fraction(bad, arm_id, n, *, min_fraction=0.1):
+    """
+    Fraction of length-``n`` window starts that pass the arm-containment + RMS bad-fraction gate -- the
+    fold-agnostic case of :meth:`banded.BandedHicStore.eligible_starts`, and *the* number to watch across a
+    conversion: the share of candidate training windows that survive coverage filtering. A sudden drop vs
+    other resolutions/datasets means a coverage/balancing problem.
+
+    Operates on genome-wide concatenated per-bin arrays (``bad`` ``[C, total]``, ``arm_id`` ``[total]``);
+    ``arm_id`` changes at every arm/chromosome boundary, so no accepted window spans a boundary.
+
+    Returns ``(fraction_of_in_arm_windows, n_eligible, n_candidate_in_arm)``.
+    """
+    C, total = bad.shape
+    if n > total:
+        return 0.0, 0, 0
+    a = np.arange(total - n + 1)
+    arm_changes = np.concatenate([[0], np.cumsum(arm_id[1:] != arm_id[:-1])])
+    arm_ok = (arm_changes[a + n - 1] - arm_changes[a] == 0) & (arm_id[a] != -1)
+    bad_cum = np.concatenate([np.zeros((C, 1)), np.cumsum(bad.astype(np.float64), axis=1)], axis=1)
+    win_mean = (bad_cum[:, a + n] - bad_cum[:, a]) / n
+    bad_ok = np.sqrt((win_mean**2).mean(axis=0)) < min_fraction
+    n_cand = int(arm_ok.sum())
+    n_elig = int((arm_ok & bad_ok).sum())
+    return (n_elig / n_cand if n_cand else 0.0), n_elig, n_cand
+
+
 # --------------------------------------------------------------------------- #
 # Orchestration                                                                #
 # --------------------------------------------------------------------------- #
-def _file_provenance(uris, compute_md5):
-    paths = [u.split("::")[0] for u in uris]
-    sizes = [os.path.getsize(p) if os.path.exists(p) else -1 for p in paths]
-    md5s = []
-    for p in paths:
-        if compute_md5 and os.path.exists(p):
-            h = hashlib.md5()
-            with open(p, "rb") as fh:
-                for chunk in iter(lambda: fh.read(1 << 22), b""):
-                    h.update(chunk)
-            md5s.append(h.hexdigest())
-        else:
-            md5s.append("")
-    return sizes, md5s
+def _file_provenance(uris, coolers):
+    """Source identity: file size, plus the cooler's ``sum`` and ``nnz`` -- together these pin a cooler
+    (its total contacts and number of non-zero pixels), and both are in ``cooler.info`` (no hashing needed)."""
+    sizes = [os.path.getsize(u.split("::")[0]) if os.path.exists(u.split("::")[0]) else -1 for u in uris]
+    nnz = [int(c.info["nnz"]) for c in coolers]
+    sums = [int(c.info["sum"]) for c in coolers]
+    return sizes, nnz, sums
 
 
 def coolers_to_banded(
@@ -189,7 +208,6 @@ def coolers_to_banded(
     n_diag=1024,
     chroms=None,
     nproc=8,
-    compute_md5=False,
     dry_run=False,
 ):
     """
@@ -209,8 +227,6 @@ def coolers_to_banded(
         Diagonals to store (= model ``n_bins``; default 1024).
     chroms : list[str] | None
         Restrict to these chromosomes (default: all in the cooler that have an arm).
-    compute_md5 : bool
-        Also store md5 of each source file (slow for big files; default off).
     dry_run : bool
         If True, do only the cheap parts -- open every cooler (which validates the resolution exists),
         check the bin grids match, resolve arms / chromosome selection, and gather source sizes -- then
@@ -242,7 +258,7 @@ def coolers_to_banded(
     arm_chroms = set(arms["chrom"])
     use_chroms = chroms if chroms is not None else [c for c in coolers[0].chromnames if c in arm_chroms]
     dropped = [c for c in coolers[0].chromnames if c not in set(use_chroms)]
-    sizes, md5s = _file_provenance(cooler_uris, compute_md5)
+    sizes, nnz, sums = _file_provenance(cooler_uris, coolers)
 
     if dry_run:
         chrom_bins = {c: int(coolers[0].extent(c)[1] - coolers[0].extent(c)[0]) for c in use_chroms}
@@ -261,7 +277,8 @@ def coolers_to_banded(
             total_bins=total_bins,
             est_band_bytes=total_bins * C * n_diag * 2,  # int16 band, gap-free
             source_sizes=sizes,
-            source_md5=md5s,
+            source_nnz=nnz,
+            source_sum=sums,
         )
 
     bins = coolers[0].bins()[:]
@@ -271,6 +288,10 @@ def coolers_to_banded(
     weight_all = np.stack([np.nan_to_num(c.bins()["weight"][:]).astype(np.float32) for c in coolers])
     weight_all = np.stack([zero_bad_in_weights(weight_all[i], bad_all[i]) for i in range(C)])
     exp = expected_per_arm(coolers, arms, n_diag, nproc=nproc)
+
+    # The watch metric: fraction of candidate n_diag-windows that survive coverage filtering. Persisted in
+    # the file (autonomous) so a conversion can be audited afterwards without recomputing.
+    accept_frac, n_elig, n_cand = eligible_start_fraction(bad_all, arm_id_all, n_diag)
 
     str_dt = h5py.string_dtype()
 
@@ -283,13 +304,18 @@ def coolers_to_banded(
                 n_diag=n_diag,
                 group_name=group_name,
                 n_channels=C,
+                accepted_fraction=accept_frac,
+                n_eligible=n_elig,
+                n_candidate=n_cand,
+                accept_min_fraction=0.1,
             )
         )
         prov = f.create_group("provenance")
         prov.create_dataset("uris", data=np.array(cooler_uris, dtype=object), dtype=str_dt)
         prov.create_dataset("shortnames", data=np.array(list(shortnames), dtype=object), dtype=str_dt)
         prov.create_dataset("sizes", data=np.array(sizes, dtype=np.int64))
-        prov.create_dataset("md5", data=np.array(md5s, dtype=object), dtype=str_dt)
+        prov.create_dataset("nnz", data=np.array(nnz, dtype=np.int64))
+        prov.create_dataset("sum", data=np.array(sums, dtype=np.int64))
 
         ch = f.create_group("chroms")  # for autonomous plotting: name -> length (bp)
         ch.create_dataset("name", data=np.array(coolers[0].chromnames, dtype=object), dtype=str_dt)

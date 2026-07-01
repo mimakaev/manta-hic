@@ -103,6 +103,17 @@ def test_eligible_starts_matches_brute_force(n, min_fraction, fold):
     np.testing.assert_array_equal(got, want)
 
 
+def test_eligible_start_fraction_matches_store():
+    """The conversion's watch-metric helper must count exactly what eligible_starts(fold=None) returns."""
+    from manta_hic.io.banded_write import eligible_start_fraction
+
+    store, _ = _make_store()
+    for n, mf in [(16, 0.1), (16, 0.5), (32, 1.0)]:
+        frac, n_elig, n_cand = eligible_start_fraction(store.bad, store.arm_id, n, min_fraction=mf)
+        assert n_elig == len(store.eligible_starts(n, min_fraction=mf, fold=None))
+        assert n_cand >= n_elig and (frac == (n_elig / n_cand if n_cand else 0.0))
+
+
 def test_get_window_rejects_excluded_arm():
     """get_window on a bin in an excluded region (arm_id=-1) must raise, not silently use the last arm."""
     store, _ = _make_store()
