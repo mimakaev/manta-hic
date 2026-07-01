@@ -125,13 +125,19 @@ class BandedHicStore:
         - ``weight`` ``[C, n]`` per-bin weights,
         - ``exp``    ``[C, n_diag]`` per-distance expected for this window's arm.
         """
-        hic = square_from_band(self.band, start_bin, n)
+        if n <= 0:
+            raise ValueError(f"n must be positive, got {n}")
+        hic = square_from_band(self.band, start_bin, n)  # also bounds-checks the window
         weight = self.weights[:, start_bin : start_bin + n]
         arm = int(self.arm_id[start_bin])
         if self.exp.ndim == 2:
             exp = self.exp  # single global arm
         elif arm < 0:
             raise ValueError(f"start_bin {start_bin} is in an excluded region (arm_id=-1); no per-arm expected")
+        elif not np.all(self.arm_id[start_bin : start_bin + n] == arm):
+            # eligible_starts guarantees single-arm windows; a hand-picked window crossing an arm boundary
+            # would give a per-arm exp that is wrong for the far side, so reject it rather than mislead.
+            raise ValueError(f"window [{start_bin}, {start_bin + n}) crosses an arm boundary; exp is ambiguous")
         else:
             exp = self.exp[:, arm]
         return hic, weight, exp

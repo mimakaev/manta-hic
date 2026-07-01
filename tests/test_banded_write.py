@@ -76,6 +76,33 @@ def test_dry_run_rejects_bad_shortnames(synthetic_cooler, tmp_path):
         )
 
 
+def test_assign_arm_fold_ids(monkeypatch):
+    """arm_id from arms, fold_id from the (polars) Borzoi fold_df incl. 'foldN' parsing; excluded -> -1."""
+    import polars as pl
+
+    res, L = 100, 10
+    bins = pd.DataFrame({"chrom": ["chrX"] * L, "start": np.arange(L) * res, "end": (np.arange(L) + 1) * res})
+    arms = pd.DataFrame({"chrom": ["chrX", "chrX"], "start": [0, 500], "end": [500, 1000], "name": ["p", "q"]})
+    fake = pl.DataFrame(
+        {
+            "genome": ["hg38"] * 2,
+            "chrom": ["chrX"] * 2,
+            "start": [0, 600],
+            "end": [600, 1000],
+            "fold": ["fold3", "fold5"],
+        }
+    )
+    monkeypatch.setattr(bw, "fold_df", fake)
+    arm_id, fold_id = bw.assign_arm_fold_ids(bins, arms, "hg38")
+    mid = (bins["start"].values + bins["end"].values) // 2
+    assert (arm_id[mid < 500] == 0).all() and (arm_id[mid >= 500] == 1).all()
+    assert (fold_id[mid < 600] == 3).all() and (fold_id[mid >= 600] == 5).all()  # "fold3"/"fold5" -> 3/5
+    # a chromosome absent from arms/folds stays excluded (-1)
+    other = pd.DataFrame({"chrom": ["chrZ"], "start": [0], "end": [res]})
+    a2, f2 = bw.assign_arm_fold_ids(other, arms, "hg38")
+    assert a2[0] == -1 and f2[0] == -1
+
+
 def test_mismatched_bin_grid_rejected(tmp_path):
     """Coolers in a group with different bin grids must be rejected before any conversion work."""
     p1 = _make_cooler(tmp_path / "a.cool", 300, seed=1)

@@ -123,6 +123,15 @@ def test_get_window_rejects_excluded_arm():
         store.get_window(92, n)
 
 
+def test_get_window_rejects_arm_crossing_and_nonpositive_n():
+    """A window that crosses an arm boundary (ambiguous per-arm exp) or has n<=0 must raise."""
+    store, _ = _make_store()
+    with pytest.raises(ValueError, match="crosses an arm boundary"):
+        store.get_window(85, 20)  # [85,105) spans arm0 -> excluded -> arm1
+    with pytest.raises(ValueError, match="must be positive"):
+        store.get_window(10, 0)
+
+
 def test_eligibility_never_crosses_centromere_or_arm():
     store, _ = _make_store()
     n = 16

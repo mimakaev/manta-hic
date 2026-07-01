@@ -28,6 +28,7 @@ import cooltools
 import h5py
 import numpy as np
 import pandas as pd
+import polars as pl
 
 from manta_hic.training_meta import fold_df
 
@@ -166,7 +167,7 @@ def assign_arm_fold_ids(bins, arms, genome):
         arm_id[(chroms == a["chrom"]) & (mid >= a["start"]) & (mid < a["end"])] = ai
 
     fold_id = np.full(len(bins), -1, dtype=np.int32)
-    for f in fold_df.filter(fold_df["genome"] == genome).iter_rows(named=True):  # polars, no pyarrow
+    for f in fold_df.filter(pl.col("genome") == genome).iter_rows(named=True):  # polars, no pyarrow
         m = (chroms == f["chrom"]) & (mid >= f["start"]) & (mid < f["end"])
         fold_id[m] = int(str(f["fold"]).replace("fold", ""))
     return arm_id, fold_id
@@ -312,8 +313,10 @@ def coolers_to_banded(
     exp = expected_per_arm(coolers, arms, n_diag, nproc=nproc)
 
     # The watch metric: fraction of candidate n_diag-windows that survive coverage filtering. Persisted in
-    # the file (autonomous) so a conversion can be audited afterwards without recomputing.
-    accept_frac, n_elig, n_cand = eligible_start_fraction(bad_all, arm_id_all, n_diag)
+    # the file (autonomous) so a conversion can be audited afterwards without recomputing. One source of
+    # truth for the threshold so the recorded attr can't drift from the computed metric.
+    accept_min_fraction = 0.1
+    accept_frac, n_elig, n_cand = eligible_start_fraction(bad_all, arm_id_all, n_diag, min_fraction=accept_min_fraction)
 
     str_dt = h5py.string_dtype()
 
@@ -329,7 +332,7 @@ def coolers_to_banded(
                 accepted_fraction=accept_frac,
                 n_eligible=n_elig,
                 n_candidate=n_cand,
-                accept_min_fraction=0.1,
+                accept_min_fraction=accept_min_fraction,
             )
         )
         prov = f.create_group("provenance")
