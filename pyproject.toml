@@ -13,10 +13,10 @@ name = "manta-hic"
 version = "0.0.1"
 description = "A neural network for reproducing Hi-C data from sequence"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "Max Imakaev", email = "mimakaev@gmail.com" }]
 classifiers = [
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
@@ -45,6 +45,13 @@ requires-python = ">=3.12"
 
 [project.scripts]
 manta_hic = "manta_hic.cli:cli"
+
+# Package only the library. Without this, setuptools' flat-layout auto-discovery sees the sibling
+# `manta_demo/` directory as a second top-level package and refuses to build ("Multiple top-level packages
+# discovered in a flat-layout"). `tests`/`scripts`/`docs` are on setuptools' default-exclude list; the demo
+# folder is not, so we pin discovery explicitly.
+[tool.setuptools.packages.find]
+include = ["manta_hic*"]
 
 [tool.setuptools.package-data]
 manta_hic = ["data/*"]

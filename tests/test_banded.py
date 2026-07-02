@@ -114,6 +114,33 @@ def test_eligible_start_fraction_matches_store():
         assert n_cand >= n_elig and (frac == (n_elig / n_cand if n_cand else 0.0))
 
 
+@pytest.mark.parametrize("n", [16, 32])
+@pytest.mark.parametrize("min_fraction", [0.1, 0.5, 1.0])
+@pytest.mark.parametrize("fold", [None, 0, 1, 2])
+def test_is_eligible_matches_eligible_starts(n, min_fraction, fold):
+    """The O(1) single-window test must agree with the vectorized eligible_starts set for every bin."""
+    store, _ = _make_store()
+    starts = set(int(a) for a in store.eligible_starts(n, min_fraction=min_fraction, fold=fold))
+    for a in range(store.n_bins - n + 1):
+        assert store.is_eligible(a, n, min_fraction=min_fraction, fold=fold) == (a in starts)
+
+
+def test_is_eligible_rejects_out_of_bounds_and_nonpositive():
+    store, _ = _make_store()
+    assert not store.is_eligible(store.n_bins - 5, 16)  # runs off the end
+    assert not store.is_eligible(-1, 16) and not store.is_eligible(0, 0)
+
+
+def test_eligible_starts_fold_set_is_union_of_single_folds():
+    """eligible_starts(fold={a,b}) must equal the union of the single-fold results (used for the train split)."""
+    store, _ = _make_store()
+    n = 16
+    union = set(int(a) for f in (0, 2) for a in store.eligible_starts(n, fold=f))
+    got = set(int(a) for a in store.eligible_starts(n, fold={0, 2}))
+    assert got == union
+    assert 1 not in set(int(store.fold_id[a]) for a in got)  # fold 1 windows excluded
+
+
 def test_get_window_rejects_excluded_arm():
     """get_window on a bin in an excluded region (arm_id=-1) must raise, not silently use the last arm."""
     store, _ = _make_store()

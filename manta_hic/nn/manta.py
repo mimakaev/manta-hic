@@ -1,10 +1,7 @@
-import datetime as dt
 import io
 import json
-import queue
 import threading
 import warnings
-from contextlib import nullcontext
 from typing import Optional
 
 import h5py
@@ -25,18 +22,29 @@ from manta_hic.nn.layers import (
     TransformerTower,
 )
 from manta_hic.nn.microzoi import MicroBorzoi
-from manta_hic.ops.hic_ops import (
-    coarsegrained_hic_corrs,
-    create_expected_matrix,
-    hic_hierarchical_loss,
-)
 from manta_hic.ops.seq_ops import make_seq_1hot, open_fasta_chromsizes
-from manta_hic.ops.tensor_ops import list_to_tensor_batch
-from manta_hic.training_meta import assign_fold_type
+from manta_hic.ops.tensor_ops import list_to_tensor_batch, round_mantissa
 
 MICROZOI_RECEPTIVE_FIELD = 2**19 + 2**18
 BIN_BP = 256
 CACHE_OVERHANG_BP = 2**22
+
+# Activation-cache codec: Blosc-zstd + BIT shuffle (was plain Zstd level 9). Decompresses multi-threaded --
+# with BLOSC_NTHREADS=4 (set in the package __init__) a fetch reads ~30% faster than the old single-threaded
+# zstd, the training/mutation IO hot path. On float16 activations bitshuffle beats byteshuffle: ~30% faster
+# reads and ~5x faster writes at ~the same size. clevel=5 reads faster than 9. Same codec as the bands.
+CACHE_COMPRESSION = hdf5plugin.Blosc(cname="zstd", clevel=5, shuffle=hdf5plugin.Blosc.BITSHUFFLE)
+
+# Lossy pre-compression: keep only this many of float16's 10 mantissa bits (round-to-nearest) before writing.
+# 4 bits shrinks the cache a further ~1.7x with the predicted Hi-C map still correlated 0.999998 with the
+# full-precision map (the model sees f16/bf16 and averages runs). Set to 10 (or None) to store full precision.
+CACHE_ROUND_BITS = 4
+
+# Cache HDF5 chunk = (n_channels, CACHE_CHUNK_BINS). A fetch reads all channels over a large (10k-40k-bin)
+# window, so the chunk wants to be big enough for Blosc to thread. 4096 reads the common ~10k window as fast
+# as 1024, reads big 40k windows ~15% faster, and compresses ~50% faster (multi-threaded) at a hair smaller
+# size; 8192 starts to over-read the 10k window. (512/1024 are too small -- fewer blocks per chunk.)
+CACHE_CHUNK_BINS = 4096
 
 
 def fetch_tile_microzoi_activations(
@@ -328,8 +336,8 @@ def populate_microzoi_cache(
                         ds_name,
                         shape=(n_channels, total_bins),
                         dtype=np.float16,
-                        compression=hdf5plugin.Zstd(clevel=9),
-                        chunks=(n_channels, min(1024, total_bins)),
+                        chunks=(n_channels, min(CACHE_CHUNK_BINS, total_bins)),
+                        **CACHE_COMPRESSION,
                     )
 
                     block_bp = 2**23
@@ -369,6 +377,8 @@ def populate_microzoi_cache(
 
                         arr = activ.cpu().numpy().astype(np.float16)
                         assert (~np.isfinite(arr)).sum() == 0
+                        if CACHE_ROUND_BITS is not None:  # lossy: zero low mantissa bits for ~1.7x compression
+                            arr = round_mantissa(arr, CACHE_ROUND_BITS)
 
                         if reverse_bool:  # reverse the array - we are saving in forward orientation
                             arr = arr[:, ::-1]
@@ -891,268 +901,6 @@ class DummyFetcher(object):
 
     def fetch(self, *args, **kwargs):
         return None
-
-
-class HiCDataset:
-    """
-    A dataset class for handling Hi-C data.
-    Parameters
-    ----------
-    filename : str
-        Path to the HDF5 file containing Hi-C data.
-    fetcher : CachedStochasticActivationFetcher or other fetcher defined above
-        A fetcher object that can retrieve activations for a given region.
-    n_bins : int
-        Number of bins to use for Hi-C data slices.
-    bins_pad : int
-        Padding to add around Hi-C data slices.
-    genome : str
-        Genome name for the dataset - used to assign fold types.
-    test_fold : str, optional
-        Name of the fold to use for testing data (default is "fold3").
-    val_fold : str, optional
-        Name of the fold to use for validation data (default is "fold4").
-    fold_types_use : Iterable[str] | None, optional
-        Which fold-types to use for the dataset (default is ["train"]). None uses everything.
-    random : bool, optional
-        Whether to use random starting positions for Hi-C data slices (default is True).
-
-    Methods
-    -------
-    __len__()
-        Returns the number of samples in the dataset.
-    __getitem__(idx, stochastic_reverse=True)
-        Retrieves a sample from the dataset at the specified index.
-    get_single(idx)
-        Retrieves a sample from the dataset at the specified index without random shifts or reverse.
-
-    Notes
-    -----
-
-    The Hi-C dataset class holds Hi-C data in a slightly bigger squares than the requested nbins.
-    The squares are tiled in a way that any map n_bins by n_bins can be extracted from the dataset.
-    (specifically, we save 1.25*n_bins by 1.25*n_bins squares, and save them every 0.25*n_bins).
-
-    The datasets holds 3 arrays that define a (chrom, start, end) dataframe.
-    It also saves:
-
-    *  the Hi-C data in a 3D array (index, 1.25*n_bins, 1.25*n_bins)
-    *  the weights in a 2D array (index, 1.25*n_bins)
-    *  the expected values in a 2D array (index, 1.25*n_bins)
-
-    The expected value was calculated from the entire crhomosomal arm.
-    """
-
-    def __init__(
-        self,
-        filename,
-        fetcher,
-        n_bins,
-        bins_pad,
-        genome,
-        test_fold="fold3",
-        val_fold="fold4",
-        fold_types_use=("train",),
-        stochastic_offset=True,
-        stochastic_reverse=True,
-        n_runs=1,
-        device="cpu",
-    ):
-        self.filename = filename
-        self.n_bins = n_bins
-        self.bins_pad = bins_pad
-        self.stochastic_offset = stochastic_offset
-        self.stochastic_reverse = stochastic_reverse
-        self.fetcher = fetcher
-        # n_runs: int, or a zero-arg callable returning an int per sample (lets the training loop own the
-        # run-averaging augmentation policy -- e.g. "average 2-6 runs 10% of the time, else 1").
-        self.n_runs = n_runs
-        # device for the fetcher's torch output; "cpu" keeps the (threaded) loader off the GPU so its
-        # disk IO overlaps with training compute on the main thread.
-        self.device = device
-
-        allowed_fold_types = ["train", "val", "test", "discard"]
-        if fold_types_use is not None:
-            assert all(fold_type in allowed_fold_types for fold_type in fold_types_use), "Invalid fold type"
-
-        with h5py.File(filename, "r") as f:
-            df = pl.DataFrame({"chrom": f["chrom"][:], "start": f["start"][:], "end": f["end"][:]})
-            self.M = f["hic"].shape[-1]
-            self.n_channels = f["hic"].shape[1]
-            self.hic_res = (f["end"][0] - f["start"][0]) // self.M  # infer Hi-C resolution from the matrix size
-
-        df = df.with_columns(pl.col("chrom").cast(str), pl.int_range(pl.len()).alias("index"))
-        df = assign_fold_type(df, test_fold=test_fold, val_fold=val_fold, genome=genome)
-
-        if fold_types_use:
-            df = df.filter(pl.col("fold_type").is_in(fold_types_use))
-
-        self.df = df
-
-    def get_slice_by_index(self, idx, offset_bins=0, reverse=False):
-        row = self.df.row(idx, named=True)
-        orig_idx = row["index"]
-        map_start_bp = row["start"] + offset_bins * self.hic_res
-        map_end_bp = map_start_bp + self.n_bins * self.hic_res
-        fetch_start_bp = map_start_bp - self.bins_pad * self.hic_res
-        fetch_end_bp = map_end_bp + self.bins_pad * self.hic_res
-
-        with h5py.File(self.filename, "r") as f:
-            offset_slice = slice(offset_bins, offset_bins + self.n_bins)
-            hic_slice = f["hic"][orig_idx, :, offset_slice, offset_slice]
-            weight_slice = f["weights"][orig_idx, :, offset_slice]
-            exp = f["exp"][orig_idx]
-        if reverse:
-            hic_slice = hic_slice[:, ::-1, ::-1].copy()
-            weight_slice = weight_slice[:, ::-1].copy()
-
-        n_runs = self.n_runs() if callable(self.n_runs) else self.n_runs
-        activations = self.fetcher.fetch(
-            row["chrom"], fetch_start_bp, fetch_end_bp, reverse=reverse, n_runs=n_runs, device=self.device
-        )
-
-        result = {
-            "acts": activations,
-            "hic_slice": hic_slice,
-            "weight_slice": weight_slice,
-            "exp": exp,
-            "chrom": row["chrom"],
-            "fetch_start_bp": fetch_start_bp,
-            "fetch_end_bp": fetch_end_bp,
-            "map_start_bp": map_start_bp,
-            "map_end_bp": map_end_bp,
-            "reverse": reverse,
-        }
-
-        return result
-
-    def get_slice_by_coords(self, chrom, start_bp, reverse=False):
-        """
-        Finds which record does the given coordinates belong to and returns the slice.
-        If record is not found (usually if it crosses the centromere) raise an error.
-        """
-        end_bp = start_bp + self.n_bins * self.hic_res
-        df = self.df.with_row_count(name="new_index").filter(
-            (pl.col("chrom") == chrom) & (pl.col("start") <= start_bp) & (pl.col("end") >= end_bp)
-        )
-        if len(df) == 0:
-            raise ValueError("Region not found in the dataset")
-        row = df.row(0, named=True)
-        if (start_bp - row["start"]) % self.hic_res != 0:
-            raise ValueError("Start bp is not multiple of hic resolution")
-        offset = (start_bp - row["start"]) // self.hic_res
-        return self.get_slice_by_index(row["new_index"], offset_bins=offset, reverse=reverse)
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        offset_bins = np.random.randint(0, self.M - self.n_bins) if self.stochastic_offset else 0
-        use_reverse = self.stochastic_reverse and np.random.rand() > 0.5
-        return self.get_slice_by_index(idx, offset_bins=offset_bins, reverse=use_reverse)
-
-
-class ThreadedDataLoader:
-    """
-    A data loader that loads data in a separate thread and uses a queue to store batches.
-    Parameters
-    ----------
-    dataset : Dataset
-        The dataset from which to load the data.
-    batch_size : int, optional
-        The number of samples per batch to load (default is 1).
-    shuffle : bool, optional
-        Whether to shuffle the data before loading (default is True).
-    fraction : float, optional
-        The fraction of the dataset to load (default is 1.0). 0.25 is recommended as default tile have 25% overlap.
-    queue_size : int, optional
-        The maximum size of the queue to store batches (default is 3).
-    Methods
-    -------
-    __iter__()
-        Returns an iterator that yields batches of data.
-    get_item(idx)
-        Returns a single item from the dataset at the specified index.
-    """
-
-    def __init__(self, dataset, batch_size=1, shuffle=True, fraction=1.0, queue_size=3):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.fraction = fraction
-        self.q = queue.Queue(maxsize=queue_size)
-
-    def _loader_thread(self):
-        need = int(len(self.dataset) * self.fraction)
-        indices = np.random.choice(len(self.dataset), need, replace=False)
-        if not self.shuffle:
-            indices = np.sort(indices)
-        for i in range(0, len(indices), self.batch_size):
-            batch_idx = indices[i : i + self.batch_size]
-            batch = [self.dataset[j] for j in batch_idx]
-            if len(batch) < self.batch_size:
-                break
-            # transpose so that interms, hic_slice, weightmat, exp become separate lists
-            self.q.put(tuple(batch))
-        self.q.put(None)
-
-    def __iter__(self):
-        thread = threading.Thread(target=self._loader_thread)
-        thread.start()
-        while True:
-            data = self.q.get()
-            if data is None:
-                break
-            yield data
-        thread.join()
-
-    def get_item(self, idx):
-        return ([i] for i in self.dataset.get_single(idx))
-
-
-def run_epoch(model, dataloader, device, is_train=True, optimizer=None, scaler=None):
-    corrs = []
-
-    model.train() if is_train else model.eval()
-
-    for batch in dataloader:
-        t0 = dt.datetime.now()
-
-        acts = list_to_tensor_batch([i["acts"] for i in batch], device)
-        target = list_to_tensor_batch([i["hic_slice"] for i in batch], device)
-        weight = list_to_tensor_batch([i["weight_slice"] for i in batch], device)
-        exp = list_to_tensor_batch([i["exp"] for i in batch], device)
-        target, weightmat = create_expected_matrix(target, weight, exp)
-
-        # calculating activations
-
-        with torch.autocast("cuda"):
-
-            if is_train:
-                acts.requires_grad = True
-                optimizer.zero_grad()
-
-            with torch.no_grad() if not is_train else nullcontext():
-                output = model(acts)
-                if is_train:
-                    loss = hic_hierarchical_loss(output, target, weightmat)
-                corr = [i for i in coarsegrained_hic_corrs(output, target, weight, exp, also_divide_by_mean=True)]
-                corr = np.array([i.detach().cpu().numpy() for i in corr])
-
-            corrs.append(corr)
-
-        # Backprop/update only if training
-        if is_train:
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-        # Simple progress print
-        duration = (dt.datetime.now() - t0).total_seconds()
-        cr = ", ".join([f"{i.mean():.4f}" for i in corr])
-        print(f"[{'Train' if is_train else 'Val'}] spearm/pears/msd = {cr}, duration={duration:.3f} s   ", end="\r")
-
-    return np.array(corrs)
 
 
 def calculate_distance_matrix(n_bins):
