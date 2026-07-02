@@ -10,13 +10,14 @@ import numpy as np
 import torch
 import torch.optim as optim
 
-from manta_hic.nn.manta import (
-    CachedStochasticActivationFetcher,
+from manta_hic.io.banded import BandedHicFile
+from manta_hic.nn.dataset import (
     HiCDataset,
-    Manta2,
     ThreadedDataLoader,
     run_epoch,
+    train_val_test_folds,
 )
+from manta_hic.nn.manta import CachedStochasticActivationFetcher, Manta2
 
 
 @contextmanager
@@ -139,35 +140,35 @@ def train_manta(
     # training only reads cached activations (no mutation patching), so no fasta handle is needed
     fetcher = CachedStochasticActivationFetcher(cache_path)
 
+    # One open banded file shared by train + val (per-bin fold ids live in it, so the fold split is here).
+    banded = BandedHicFile(input_file)
+    if banded.genome != genome:
+        raise ValueError(f"banded file genome {banded.genome!r} != requested genome {genome!r}")
+    train_folds, val_folds, _test_folds = train_val_test_folds(banded, val_fold, test_fold)
+
     # Run-averaging augmentation policy lives here (the fetcher just averages whatever n_runs it is given):
     # for ~10% of training samples average a random 2-6 cached runs (tilings/sub-bp shifts), else use 1.
     def sample_n_runs(prob_mean=0.1, min_runs=2, max_runs=6):
         return int(np.random.randint(min_runs, max_runs + 1)) if np.random.rand() < prob_mean else 1
 
     ds_train = HiCDataset(
-        input_file,
+        banded,
         fetcher,
         n_bins=n_bins,
         bins_pad=bins_pad,
-        genome=genome,
-        fold_types_use=None if use_all_data else ["train"],
-        stochastic_offset=True,
-        stochastic_reverse=True,
+        folds=None if use_all_data else train_folds,  # None = all data, no fold constraint
+        sampling="random",
         n_runs=sample_n_runs,
     )
 
     if not use_all_data:
         ds_val = HiCDataset(
-            input_file,
+            banded,
             fetcher,
             n_bins=n_bins,
             bins_pad=bins_pad,
-            genome=genome,
-            fold_types_use=["val"],
-            test_fold=test_fold,
-            val_fold=val_fold,
-            stochastic_offset=False,
-            stochastic_reverse=False,
+            folds=val_folds,
+            sampling="strided",  # deterministic eval tiling
         )
         assert len(ds_val) > 0, "No validation data"
     else:
@@ -175,7 +176,8 @@ def train_manta(
 
     assert len(ds_train) > 0, "No training data"
 
-    train_dl = ThreadedDataLoader(ds_train, batch_size=batch_size, shuffle=True, fraction=0.5)
+    # The dataset already sizes an epoch (~N_eligible / stride windows), so iterate all of it.
+    train_dl = ThreadedDataLoader(ds_train, batch_size=batch_size, shuffle=True, fraction=1.0)
 
     hic_res = ds_train.hic_res
     # resolution of microzoi is 256bp, which has log2(256)=8. plus one because we maxpool after the first convolution

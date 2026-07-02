@@ -26,6 +26,7 @@ import bioframe
 import cooler
 import cooltools
 import h5py
+import hdf5plugin
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -33,6 +34,14 @@ import polars as pl
 from manta_hic.training_meta import fold_df
 
 COUNT_CLIP = 32000  # clip raw counts to fit int16 (matches cool_io)
+
+# Band codec: Blosc-zstd with BIT shuffle. On int16 Hi-C counts bitshuffle beats byteshuffle -- a further
+# ~19% smaller (Hi-C counts are small, so high bit-planes are mostly zero -> long zero runs) and ~2x faster
+# to compress, at the same read speed. Overall ~3x smaller than the original lzf. clevel=5 is the sweet spot;
+# clevel=9 shrinks a bit more but compresses much slower. Reading needs the Blosc filter registered --
+# `import hdf5plugin` (here and in io/banded.py) does that process-wide; the shuffle type is stored in the
+# stream, so readers un-shuffle automatically (no extra config).
+BAND_COMPRESSION = hdf5plugin.Blosc(cname="zstd", clevel=5, shuffle=hdf5plugin.Blosc.BITSHUFFLE)
 
 
 # --------------------------------------------------------------------------- #
@@ -353,7 +362,13 @@ def coolers_to_banded(
         av.create_dataset("end", data=arms["end"].values.astype(np.int64))
         f.create_dataset("exp", data=exp)
 
-        block = 8192
+        block = 8192  # write granularity (transient memory ~ one block x n_diag int16 chunk, ~16 MB)
+        # HDF5 read chunk, decoupled from the write block. With the Blosc-zstd+shuffle codec (multi-threaded
+        # de/compress, see BAND_COMPRESSION) a 512-row chunk is the sweet spot: it reads a 1024-bin window
+        # faster than smaller chunks (bigger chunk -> more blocks -> the 4 threads parallelize decompression)
+        # AND compresses multi-threaded (~330 vs ~120 MB/s for a 128-row chunk, which starves the threads),
+        # at identical file size. Divides the 8192 write block so each write lands on whole chunks.
+        read_chunk = 512
         for chrom in use_chroms:
             lo, hi = coolers[0].extent(chrom)
             nb = hi - lo
@@ -363,7 +378,11 @@ def coolers_to_banded(
             # (block x n_diag) int16 chunk (~16 MB), never the whole [C, nb, n_diag] chromosome (~GBs at
             # 256 bp). Each (channel, block) is an independent read+write, so this also parallelizes.
             band_ds = g.create_dataset(
-                "band", shape=(C, nb, n_diag), dtype=np.int16, compression="lzf", chunks=(1, min(block, nb), n_diag)
+                "band",
+                shape=(C, nb, n_diag),
+                dtype=np.int16,
+                chunks=(1, min(read_chunk, nb), n_diag),
+                **BAND_COMPRESSION,
             )
             for ci, clr in enumerate(coolers):
                 sel = clr.matrix(balance=False, as_pixels=True, join=False)
