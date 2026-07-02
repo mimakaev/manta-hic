@@ -170,3 +170,7 @@ CLAUDE.md
 node_modules
 package-lock.json
 package.json
+
+
+# Scripts used in development 
+scripts-dev
