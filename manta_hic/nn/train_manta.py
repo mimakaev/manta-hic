@@ -141,87 +141,89 @@ def train_manta(
     fetcher = CachedStochasticActivationFetcher(cache_path)
 
     # One open banded file shared by train + val (per-bin fold ids live in it, so the fold split is here).
-    banded = BandedHicFile(input_file)
-    if banded.genome != genome:
-        raise ValueError(f"banded file genome {banded.genome!r} != requested genome {genome!r}")
-    train_folds, val_folds, _test_folds = train_val_test_folds(banded, val_fold, test_fold)
+    # The datasets slice it lazily for the whole run, so it stays open until training finishes -- the `with`
+    # guarantees the HDF5 handle is closed on normal exit and on any exception below.
+    with BandedHicFile(input_file) as banded:
+        if banded.genome != genome:
+            raise ValueError(f"banded file genome {banded.genome!r} != requested genome {genome!r}")
+        train_folds, val_folds, _test_folds = train_val_test_folds(banded, val_fold, test_fold)
 
-    # Run-averaging augmentation policy lives here (the fetcher just averages whatever n_runs it is given):
-    # for ~10% of training samples average a random 2-6 cached runs (tilings/sub-bp shifts), else use 1.
-    def sample_n_runs(prob_mean=0.1, min_runs=2, max_runs=6):
-        return int(np.random.randint(min_runs, max_runs + 1)) if np.random.rand() < prob_mean else 1
+        # Run-averaging augmentation policy lives here (the fetcher just averages whatever n_runs it is given):
+        # for ~10% of training samples average a random 2-6 cached runs (tilings/sub-bp shifts), else use 1.
+        def sample_n_runs(prob_mean=0.1, min_runs=2, max_runs=6):
+            return int(np.random.randint(min_runs, max_runs + 1)) if np.random.rand() < prob_mean else 1
 
-    ds_train = HiCDataset(
-        banded,
-        fetcher,
-        n_bins=n_bins,
-        bins_pad=bins_pad,
-        folds=None if use_all_data else train_folds,  # None = all data, no fold constraint
-        sampling="random",
-        n_runs=sample_n_runs,
-    )
-
-    if not use_all_data:
-        ds_val = HiCDataset(
+        ds_train = HiCDataset(
             banded,
             fetcher,
             n_bins=n_bins,
             bins_pad=bins_pad,
-            folds=val_folds,
-            sampling="strided",  # deterministic eval tiling
-        )
-        assert len(ds_val) > 0, "No validation data"
-    else:
-        ds_val = None
-
-    assert len(ds_train) > 0, "No training data"
-
-    # The dataset already sizes an epoch (~N_eligible / stride windows), so iterate all of it.
-    train_dl = ThreadedDataLoader(ds_train, batch_size=batch_size, shuffle=True, fraction=1.0)
-
-    hic_res = ds_train.hic_res
-    # resolution of microzoi is 256bp, which has log2(256)=8. plus one because we maxpool after the first convolution
-    # which is not in a tower. Also tower is split to be before/after MHA, with one layer after MHA, so minimum
-    # resolution of the model is 1024bp:
-    # microzoi (256bp) -> maxpool (512bp) -> MHA (512bp) -> last conv block + maxpool (1024bp) -> Hi-C map (1024bp))
-    params["tower_height"] = int(np.round(np.log2(hic_res))) - 9
-
-    res_epoch_dict = {256: 20, 512: 30, 1024: 40, 2048: 50, 4096: 60, 8192: 70, 16384: 80}
-    if n_epochs == 0:
-        n_epochs = res_epoch_dict[hic_res]
-    n_epochs = int(n_epochs * epoch_multiplier)
-
-    model = Manta2(**params, output_channels=ds_train.n_channels).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scaler = torch.GradScaler()
-    os.makedirs(output_folder, exist_ok=True)
-
-    for epoch in range(n_epochs):
-        model.train()
-        corrs_train = run_epoch(
-            model,
-            train_dl,
-            device=device,
-            is_train=True,
-            optimizer=optimizer,
-            scaler=scaler,
+            folds=None if use_all_data else train_folds,  # None = all data, no fold constraint
+            sampling="random",
+            n_runs=sample_n_runs,
         )
 
-        # -- Validate
         if not use_all_data:
-            val_dl = ThreadedDataLoader(ds_val, batch_size=batch_size * 2, shuffle=False, fraction=1)
-            corrs_val = run_epoch(model, val_dl, device=device, is_train=False)
+            ds_val = HiCDataset(
+                banded,
+                fetcher,
+                n_bins=n_bins,
+                bins_pad=bins_pad,
+                folds=val_folds,
+                sampling="strided",  # deterministic eval tiling
+            )
+            assert len(ds_val) > 0, "No validation data"
         else:
-            corrs_val = np.zeros((1, 1, 1, 1))
+            ds_val = None
 
-        if (epoch + 1) % save_every == 0:
-            torch.save(model.state_dict(), f"{output_folder}/model_{epoch}.pth")
+        assert len(ds_train) > 0, "No training data"
 
-        with open(f"{output_folder}/corrs_{epoch}.pkl", "wb") as f:
-            pickle.dump([corrs_train, corrs_val], f)
+        # The dataset already sizes an epoch (~N_eligible / stride windows), so iterate all of it.
+        train_dl = ThreadedDataLoader(ds_train, batch_size=batch_size, shuffle=True, fraction=1.0)
 
-        ct = ", ".join([f"{i:.3f}" for i in np.mean(corrs_train, axis=(0, 2, 3))])
-        cv = ", ".join([f"{i:.3f}" for i in np.mean(corrs_val, axis=(0, 2, 3))])
+        hic_res = ds_train.hic_res
+        # resolution of microzoi is 256bp, which has log2(256)=8. plus one because we maxpool after the first convolution
+        # which is not in a tower. Also tower is split to be before/after MHA, with one layer after MHA, so minimum
+        # resolution of the model is 1024bp:
+        # microzoi (256bp) -> maxpool (512bp) -> MHA (512bp) -> last conv block + maxpool (1024bp) -> Hi-C map (1024bp))
+        params["tower_height"] = int(np.round(np.log2(hic_res))) - 9
 
-        print(f"Epoch {epoch+1}/{n_epochs}: train_corrs={ct}, val_corr={cv}   ")
-    torch.save(model.state_dict(), os.path.join(output_folder, "saved_model.pth"))
+        res_epoch_dict = {256: 20, 512: 30, 1024: 40, 2048: 50, 4096: 60, 8192: 70, 16384: 80}
+        if n_epochs == 0:
+            n_epochs = res_epoch_dict[hic_res]
+        n_epochs = int(n_epochs * epoch_multiplier)
+
+        model = Manta2(**params, output_channels=ds_train.n_channels).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        scaler = torch.GradScaler()
+        os.makedirs(output_folder, exist_ok=True)
+
+        for epoch in range(n_epochs):
+            model.train()
+            corrs_train = run_epoch(
+                model,
+                train_dl,
+                device=device,
+                is_train=True,
+                optimizer=optimizer,
+                scaler=scaler,
+            )
+
+            # -- Validate
+            if not use_all_data:
+                val_dl = ThreadedDataLoader(ds_val, batch_size=batch_size * 2, shuffle=False, fraction=1)
+                corrs_val = run_epoch(model, val_dl, device=device, is_train=False)
+            else:
+                corrs_val = np.zeros((1, 1, 1, 1))
+
+            if (epoch + 1) % save_every == 0:
+                torch.save(model.state_dict(), f"{output_folder}/model_{epoch}.pth")
+
+            with open(f"{output_folder}/corrs_{epoch}.pkl", "wb") as f:
+                pickle.dump([corrs_train, corrs_val], f)
+
+            ct = ", ".join([f"{i:.3f}" for i in np.mean(corrs_train, axis=(0, 2, 3))])
+            cv = ", ".join([f"{i:.3f}" for i in np.mean(corrs_val, axis=(0, 2, 3))])
+
+            print(f"Epoch {epoch+1}/{n_epochs}: train_corrs={ct}, val_corr={cv}   ")
+        torch.save(model.state_dict(), os.path.join(output_folder, "saved_model.pth"))

@@ -304,27 +304,31 @@ class BandedHicFile:
 
     def __init__(self, path):
         self.path = str(path)
-        self._f = h5py.File(self.path, "r")
-        f = self._f
-        if not f.attrs.get("complete", False):
-            raise ValueError(f"{self.path} is not marked complete (partial/in-progress write); refusing to open")
-        self.genome = _decode(f.attrs["genome"])
-        self.resolution = int(f.attrs["resolution"])
-        self.n_diag = int(f.attrs["n_diag"])
-        self.n_channels = int(f.attrs["n_channels"])
-        self.group_name = _decode(f.attrs["group_name"]) if "group_name" in f.attrs else None
-        self.shortnames = [_decode(s) for s in f["provenance/shortnames"][:]]
-        self.uris = [_decode(s) for s in f["provenance/uris"][:]]
-        self.chrom_lengths = {_decode(n): int(l) for n, l in zip(f["chroms/name"][:], f["chroms/length"][:])}
-        self.arms = {
-            "name": [_decode(s) for s in f["arms/name"][:]],
-            "chrom": [_decode(s) for s in f["arms/chrom"][:]],
-            "start": f["arms/start"][:],
-            "end": f["arms/end"][:],
-        }
-        self.exp = f["exp"][:]  # [C, n_arms, n_diag] -- small, held in RAM
-        # only groups that carry a band are real chromosomes (chroms/name lists *all* cooler chromnames)
-        self.chroms = [k for k in f.keys() if isinstance(f[k], h5py.Group) and "band" in f[k]]
+        f = self._f = h5py.File(self.path, "r")
+        try:  # anything below can raise on a partial/malformed file; don't leak the open handle
+            if not f.attrs.get("complete", False):
+                raise ValueError(f"{self.path} is not marked complete (partial/in-progress write); refusing to open")
+            self.genome = _decode(f.attrs["genome"])
+            self.resolution = int(f.attrs["resolution"])
+            self.n_diag = int(f.attrs["n_diag"])
+            self.n_channels = int(f.attrs["n_channels"])
+            self.group_name = _decode(f.attrs["group_name"]) if "group_name" in f.attrs else None
+            self.shortnames = [_decode(s) for s in f["provenance/shortnames"][:]]
+            self.uris = [_decode(s) for s in f["provenance/uris"][:]]
+            self.chrom_lengths = {_decode(n): int(l) for n, l in zip(f["chroms/name"][:], f["chroms/length"][:])}
+            self.arms = {
+                "name": [_decode(s) for s in f["arms/name"][:]],
+                "chrom": [_decode(s) for s in f["arms/chrom"][:]],
+                "start": f["arms/start"][:],
+                "end": f["arms/end"][:],
+            }
+            self.exp = f["exp"][:]  # [C, n_arms, n_diag] -- small, held in RAM
+        except BaseException:
+            f.close()
+            raise
+        # Real chromosomes are those carrying a band (chroms/name lists *all* cooler chromnames). Iterate in
+        # chroms/name order (canonical genome order) rather than f.keys() (lexicographic: chr1, chr10, chr2, ...).
+        self.chroms = [c for c in self.chrom_lengths if c in f and isinstance(f[c], h5py.Group) and "band" in f[c]]
         self._stores: dict[str, BandedHicStore] = {}
 
     # -- store access -------------------------------------------------------- #
