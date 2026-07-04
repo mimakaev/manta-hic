@@ -33,7 +33,7 @@ import polars as pl
 
 from manta_hic.nn.training_meta import fold_df
 
-COUNT_CLIP = 32000  # clip raw counts to fit int16 (matches cool_io)
+COUNT_CLIP = 32000  # clip raw counts to fit int16
 
 # Band codec: Blosc-zstd with BIT shuffle. On int16 Hi-C counts bitshuffle beats byteshuffle -- a further
 # ~19% smaller (Hi-C counts are small, so high bit-planes are mostly zero -> long zero runs) and ~2x faster
@@ -49,8 +49,7 @@ BAND_COMPRESSION = hdf5plugin.Blosc(cname="zstd", clevel=5, shuffle=hdf5plugin.B
 # --------------------------------------------------------------------------- #
 def compute_bad_bins(clr, *, cov_cutoff_div=30000.0):
     """
-    Per-bin "bad" mask for one cooler (low coverage / weight outliers). Cleaned re-implementation of the
-    original ``cool_io.get_bad_bin_masks`` with the same behaviour.
+    Per-bin "bad" mask for one cooler (low coverage / weight outliers).
 
     The idea (the "creative" bit): cooler balancing weight ~ 1/sqrt(coverage), so well-covered bins form a
     sharp peak in the (log-binned) weight histogram and poorly-covered bins are a high-weight tail. We:

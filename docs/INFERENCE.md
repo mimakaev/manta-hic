@@ -42,17 +42,9 @@ pipeline is a deterministic function of the spec.
 
 Trained checkpoints are **self-describing**: `save_manta_checkpoint` (called by training) writes
 `{"state_dict": ..., "config": {resolution, n_bins, bins_pad, tower_height, output_channels, channel_names?,
-model_params?}}`. `MantaInference` reads `resolution` straight from `config`, so it never has to guess it from
-tensor shapes — that guess is ambiguous at ≤1024 bp (256/512/1024 all yield one conv block). A bare
-state-dict still loads (falls back to `target=`/`tower_height=`/a shape guess with a warning), but prefer the
-rich format.
-
-To upgrade old bare `saved_model.pth` files, run `scripts/repack_manta_checkpoints.py` (resolution from a
-`<name>_<res>_<fold>/` dir name or `--resolution`, optional `--channel-names-from target.bhic.h5`):
-
-```bash
-python scripts/repack_manta_checkpoints.py /path/to/2024_manta_trained_models/   # whole tree, in place with --in-place
-```
+model_params?}}`. `MantaInference` reads everything it needs — resolution, `n_bins`, `bins_pad`,
+`output_channels`, channel names — straight from `config`; a checkpoint plus a fetcher is all you need to
+predict.
 
 ## Conventions
 

@@ -95,6 +95,8 @@ class CachedMicrozoiFetcher(object):
             self.N_runs = f.attrs["N_runs"]
             self.cache_overhang_bp = f.attrs["CACHE_OVERHANG_BP"]
             self.bin_bp = f.attrs["BIN_BP"]
+            genome = f.attrs.get("genome")  # caches written before genome-baking lack it -> None
+            self.genome = genome.decode() if isinstance(genome, bytes) else genome
 
     def _read_runs(self, chrom, start_bp, end_bp, reverse, run_indices, device):
         """

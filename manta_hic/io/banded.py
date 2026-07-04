@@ -1,16 +1,13 @@
 """
-Banded ("turned") Hi-C target storage -- prototype of the read side.
+Banded ("turned") Hi-C target storage.
 
-Instead of overlapping ``actual_size x actual_size`` square tiles (``io/cool_io.py``), store the first
-``n_diag`` diagonals of each chromosome's contact map densely and once:
+Store the first ``n_diag`` diagonals of each chromosome's contact map densely and once:
 
     band[c, x, d] = M_c[x, x + d]      for d in 0..n_diag-1
 
-This is the layout of ``OnDiagonalHicAggregator`` (save_mcools/save_to_coolers_prototype.ipynb), reused
-here for the *training target* rather than for aggregating predictions. It is gap-free, ~6x smaller than
-overlapping squares, and any window is reconstructed on the fly by symmetry, so display never fails and
-tile accept/reject is a sampling-time policy (per-bin vectors + prefix sums) rather than a baked-in build
-decision. See docs/HIC_STORAGE.md.
+Any ``n x n`` window is reconstructed on the fly by symmetry, so display never fails and tile accept/reject
+is a sampling-time policy (per-bin vectors + prefix sums) rather than a baked-in build decision. The layout
+is gap-free and compact. See docs/HIC_STORAGE.md.
 
 Two entry points:
 

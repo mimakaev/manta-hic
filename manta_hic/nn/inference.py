@@ -12,16 +12,13 @@ can plot prediction and target side by side.
     obs  = infer.target("chr1", 20_000_000)               # observed-over-expected, same window (or None)
     wt, mut = infer.predict_pair("chr1", 20_000_000, [("replace", 20_500_000, "ACGT...")])
 
-``output_channels`` is read from ``final_conv.weight`` and the resolution from the checkpoint's tower height,
-so a checkpoint + fetcher is usually all you need. The one exception is the 256/512/1024 bp floor, which the
-checkpoint alone can't tell apart -- there, attach a ``target`` (its resolution is authoritative) or pass
-``tower_height`` (see :class:`MantaInference`).
+The checkpoint is self-describing (written by :func:`manta_hic.nn.manta.save_manta_checkpoint`): its
+``config`` carries resolution, ``n_bins``, ``bins_pad``, ``output_channels``, ``genome`` and channel names,
+so a checkpoint + fetcher is all you need.
 """
 
 from __future__ import annotations
 
-import re
-import warnings
 from collections.abc import Sequence
 
 import numpy as np
@@ -33,29 +30,6 @@ from manta_hic.nn.specs import Spec
 from manta_hic.ops.hic_ops import create_expected_matrix
 
 
-def tower_height_from_state(state: dict) -> int:
-    """Manta's ``tower_height`` from a checkpoint = the number of ``conv_blocks_1d`` blocks.
-
-    Ambiguous at the floor: ``Manta`` builds ``max(tower_height, 1)`` blocks, so tower_height -1/0/1 (256/512/
-    1024 bp) all yield one block and are indistinguishable from the state dict. A count of 1 is reported as 1
-    (1024 bp); pass ``tower_height`` or attach a ``target`` for a 256/512 bp model.
-    """
-    idxs = {int(m.group(1)) for k in state if (m := re.match(r"conv_blocks_1d\.(\d+)\.", k))}
-    if not idxs:
-        raise ValueError("checkpoint has no conv_blocks_1d.* keys; cannot infer the tower height")
-    return max(idxs) + 1
-
-
-def resolution_for_tower_height(tower_height: int) -> int:
-    """Hi-C bin size in bp for a ``tower_height`` (microzoi 256 bp, +1 maxpool): ``2 ** (tower_height + 9)``."""
-    return 2 ** (tower_height + 9)
-
-
-def tower_height_for_resolution(resolution: int) -> int:
-    """Inverse of :func:`resolution_for_tower_height`: ``round(log2(resolution)) - 9``."""
-    return int(round(np.log2(resolution))) - 9
-
-
 class MantaInference:
     """
     Predict Hi-C maps from a trained Manta model + a MicroZoi activation fetcher.
@@ -63,26 +37,21 @@ class MantaInference:
     Parameters
     ----------
     checkpoint : str | os.PathLike | dict
-        Path to a ``saved_model.pth`` (a bare ``state_dict``) or an already-loaded state dict. ``output_channels``
-        is read from it, and the resolution from its tower height -- except at the 256/512/1024 bp floor, which
-        the checkpoint can't disambiguate (pass ``target`` or ``tower_height`` there).
+        A self-describing ``saved_model.pth`` (or an already-loaded ``{"state_dict", "config"}`` dict) written by
+        :func:`manta_hic.nn.manta.save_manta_checkpoint`. Its ``config`` supplies resolution, ``n_bins``,
+        ``bins_pad``, ``output_channels``, ``genome`` and channel names. A ``target`` whose genome disagrees
+        with the checkpoint's is rejected.
     fetcher : CachedMicrozoiFetcher
         Supplies activations; must cover the queried chromosome/genome (and hold a fasta handle for mutations).
     device : str
         Device to run on (e.g. ``"cuda:0"``).
-    n_bins, bins_pad : int
-        Map side length and activation padding (must match training; the pretrained models use 1024 / 128).
     channel_names : list[str] | None
-        Optional per-output-channel names. Defaults to the ``target`` file's shortnames when a target is given.
+        Override the per-output-channel names (else the checkpoint's, else the ``target`` file's shortnames).
     target : BandedHicFile | str | None
-        Optional banded file with the observed maps, enabling :meth:`target` / :meth:`is_eligible`. **Its
-        resolution is authoritative** (it also disambiguates the 256/512/1024 bp floor); channel count is
-        checked against the model.
-    tower_height : int | None
-        Override the tower height (else taken from ``target``, else the checkpoint). Needed for a 256/512 bp
-        checkpoint loaded without a target.
+        Optional banded file with the observed maps, enabling :meth:`target` / :meth:`is_eligible`; its resolution
+        and channel count are checked against the model.
     model_params : dict | None
-        Extra ``Manta`` kwargs if the checkpoint was trained with non-default architecture params.
+        Override the ``Manta`` architecture kwargs (else taken from the checkpoint's ``config``).
     """
 
     def __init__(
@@ -91,11 +60,8 @@ class MantaInference:
         fetcher,
         *,
         device: str = "cuda:0",
-        n_bins: int = 1024,
-        bins_pad: int = 128,
         channel_names: list[str] | None = None,
         target=None,
-        tower_height: int | None = None,
         model_params: dict | None = None,
     ):
         obj = (
@@ -108,34 +74,14 @@ class MantaInference:
         if target is not None:
             self.target_file = BandedHicFile(target) if isinstance(target, (str, bytes)) else target
 
-        config_channel_names = None
-        if "config" in obj and "state_dict" in obj:
-            # self-describing checkpoint (save_manta_checkpoint): its config is authoritative -- no shape guessing
-            state, cfg = obj["state_dict"], obj["config"]
-            th, resolution = int(cfg["tower_height"]), int(cfg["resolution"])
-            n_bins, bins_pad = int(cfg.get("n_bins", n_bins)), int(cfg.get("bins_pad", bins_pad))
-            output_channels = int(cfg["output_channels"])
-            config_channel_names = cfg.get("channel_names")
-            model_params = model_params or cfg.get("model_params")
-        else:
-            # bare state dict: infer the shape. Resolution is ambiguous below 1024 bp, so a target (authoritative)
-            # or an explicit tower_height disambiguates the 256/512/1024 floor (see tower_height_from_state).
-            state = obj
-            output_channels = int(state["final_conv.weight"].shape[0])
-            if tower_height is not None:
-                th = tower_height
-            elif self.target_file is not None:
-                th = tower_height_for_resolution(self.target_file.resolution)
-            else:
-                th = tower_height_from_state(state)
-                if th == 1:  # one conv block -> could be tower_height -1/0/1 (256/512/1024 bp)
-                    warnings.warn(
-                        "bare checkpoint has one conv_blocks_1d block; 256/512/1024 bp models are structurally "
-                        "identical, so resolution is assumed to be 1024 bp. Pass tower_height=/target=, or re-save "
-                        "with save_manta_checkpoint, for a 256/512 bp model.",
-                        stacklevel=2,
-                    )
-            resolution = resolution_for_tower_height(th)
+        # self-describing checkpoint (save_manta_checkpoint): its config is authoritative
+        state, cfg = obj["state_dict"], obj["config"]
+        th, resolution = int(cfg["tower_height"]), int(cfg["resolution"])
+        n_bins, bins_pad = int(cfg["n_bins"]), int(cfg["bins_pad"])
+        output_channels = int(cfg["output_channels"])
+        config_channel_names = cfg.get("channel_names")
+        self.genome = cfg.get("genome")  # the genome the model was trained on (None for older checkpoints)
+        model_params = model_params or cfg.get("model_params")
 
         self.model = (
             Manta(
@@ -160,6 +106,8 @@ class MantaInference:
                 raise ValueError(
                     f"target has {self.target_file.n_channels} channels but the model outputs {output_channels}"
                 )
+            if self.genome is not None and self.target_file.genome != self.genome:
+                raise ValueError(f"target genome {self.target_file.genome!r} != model genome {self.genome!r}")
 
         self.fetcher = fetcher
         self.resolution = resolution
