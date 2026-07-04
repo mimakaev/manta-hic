@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 
 from manta_hic.ops.seq_ops import onehot_turbo, reverse_complement
 

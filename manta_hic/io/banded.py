@@ -315,7 +315,7 @@ class BandedHicFile:
             self.group_name = _decode(f.attrs["group_name"]) if "group_name" in f.attrs else None
             self.shortnames = [_decode(s) for s in f["provenance/shortnames"][:]]
             self.uris = [_decode(s) for s in f["provenance/uris"][:]]
-            self.chrom_lengths = {_decode(n): int(l) for n, l in zip(f["chroms/name"][:], f["chroms/length"][:])}
+            self.chrom_lengths = {_decode(n): int(ln) for n, ln in zip(f["chroms/name"][:], f["chroms/length"][:])}
             self.arms = {
                 "name": [_decode(s) for s in f["arms/name"][:]],
                 "chrom": [_decode(s) for s in f["arms/chrom"][:]],

@@ -1,5 +1,5 @@
 """
-Tests for ``CachedStochasticActivationFetcher`` (cache reads, run-averaging, and mutation patching).
+Tests for ``CachedMicrozoiFetcher`` (cache reads, run-averaging, and mutation patching).
 
 These run on CPU with no real model or 700 GB cache. The strategy is three-fold:
 
@@ -12,7 +12,7 @@ These run on CPU with no real model or 700 GB cache. The strategy is three-fold:
    base code over that bin. A ``replace`` therefore changes exactly the output bins it overlaps, so patch
    placement can be verified to the bin.
 
-3. **Differential test** -- ``_recompute_patches`` must be byte-identical to the trusted
+3. **Differential test** -- the live ``_recompute_jobs`` must be byte-identical to the trusted
    ``fetch_tile_microzoi_activations`` for the same (model, fasta), across orientations / tile offsets /
    shifts / mutations. This pins the recompute geometry without needing a position oracle.
 """
@@ -23,12 +23,12 @@ import pytest
 import torch
 from torch import nn
 
-from manta_hic.nn.manta import (
+from manta_hic.nn.fetchers import (
     BIN_BP,
     MICROZOI_RECEPTIVE_FIELD,
-    CachedStochasticActivationFetcher,
-    fetch_tile_microzoi_activations,
+    CachedMicrozoiFetcher,
 )
+from manta_hic.nn.fill_cache import fetch_tile_microzoi_activations
 
 
 def _np(t):
@@ -69,7 +69,7 @@ class FakeFasta:
 
 class FakePosModel(nn.Module):
     """
-    Mimics ``MicroBorzoi(return_type="mha").forward(x, genome, offset, crop_mha)``.
+    Mimics ``Microzoi(return_type="mha").forward(x, genome, offset, crop_mha)``.
 
     Input x: one-hot [B, 4, L] (L a multiple of 256). Output [B, MODEL_CHANNELS, L//256 - 2*crop_mha],
     where each output bin = sum of base codes (A=0,C=1,G=2,T=3) over that bin's 256 bp (broadcast across
@@ -127,7 +127,7 @@ def cache_path(tmp_path_factory):
 
 @pytest.fixture()
 def fetcher(cache_path):
-    fet = CachedStochasticActivationFetcher(cache_path, fasta_open=FakeFasta(), batch_size=2)
+    fet = CachedMicrozoiFetcher(cache_path, fasta_open=FakeFasta(), batch_size=2)
     fet._model = FakePosModel()  # bypass _fetch_microzoi_model (no real model blob needed)
     return fet
 
@@ -178,20 +178,20 @@ def test_fetch_out_of_range_and_misaligned_raise(fetcher):
 
 
 # --------------------------------------------------------------------------- #
-# 2. Recompute geometry: differential vs the trusted tiler                     #
+# 2. Recompute geometry: the shipping pooled path, byte-exact vs the tiler      #
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("reverse", [False, True])
-@pytest.mark.parametrize("soff", [0, 5, 40])
-@pytest.mark.parametrize("shift_bp", [0, 37])
 @pytest.mark.parametrize("width_bins", [1536, 3200])  # one tile, several tiles
-def test_recompute_patches_matches_tiler(fetcher, reverse, soff, shift_bp, width_bins):
+def test_recompute_jobs_matches_tiler(fetcher, reverse, width_bins):
+    """The live L1 recompute (``_recompute_jobs``, always tile-offset 0) must be byte-identical to the trusted
+    ``fetch_tile_microzoi_activations`` at ``start_offset_bins=0, shift_bp=0`` -- and pooling a WT + mutant job
+    in one batch must give each the same result as a standalone tiler call."""
     mid = 800_000 // BIN_BP * BIN_BP
     win_lo, win_hi = mid - (width_bins // 2) * BIN_BP, mid + (width_bins - width_bins // 2) * BIN_BP
-    mut = [("replace", mid, "ACGTACGTAC" * 20)]  # 200 bp
-    for mutate in (None, mut):
-        (mine,) = fetcher._recompute_patches(
-            fetcher._model, CHROM, win_lo, win_hi, [(mutate, shift_bp, soff)], reverse, 768, "cpu"
-        )
+    mut = (("replace", mid, "ACGTACGTAC" * 20),)  # 200 bp
+    jobs = [(CHROM, win_lo, win_hi, None, reverse), (CHROM, win_lo, win_hi, mut, reverse)]  # WT + mutant, pooled
+    patches = fetcher._recompute_jobs(fetcher._model, jobs, 768, "cpu")
+    for job, mutate in ((jobs[0], None), (jobs[1], mut)):
         with torch.no_grad(), torch.autocast("cpu"):
             ref = fetch_tile_microzoi_activations(
                 fetcher._model,
@@ -201,22 +201,21 @@ def test_recompute_patches_matches_tiler(fetcher, reverse, soff, shift_bp, width
                 win_hi,
                 mutate=mutate,
                 reverse=reverse,
-                start_offset_bins=soff,
-                shift_bp=shift_bp,
+                start_offset_bins=0,
+                shift_bp=0,
                 crop_mha_bins=768,
                 batch_size=2,
             )
-        assert tuple(mine.shape) == tuple(ref.shape)
-        np.testing.assert_array_equal(_np(mine), _np(ref.half()))
+        assert tuple(patches[job].shape) == tuple(ref.shape)
+        np.testing.assert_array_equal(_np(patches[job]), _np(ref.half()))
 
 
 # --------------------------------------------------------------------------- #
-# 3. Matched pairs: invariant, alignment, averaging                            #
+# 3. L1 matched pairs via fetch_activations_batch (spec -> activations)         #
 # --------------------------------------------------------------------------- #
-# A Manta-style window wide enough to contain the RF/4 flank around the mutation.
-WIN_START = 600_000 // BIN_BP * BIN_BP
-WIN_END = 1_400_000 // BIN_BP * BIN_BP
-MUT_POS = 1_000_000 // BIN_BP * BIN_BP
+# resolution == BIN_BP keeps the map window on the cache bin grid; the window is wide enough to hold a tile.
+RES, NB, PAD, MAP = BIN_BP, 2000, 256, 3000 * BIN_BP
+MUT_POS = 1_000_000
 
 
 def _changed_columns(wt, mut):
@@ -224,78 +223,66 @@ def _changed_columns(wt, mut):
     return np.flatnonzero(d > 0)
 
 
-def _expected_mut_cols(pos, seq_len, reverse):
-    """Result columns of the genomic bins overlapping a replacement of length seq_len at pos."""
-    bins = range(pos // BIN_BP, (pos + seq_len - 1) // BIN_BP + 1)
-    n_total = (WIN_END - WIN_START) // BIN_BP
-    if reverse:
-        return {n_total - 1 - (b - WIN_START // BIN_BP) for b in bins}
-    return {b - WIN_START // BIN_BP for b in bins}
+def _run_pair(fetcher, mut_pos, reverse=False):
+    from manta_hic.nn.specs import background_for, variant_specs
 
-
-def test_matched_pair_invariant_single_run(fetcher):
-    muts = [("replace", MUT_POS, "ACGT" * 50)]
-    wt, mut = fetcher.fetch_matched_pair(CHROM, WIN_START, WIN_END, "cpu", muts, n_runs=1, run_idx=0)
-    assert tuple(wt.shape) == tuple(mut.shape) == (N_CHANNELS, (WIN_END - WIN_START) // BIN_BP)
-    # outside the recompute WINDOW (wider than the mutated region): wt is the untouched cached background.
-    win_lo, win_hi = fetcher._mutation_window(muts, WIN_START, WIN_END, MICROZOI_RECEPTIVE_FIELD // 4)
-    outside = np.ones(wt.shape[1], bool)
-    outside[(win_lo - WIN_START) // BIN_BP : (win_hi - WIN_START) // BIN_BP] = False
-    cache0 = _np(fetcher.fetch(CHROM, WIN_START, WIN_END, run_idx=0)).astype(np.float32)
-    np.testing.assert_array_equal(_np(wt).astype(np.float32)[:, outside], cache0[:, outside])
-    # mut == wt everywhere except the bins the replacement actually overlaps
-    assert set(_changed_columns(wt, mut)).issubset(_expected_mut_cols(MUT_POS, 200, False))
-
-
-@pytest.mark.parametrize("reverse", [False, True])
-def test_matched_pair_patch_lands_at_mutation(fetcher, reverse):
-    """Changed columns must map exactly to the genomic bins the replacement overlaps."""
-    muts = [("replace", MUT_POS, "ACGT" * 50)]  # 200 bp
-    wt, mut = fetcher.fetch_matched_pair(CHROM, WIN_START, WIN_END, "cpu", muts, n_runs=1, run_idx=0, reverse=reverse)
-    changed = set(_changed_columns(wt, mut).tolist())
-    assert changed, "mutation produced no change"
-    assert changed.issubset(_expected_mut_cols(MUT_POS, 200, reverse))
-
-
-@pytest.mark.parametrize("n_runs", [1, 2, 3])
-@pytest.mark.parametrize("patch_off_bins", [0, 8])
-def test_matched_pair_averaging_clean(fetcher, n_runs, patch_off_bins):
-    muts = [("replace", MUT_POS, "ACGT" * 50)]
-    wt, mut = fetcher.fetch_matched_pair(
-        CHROM, WIN_START, WIN_END, "cpu", muts, n_runs=n_runs, patch_max_offset_bins=patch_off_bins
+    mut = (("replace", mut_pos, "ACGT" * 50),)  # 200 bp
+    bg = background_for(CHROM, MAP, run_idx=0, reverse=reverse, mutations_superset=mut)
+    wt, m = fetcher.fetch_activations_batch(
+        variant_specs(bg, {"wt": None, "mut": mut}), resolution=RES, n_bins=NB, bins_pad=PAD, device="cpu"
     )
-    assert np.isfinite(_np(wt)).all() and np.isfinite(_np(mut)).all()
-    # Under run averaging the shared backgrounds (and the unmutated annulus of the patch) cancel, so the
-    # difference stays confined to the bins the replacement overlaps -- it does not smear across runs.
-    assert set(_changed_columns(wt, mut)).issubset(_expected_mut_cols(MUT_POS, 200, False))
+    fs = MAP - PAD * RES
+    return bg, wt, m, fs
 
 
-def test_fetch_activations_matches_matched_pair_mut(fetcher):
-    """fetch_activations(mutated) equals the mutant half of the pair under identical sampling."""
-    muts = [("replace", MUT_POS, "ACGT" * 50)]
-    _, mut_pair = fetcher.fetch_matched_pair(CHROM, WIN_START, WIN_END, "cpu", muts, n_runs=1, run_idx=0)
-    mut_solo = fetcher.fetch_activations(CHROM, WIN_START, WIN_END, "cpu", muts, n_runs=1, run_idx=0)
-    np.testing.assert_array_equal(_np(mut_solo), _np(mut_pair))
+def _tile_cols(bg, fs, fe, reverse):
+    """[lo, hi) array columns the tile pattern occupies (accounting for the reverse flip)."""
+    lo, hi = bg.tiles[0][0], bg.tiles[-1][1]
+    return ((fe - hi) // BIN_BP, (fe - lo) // BIN_BP) if reverse else ((lo - fs) // BIN_BP, (hi - fs) // BIN_BP)
+
+
+def test_l1_matched_pair_localized_and_clean(fetcher):
+    bg, wt, mut, fs = _run_pair(fetcher, MUT_POS)
+    assert tuple(wt.shape) == tuple(mut.shape) == (N_CHANNELS, NB + 2 * PAD)
+    changed = _changed_columns(wt, mut)
+    assert len(changed) > 0, "mutation produced no change"
+    # the difference sits at the mutation's bin(s), inside the tile, and nowhere else
+    mut_col = (MUT_POS - fs) // BIN_BP
+    assert changed.min() >= mut_col - 1 and changed.max() <= mut_col + 1
+    # WT recompute leaves the cached background untouched OUTSIDE the tiles (clean pair everywhere else)
+    tlo, thi = _tile_cols(bg, fs, fs + (NB + 2 * PAD) * RES, reverse=False)
+    cache = _np(fetcher.fetch(CHROM, fs, fs + (NB + 2 * PAD) * RES, run_idx=0)).astype(np.float32)
+    outside = np.ones(wt.shape[1], bool)
+    outside[tlo:thi] = False
+    np.testing.assert_array_equal(_np(wt).astype(np.float32)[:, outside], cache[:, outside])
+
+
+def test_l1_matched_pair_reverse_localized(fetcher):
+    bg, wt, mut, fs = _run_pair(fetcher, MUT_POS, reverse=True)
+    changed = _changed_columns(wt, mut)
+    assert len(changed) > 0
+    tlo, thi = _tile_cols(bg, fs, fs + (NB + 2 * PAD) * RES, reverse=True)
+    assert changed.min() >= tlo and changed.max() < thi  # localized to the (flipped) tile region
+
+
+def test_l1_dedup_one_cache_read(fetcher):
+    from manta_hic.nn.specs import background_for, variant_specs
+
+    reads = []
+    orig = fetcher.fetch
+    fetcher.fetch = lambda *a, **k: (reads.append(1), orig(*a, **k))[1]
+    mut = (("replace", MUT_POS, "ACGT" * 50),)
+    bg = background_for(CHROM, MAP, run_idx=0, mutations_superset=mut)
+    specs = variant_specs(bg, {"wt": None, "mut": mut, "mut2": mut})  # 3 specs, same background
+    fetcher.fetch_activations_batch(specs, resolution=RES, n_bins=NB, bins_pad=PAD, device="cpu")
+    assert len(reads) == 1  # one shared cache read
 
 
 # --------------------------------------------------------------------------- #
-# 4. Validation / warnings                                                     #
+# 4. Validation (length-changing mutations rejected at spec-build time)         #
 # --------------------------------------------------------------------------- #
-def test_insert_is_rejected(fetcher):
-    with pytest.raises(ValueError, match="not supported"):
-        fetcher.fetch_matched_pair(CHROM, WIN_START, WIN_END, "cpu", [("insert", MUT_POS, "ACGT")], n_runs=1)
+def test_insert_is_rejected():
+    from manta_hic.nn.specs import background_for
 
-
-def test_out_of_window_mutation_rejected(fetcher):
-    with pytest.raises(ValueError, match="outside the window"):
-        fetcher.fetch_matched_pair(CHROM, WIN_START, WIN_END, "cpu", [("replace", WIN_END + BIN_BP, "AC")], n_runs=1)
-
-
-def test_matched_pair_requires_mutation(fetcher):
-    with pytest.raises(ValueError, match="at least one mutation"):
-        fetcher.fetch_matched_pair(CHROM, WIN_START, WIN_END, "cpu", [], n_runs=1)
-
-
-def test_n_runs_none_warns(fetcher):
-    with pytest.warns(UserWarning, match="n_runs not specified"):
-        fetcher.fetch_activations(CHROM, 0, 40 * BIN_BP, n_runs=None)
+    with pytest.raises(ValueError):
+        background_for(CHROM, MAP, run_idx=0, mutations_superset=[("insert", MUT_POS, "ACGT")])

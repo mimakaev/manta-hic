@@ -174,3 +174,7 @@ package.json
 
 # Scripts used in development 
 scripts-dev
+
+# Downloaded demo data -- the README stays tracked; the large files are downloaded, not committed
+manta_demo/data/*
+!manta_demo/data/README.md

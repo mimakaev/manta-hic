@@ -6,7 +6,8 @@ from typing import Optional
 
 import numpy as np
 import pysam
-import ushuffle
+
+from manta_hic.ops.kshuffle import k_let_shuffle
 
 
 def open_fasta_chromsizes(
@@ -101,7 +102,7 @@ def onehot_turbo(
                 # Insert the sequence at the specified position
                 for j, char in enumerate(reversed(ins_seq)):
                     seq_list.insert(pos, char)
-            seq_string = ''.join(seq_list)
+            seq_string = "".join(seq_list)
 
             # Adjust positions of other mutations to account for insertions
             mutate_adjusted = []
@@ -146,7 +147,7 @@ def onehot_turbo(
                     shuffle_by = int(m[0].split("shuffle")[1])
                 start, end = m[1], m[2]
                 seq_to_shuffle = seq_string[start:end].encode()
-                shuffled_seq = ushuffle.shuffle(seq_to_shuffle, shuffle_by).decode()
+                shuffled_seq = k_let_shuffle(seq_to_shuffle, shuffle_by).decode()
                 assert len(shuffled_seq) == end - start
                 np_string[start:end] = np.array([shuffled_seq], dtype="S").view(dtype="S1")
             elif m[0] == "insert":
@@ -192,8 +193,8 @@ def make_seq_1hot(
 
     Notes
     -----
-    Shuffling is done with ushuffle. Shuffle2 is dinucleotide shuffling (most frequent)
-    so "shuffle" is a shorthand for "shuffle2".
+    Shuffling preserves exact k-let counts (see :mod:`manta_hic.ops.kshuffle`). Shuffle2 is dinucleotide
+    shuffling (most frequent), so "shuffle" is a shorthand for "shuffle2".
 
     Insert operation inserts a sequence at a given position, shifting the rest of the sequence.
     The sequence length will be increased by the length of the inserted sequence.
@@ -318,3 +319,104 @@ class InMemoryFasta:
 
     def get_reference_length(self, chrom: str) -> int:
         return len(self.seqs[chrom])
+
+
+# --------------------------------------------------------------------------- #
+# Quiescent ("inert") sequence -- for silencing a regulatory element           #
+# --------------------------------------------------------------------------- #
+#
+# To *inactivate* an element we do NOT scramble its own bases: di/tetra-nucleotide content alone can still
+# read as "promoter-like" to Borzoi/MicroZoi. Instead we drop in inert sequence -- a ~4 kb quiescent region
+# (no known regulatory elements), tetra-nucleotide-shuffled so it is random but compositionally bland. To
+# average over inert realizations, generate a fresh one per sample (pass different rng draws).
+
+_QUIESCENT_4KB = (
+    "CTATCTCTTCCCCATTCTGAGTAATGGGAACTCACTTTATTTTGCACATAAATCCAAATACAAGAAGAAGAGGAATGTTAGGCTATGTCTGCAGTACAAATTACCTAGGGAA"
+    "AAGAAAATTAAGATGACTTCTAAGGATGAAAAATAATCTTCCCAACAGAGTTCAAAAGGACTCAGAAATGGTCTCTATGGGGAAAGCTTTCATTAAACAGAAAAACATAAAA"
+    "GAGGCGACAGTCCTGCCCTGAGAGGGTAATGGCCAATTTGACCTATTAGGTGTTTACTGCATCAAGTTTATTTGTTGCCCTGATTAGAAACCACTAAGGGGACATTGGAAAT"
+    "GGGGGAGGACTGTCTAGGCCACAGGCATTCCTTCTAGATTCTGTCTTTTGAGGACTGGTCCCCACACAATGTTTCTAGGGTTGATAAACTCACCTCTTTTGACCTTCAGCCT"
+    "TCCCTAGGATGACAGGATATTGAAGGAAATATATATTTGTAGTTGGTGGTAGTGAGGAAAAATATAAGATAAACTTCAGGTGCAATAAAAGGGAGTTGAAGTAGGAACATCC"
+    "GAAAATTAATTTCCTGGCTCCAAGTGTTATTGGATTGTAGCTCAACAATCCACTTGGGACATGTTAGAAGCATATCATGGAAAATAGGTGAGCTGAGTGGATGGAAACACCA"
+    "AATGATGAGTAATAGAACAATATCTGTATAGGCAAAGATCCTAGTAACCCCTGGATACCTTATTTGTCTGTGTCTATGGTGCAGAAGATTTTATGTTACCTGCTGTCCAGCT"
+    "GCCTCAAATGAATCAACTGTTTAGAAAGCTTATTTACATTTTAATAGGAGGCCCAGGCATCTGTTCCCAGCACCTAGTGCCTCCTGCAGCATGCTTGGGGCTGTCCTGGAAG"
+    "CTGCTTGTTGATTCCTGCAGGGGCTTGATTGTCTCATCAGATTATTAGAATTAACTGGGCAAAATCAGATTTCAAACTGGATTAAGACATCAAGAAAATGCTGCTGACCAAT"
+    "TTCTCTTCTCCCAGATCAGAAAAAAATGCCTATAGATGCAAGATACTTCATAAATGTAAATAATTAACCCTACATATTTGTACATACATTACAATTTACAAAACACTTCTTT"
+    "AAATGTTGTGTTTAGATCCATGTGAACTCCTTGTAAAGTAGGCAGAGTATATGTTATTGCACAAATAATCATCTACAGATGAGGAAACCGAGGCTTGATTGCCTAATGTCAC"
+    "TAAAGAACAAAGTCAAAGCTAAGTATTCTGACCTCCAGAATACCACTGATATCTAACCCGTAGCCAAGAATACACAAGCATTTTGAAGCTGTGAATGTTTGTCATTACCCTT"
+    "CACATTTTCTTTTTCTGTGGGAATGGAAGGTTAAGATGACATTGACTATGATGGTACAGCTCTTTAGAAGGCACTTTGGAAAGTACAGGTTCAGTCATGGTCACAGGCCTGC"
+    "AAGAACTTTAATCTGGTTTGGGAATAGACATACAACCATTGAATCTTTCATAACTCTCAAAGGGGATATCTGAATATATGATGAAATGACAGCAGAGATAAAACTACTAGTG"
+    "AAATTCCAACTAATAACATGTTATTATGAGCTAGAGAATAAGCAGAAGGTTTTGTCATGAAAGCGTCTCACAAAGATGTGCAGAATGACAGGACTTATGGACAAAGAAGGTA"
+    "AGTGGGGTGGGAGATTCCAATGAAGATATAATTTGAGCAAACATATGGAGTGGGCTATATCTTTTAGCACCATAATAATGGGTATTAGAGGCTGAAATGAAACCTGTAGAGT"
+    "AGATTTAAGAGAGGTAGCTCTGAAACCAGATTGTTGGAGTTCAAATCTCCATCACTCACTGAGCAAGCTATGTGACAATTTCTCTATCTGTCTCTGGGGATAAGAATAGTAC"
+    "CAACCAACCTCACAGAATTTTGTGATGATTAAATGAGATGGTACATTTACAAATCCTTCATTAAAATAGTACCTATACTTAGTTGCCATTTTAAAACAAAACAAAACTGTGT"
+    "TATTGGTTTTAAAAAAATGTCAAGAGCTAAGGAGGTGGTTAGATTTGGGAGTATAAATAGAGTGAACATATGATTTTTTATTCAAGTCTTTTAGCCTTTGAAGCGAAAGGAT"
+    "CTGCTATTAATGCTTATGCCAGGACAGTAAGTATAGAGCAGTCAATGGCTTGCATAAACCAGGTGTGGTGGCCCTGCATACAGAAAACCTTACTCTAAATTTTCTGTTGTTG"
+    "TTTATTCAGACTTCCCAGGTATGTCACAAACTTTCATGATCAGATAGCACTACAGAGGTCAGGATCTTGTAAGCATTTTCCATAATATAATCCAAAGTGTTGAGCTTTGGAT"
+    "CAAGAATGTCCAAAAGATAAAGGATCTTAAAGATCACCTAATATTCCTTCTACATTTTCAGTTTTGGAAGGAATCTCATTGAATTCAGGTGCTGACACAATGTCTGTGGTTT"
+    "CATTAGGCAACACTTATATAAAGTCCACCTAGAACTGGACAGGAGTAGCCTACACACTCATTGGAGACCATTTTACAGATTTCAAATTATTATGAAAAGTCCAGGGCTTTTT"
+    "ATACAGATGAGGAAATGGTTCCAGACTGGCTATGGGCCATATTCAAGATCTCTTAATATCCAGTTTGGTTTGTTTTTAACACAACAGTGTTTCCCAAAATATGTTTTATAGA"
+    "ACATGAGTCCTGCAGGATGCTCTGGCAGGGAGGGAGAAAGGGCAAGGAAGACCATGGCTGAATAAGCTTTGGGTATGATGCATATTATGTTATATTTTTGGAAATTCAGATT"
+    "ATACACTAAGTACTCTGAGAAGTCCTTGAAAAACAACTTAATCTTGTTCAAAGGAGCATTTCCCATATTTGTTTTACCATGAAACCTTTGTACAATACAAATTAACGTTCCG"
+    "CACAATTAGTGTTCTGATGTTACATGCTTTGTAAGGGACTACACTGTATAATTTAGTACGACATGAAGAATTTCCAAACCAGTAAGAAGATGTAAATGGATCATTAGAACAT"
+    "TTTTGGCTTTCAAATAGATTTACATGTAGTCATAAAATCAACATCTCTCCAGTCAAATTCATTCTTATGGTTGTTTTATGTACCATATTTAATCAAGCTTATTTTTGTATTT"
+    "TTTGCCCAATTAATCATTTTTTCATTATTGAATAGTTTGCTTTAGCTTCTGTCAAAGTAGCAATATTAATAGGATAAAGTAATTCTGGCTCAATTAAATATTGTATAACCAT"
+    "GAAAAAAACGGGGAGAAAATACTTTAATATTTATTCAAACCTATAGAGTGATGAGGACTTTTGAATTTTCAAAACAATGGGAGAATTTAGAAAAAGAAAAGGATTAACTGTG"
+    "TAAAAATGTTGTATTTTCCCATGTCAAAAAAAGCCAATTTAGGAAATAGTAAAAAGGATTTATAGTTAAATGTGACAGCAAGTGATACCTATGTTAAATAAGGAAATGACTC"
+    "ACATAAATAGAAAAAAGGCATACACACTAATAGCAACTACAAAAGTCTCTAAGAGAACAATGGAAAAAGAACCGACGACATGAACAGAGGAAGTAGAAATAGAATGAATAAA"
+    "GGTGCCACTTGACTTCCCTACATCCAGCTTCTCTACAGGCCACACTTTCCCCTGTATGCACTGATCCTGCTAAGTCACTTTTCATACACCCCTTTCCACTCTCCATTACAGG"
+    "CTGAGTAATGGTCCTGAGTGATCTGCAACCTAGGGCTACAGCACCCACAGGAGCCATCATTAGTTATTTTATAATAGTTTTTGTTCTCTGAAAGGGAACTTCTCCTTATGTC"
+    "TACAAGTCTATCGTTCAACTTAGAACCATTCAATTTGCAACACATATTTAAGAGTATATTATATACCAAAAAAGGGACTTTTTGTAGACATAGTGACCTTGGAGTAAACTTC"
+    "CTTGTAAGTGTAGCCTTCCAGGTTCCCAGGACTTCAGTGCATGAGCTCATTCAAGAAATAGACCAGGGCCAGCCGCGGTGGCTTACGCCTGTAATCCCAGCACTTTGGGAGA"
+    "CTGAGGTGGGCAGATCACAAGGTCAAGAGTTTGAAACCAGCCTGGCCAATATGGTGAAACCTCATCTCTACTAAATATACAAAAATTACCCGGGCATGATGGCACGCACCTG"
+    "TAGTCCCTCCTACACAAGAGGCTGAGGCAGAAGAATTGCTTGAACCCAGGAGGTGGAGGTTGCAGTGAGCCACGATCGTGCCACTGCACTCCAGCCTGGGTGATAGAGCGAG"
+    "ACTCCATCTCACAAAAAAAAAAAAAAAAAAAAGAGAGAGAGAGAGACACCACATAAAACTTTTATCTCGAACTGTCACCTCTGCTCTCTGTTGGTAGTACTTGATTAGCTTG"
+    "CCTTCACATTTCTGGTACTGTCTTATGAAATTTTCACTGTTCATCTTCTGAGAAGACATAAGCCCCTGGTAACATGAGACAGTCTGTCATCCTCTATCTGAGGCACACATGT"
+    "CAATCAATCTTCTCCTATGTTTCCCAGAGAGGGAATTTAATTACATTTCCTGTCTATCTCTGTTATCAATTGCTGCAAAATAAACCACTTCCACATTTTGTGTCTTAAAACA"
+    "ACAATTTATTATTATC"
+).encode()
+
+
+def make_quiescent_seq(seq_len: int, rng: np.random.Generator | None = None) -> str:
+    """
+    A length-``seq_len`` inert DNA string: a quiescent 4 kb region tetra-nucleotide-shuffled and tiled to
+    length, then center-cropped. Pass an ``rng`` for a reproducible sequence; ``None`` (the default) draws a
+    fresh one -- generate several to average over inert realizations.
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    n_needed = seq_len // len(_QUIESCENT_4KB) + 2
+    tiled = "".join(k_let_shuffle(_QUIESCENT_4KB, 4, rng=rng).decode() for _ in range(n_needed))
+    st = len(tiled) // 2 - seq_len // 2
+    return tiled[st : st + seq_len]
+
+
+def freeze_mutations(mutations, *, fasta=None, chrom=None, rng=None):
+    """
+    Resolve the *random* mutation ops to concrete ``("replace", pos, seq)`` tuples, so a spec that carries
+    them is deterministic (a matched pair / an N-way average reuses the exact same edit). Freeze several times
+    (different ``rng`` draws) to average over realizations of a random op.
+
+    - ``("inactivate", p1, p2)`` -> ``("replace", p1, <fresh quiescent seq>)`` (silences an element with inert
+      DNA; needs no reference).
+    - ``("shuffle[k]", p1, p2)`` -> ``("replace", p1, <k-let shuffle of the reference [p1, p2)>)`` -- needs
+      ``fasta`` + ``chrom`` to read the sequence to shuffle. ``"shuffle"`` means k=2.
+    - ``("replace", ...)`` and ``("invert", ...)`` are already deterministic and pass through unchanged.
+
+    Returns a tuple of mutations, all length-preserving.
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    out = []
+    for m in mutations:
+        op = m[0]
+        if op == "inactivate":
+            lo, hi = m[1], m[2]
+            out.append(("replace", lo, make_quiescent_seq(hi - lo, rng=rng)))
+        elif op.startswith("shuffle"):
+            lo, hi = m[1], m[2]
+            k = int(op[len("shuffle") :]) if len(op) > len("shuffle") else 2
+            if fasta is None or chrom is None:
+                raise ValueError(f"freezing {op!r} needs fasta+chrom to read the reference sequence to shuffle")
+            seq = fasta.fetch(chrom, lo, hi).upper().encode()
+            out.append(("replace", lo, k_let_shuffle(seq, k, rng=rng).decode()))
+        else:  # replace / invert -- already deterministic
+            out.append(tuple(m))
+    return tuple(out)

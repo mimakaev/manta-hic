@@ -1,8 +1,10 @@
-[tool.black]
+[tool.ruff]
 line-length = 120
+exclude = ["build", "obsolete"]
 
-[tool.isort]
-profile = "black"
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]  # pycodestyle, pyflakes, warnings, import-sorting
+ignore = ["E731", "E402"]      # allow lambda assignments and non-top-of-file imports
 
 [build-system]
 requires = ["setuptools", "wheel"]
@@ -39,7 +41,6 @@ dependencies = [
     "cooler>=0.10",
     "cooltools>=0.7",
     "numba>=0.60",
-    "ushuffle>=1.1.2",
 ]
 requires-python = ">=3.12"
 

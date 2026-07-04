@@ -17,7 +17,8 @@ from manta_hic.nn.dataset import (
     run_epoch,
     train_val_test_folds,
 )
-from manta_hic.nn.manta import CachedStochasticActivationFetcher, Manta2
+from manta_hic.nn.fetchers import CachedMicrozoiFetcher
+from manta_hic.nn.manta import Manta, save_manta_checkpoint
 
 
 @contextmanager
@@ -138,7 +139,7 @@ def train_manta(
         params = {}
 
     # training only reads cached activations (no mutation patching), so no fasta handle is needed
-    fetcher = CachedStochasticActivationFetcher(cache_path)
+    fetcher = CachedMicrozoiFetcher(cache_path)
 
     # One open banded file shared by train + val (per-bin fold ids live in it, so the fold split is here).
     # The datasets slice it lazily for the whole run, so it stays open until training finishes -- the `with`
@@ -182,8 +183,8 @@ def train_manta(
         train_dl = ThreadedDataLoader(ds_train, batch_size=batch_size, shuffle=True, fraction=1.0)
 
         hic_res = ds_train.hic_res
-        # resolution of microzoi is 256bp, which has log2(256)=8. plus one because we maxpool after the first convolution
-        # which is not in a tower. Also tower is split to be before/after MHA, with one layer after MHA, so minimum
+        # resolution of microzoi is 256bp, which has log2(256)=8. plus one because we maxpool after the first
+        # convolution which is not in a tower. Also tower is split before/after MHA, with one layer after MHA, so min
         # resolution of the model is 1024bp:
         # microzoi (256bp) -> maxpool (512bp) -> MHA (512bp) -> last conv block + maxpool (1024bp) -> Hi-C map (1024bp))
         params["tower_height"] = int(np.round(np.log2(hic_res))) - 9
@@ -193,7 +194,10 @@ def train_manta(
             n_epochs = res_epoch_dict[hic_res]
         n_epochs = int(n_epochs * epoch_multiplier)
 
-        model = Manta2(**params, output_channels=ds_train.n_channels).to(device)
+        model = Manta(**params, output_channels=ds_train.n_channels).to(device)
+        # any non-default architecture params (beyond tower_height/n_bins/bins_pad, which the model already knows)
+        # to persist in the checkpoint so it reloads without them being re-supplied
+        model_arch = {k: v for k, v in params.items() if k not in ("tower_height", "n_bins", "bins_pad")}
         optimizer = optim.Adam(model.parameters(), lr=lr)
         scaler = torch.GradScaler()
         os.makedirs(output_folder, exist_ok=True)
@@ -217,7 +221,12 @@ def train_manta(
                 corrs_val = np.zeros((1, 1, 1, 1))
 
             if (epoch + 1) % save_every == 0:
-                torch.save(model.state_dict(), f"{output_folder}/model_{epoch}.pth")
+                save_manta_checkpoint(
+                    model,
+                    f"{output_folder}/model_{epoch}.pth",
+                    channel_names=banded.shortnames,
+                    model_params=model_arch,
+                )
 
             with open(f"{output_folder}/corrs_{epoch}.pkl", "wb") as f:
                 pickle.dump([corrs_train, corrs_val], f)
@@ -225,5 +234,10 @@ def train_manta(
             ct = ", ".join([f"{i:.3f}" for i in np.mean(corrs_train, axis=(0, 2, 3))])
             cv = ", ".join([f"{i:.3f}" for i in np.mean(corrs_val, axis=(0, 2, 3))])
 
-            print(f"Epoch {epoch+1}/{n_epochs}: train_corrs={ct}, val_corr={cv}   ")
-        torch.save(model.state_dict(), os.path.join(output_folder, "saved_model.pth"))
+            print(f"Epoch {epoch + 1}/{n_epochs}: train_corrs={ct}, val_corr={cv}   ")
+        save_manta_checkpoint(
+            model,
+            os.path.join(output_folder, "saved_model.pth"),
+            channel_names=banded.shortnames,
+            model_params=model_arch,
+        )

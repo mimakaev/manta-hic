@@ -36,9 +36,9 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
     import torch.optim as optim
     from torch import GradScaler, autocast
 
-    from manta_hic.nn.microzoi import MicroBorzoi, borzoi_loss, corr, dataGenerator
+    from manta_hic.nn.microzoi import Microzoi, borzoi_loss, corr, dataGenerator
+    from manta_hic.nn.training_meta import get_strand_pair
     from manta_hic.ops.tensor_ops import list_to_tensor_batch
-    from manta_hic.training_meta import get_strand_pair
 
     params = json.load(open(param_file))
     model_params = params["model"]
@@ -71,7 +71,7 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
         data_queue.put(None)
 
     # -------------- Initializing model and loading saved model  --------------
-    model = MicroBorzoi(**model_params)
+    model = Microzoi(**model_params)
     model = model.to(DEVICE)
 
     # load if continue training, or raise error if folder is not empty
