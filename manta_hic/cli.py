@@ -2,36 +2,16 @@
 
 import click
 
-from .io.cool_io import process_mcools as process_mcools_original
 from .nn.fill_cache import populate_microzoi_cache as fill_cache_original
 from .nn.train_manta import train_manta_click
 from .nn.train_microzoi import train_microzoi
 
 
 @click.command(context_settings={"show_default": True})
-@click.option("--manifest-path", "-m", type=click.Path(exists=True), required=True, help="Path to the manifest CSV.")
-@click.option(
-    "--output-folder",
-    "-o",
-    type=click.Path(file_okay=False, dir_okay=True),
-    required=True,
-    help="Folder where the outputs (HDF5 files) are written.",
-)
-@click.option("--resolutions", "-r", default="1024,2048,4096,8192", help="Comma-separated list of resolutions.")
-@click.option("--target-size", default=1024, help="Window size needed for the neural network, in bins.")
-@click.option("--step-bins", default=256, help="Step size in bins.")
-def process_mcools(manifest_path, output_folder, resolutions, target_size, step_bins):
-    """
-    Read a manifest CSV that has columns: group_name, filepath, genome.
-    Group by group_name, produce one HDF5 file per resolution per group.
-    """
-    process_mcools_original(manifest_path, output_folder, resolutions, target_size, step_bins)
-
-
-@click.command(context_settings={"show_default": True})
 @click.option("--cache-path", "-c", type=click.Path(), required=True, help="Path to the cachefile.")
 @click.option("--modfile", "-m", type=click.Path(exists=True), required=True, help="Path to the mod file.")
 @click.option("--fasta", "-f", type=click.Path(exists=True), required=True, help="Path to the FASTA file.")
+@click.option("--genome", "-g", required=True, help="Genome the FASTA is for (e.g. hg38/mm10); stored in the cache.")
 @click.option("--device", "-d", default="cuda:0", help="Torch device")
 @click.option("--batch-size", "-b", default=4, help="Batch size.")
 @click.option("--chrom", type=str, multiple=True, default=["#", "chrX"], help="Chromosomes to process.")
@@ -44,6 +24,7 @@ def fill_cache(
     cache_path,
     modfile,
     fasta,
+    genome,
     chrom=("#", "chrX"),
     params_file=None,
     n_runs=16,
@@ -57,6 +38,7 @@ def fill_cache(
         cache_path,
         modfile=modfile,
         fasta=fasta,
+        genome=genome,
         chroms=chrom,
         params_file=params_file,
         N_runs=n_runs,
@@ -90,7 +72,6 @@ def io():
     pass
 
 
-io.add_command(process_mcools)
 io.add_command(fill_cache)
 
 

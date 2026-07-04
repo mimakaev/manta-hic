@@ -70,7 +70,7 @@ def _make_store(n_bins=200, C=2, n_diag=24):
     fold_id[60:130] = 1
     fold_id[130:] = 2
     exp_per_arm = rng.uniform(0.1, 1.0, size=(C, 2, n_diag)).astype(np.float32)
-    exp_per_arm[:, :, :2] = 0.0  # first two diagonals zeroed, as in cool_io
+    exp_per_arm[:, :, :2] = 0.0  # first two diagonals zeroed
     store = BandedHicStore.from_dense(M, weights, bad, arm_id, fold_id, exp_per_arm, n_diag)
     return store, M
 

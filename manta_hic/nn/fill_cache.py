@@ -198,6 +198,7 @@ def populate_microzoi_cache(
     cache_path,
     modfile,
     fasta,
+    genome,
     chroms=("#", "chrX"),
     params_file=None,
     N_runs=16,
@@ -234,6 +235,9 @@ def populate_microzoi_cache(
         Path to the model file (e.g. "model.pt").
     fasta: str or pysam.FastaFile
         Path to the FASTA file or an open handle.
+    genome : str
+        Genome the FASTA is for (e.g. "hg38"/"mm10"). Stored as a file attr so a cache carries its genome by
+        construction; training/inference reject a cache whose genome disagrees with the target/model.
     chroms: list of str
         List of chromosome names to populate the cache for.
     params_file : str
@@ -281,6 +285,7 @@ def populate_microzoi_cache(
 
     with h5py.File(cache_path, "w") as f:
         # Record some basic attributes
+        f.attrs["genome"] = genome
         f.attrs["CACHE_OVERHANG_BP"] = CACHE_OVERHANG_BP
         f.attrs["N_runs"] = N_runs
         f.attrs["BIN_BP"] = BIN_BP

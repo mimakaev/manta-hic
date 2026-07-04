@@ -276,16 +276,16 @@ class Manta(nn.Module):
         return x_2d
 
 
-def save_manta_checkpoint(model, path, *, channel_names=None, model_params=None):
+def save_manta_checkpoint(model, path, *, channel_names=None, model_params=None, genome=None):
     """
     Save a Manta model as a **self-describing** checkpoint: ``{"state_dict": ..., "config": {...}}``.
 
     The config carries everything needed to reload and use the model without inferring anything from tensor
     shapes -- crucially the ``resolution`` (which the state dict can't disambiguate below 1024 bp), plus
-    ``n_bins`` / ``bins_pad`` / ``tower_height`` / ``output_channels`` and, optionally, ``channel_names`` (so
-    channel labels no longer depend on the target file) and non-default ``model_params``.
-    ``MantaInference`` reads this format directly; bare ``state_dict`` checkpoints still load via shape
-    inference.
+    ``n_bins`` / ``bins_pad`` / ``tower_height`` / ``output_channels`` and, optionally, ``genome`` (the model
+    is genome-specific, so this lets inference reject a mismatched cache/target), ``channel_names`` (so channel
+    labels no longer depend on the target file) and non-default ``model_params``. ``MantaInference`` reads this
+    format directly.
     """
     state = model.state_dict()
     config = {
@@ -295,6 +295,8 @@ def save_manta_checkpoint(model, path, *, channel_names=None, model_params=None)
         "tower_height": int(model.tower_height),
         "output_channels": int(state["final_conv.weight"].shape[0]),
     }
+    if genome is not None:
+        config["genome"] = str(genome)
     if channel_names is not None:
         config["channel_names"] = list(channel_names)
     if model_params:

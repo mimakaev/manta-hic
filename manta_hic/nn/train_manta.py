@@ -147,6 +147,8 @@ def train_manta(
     with BandedHicFile(input_file) as banded:
         if banded.genome != genome:
             raise ValueError(f"banded file genome {banded.genome!r} != requested genome {genome!r}")
+        if fetcher.genome is not None and fetcher.genome != genome:
+            raise ValueError(f"cache genome {fetcher.genome!r} != requested genome {genome!r} (wrong cache?)")
         train_folds, val_folds, _test_folds = train_val_test_folds(banded, val_fold, test_fold)
 
         # Run-averaging augmentation policy lives here (the fetcher just averages whatever n_runs it is given):
@@ -226,6 +228,7 @@ def train_manta(
                     f"{output_folder}/model_{epoch}.pth",
                     channel_names=banded.shortnames,
                     model_params=model_arch,
+                    genome=banded.genome,
                 )
 
             with open(f"{output_folder}/corrs_{epoch}.pkl", "wb") as f:
@@ -240,4 +243,5 @@ def train_manta(
             os.path.join(output_folder, "saved_model.pth"),
             channel_names=banded.shortnames,
             model_params=model_arch,
+            genome=banded.genome,
         )
