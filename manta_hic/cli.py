@@ -3,8 +3,7 @@
 import click
 
 from .io.cool_io import process_mcools as process_mcools_original
-from .nn.manta import populate_microzoi_cache as fill_cache_original
-from .nn.mutate_manta import manta_mutate_file
+from .nn.fill_cache import populate_microzoi_cache as fill_cache_original
 from .nn.train_manta import train_manta_click
 from .nn.train_microzoi import train_microzoi
 
@@ -94,14 +93,6 @@ def io():
 io.add_command(process_mcools)
 io.add_command(fill_cache)
 
-
-@cli.group()
-def mutate():
-    """Mutation screens."""
-    pass
-
-
-mutate.add_command(manta_mutate_file)
 
 if __name__ == "__main__":
     cli()

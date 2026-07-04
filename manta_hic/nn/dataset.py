@@ -57,7 +57,7 @@ class HiCDataset:
     ----------
     banded_file : BandedHicFile | str
         An open banded file or a path to one (opened read-only).
-    fetcher : CachedStochasticActivationFetcher
+    fetcher : CachedMicrozoiFetcher
         Supplies ``fetch(chrom, start_bp, end_bp, reverse, n_runs, device)`` activations for the padded window.
     n_bins : int
         Hi-C map side length in bins (the model's ``n_bins``).

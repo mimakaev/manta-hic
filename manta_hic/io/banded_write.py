@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
-from manta_hic.training_meta import fold_df
+from manta_hic.nn.training_meta import fold_df
 
 COUNT_CLIP = 32000  # clip raw counts to fit int16 (matches cool_io)
 
@@ -106,7 +106,8 @@ def _band_block(sel, chrom, lo, n_bins, b0, b1, n_diag, resolution, clen):
     """
     col_hi = min(b1 + n_diag, n_bins)
     px = sel.fetch(
-        f"{chrom}:{b0*resolution}-{min(b1*resolution, clen)}", f"{chrom}:{b0*resolution}-{min(col_hi*resolution, clen)}"
+        f"{chrom}:{b0 * resolution}-{min(b1 * resolution, clen)}",
+        f"{chrom}:{b0 * resolution}-{min(col_hi * resolution, clen)}",
     )
     r = px["bin1_id"].values - (lo + b0)
     d = px["bin2_id"].values - px["bin1_id"].values
