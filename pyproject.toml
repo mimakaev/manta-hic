@@ -40,6 +40,10 @@ dependencies = [
     "bioframe>=0.7",
     "cooler>=0.10",
     "cooltools>=0.7",
+    # Not imported by manta_hic -- a resolver pin (a lower bound, so it respects "no upper caps"). cooltools
+    # requires `numba` unversioned; numba caps numpy, and our unbounded numpy>=2 outruns it, so without a
+    # floor the solver backtracks to numba 0.53 (won't build on 3.12, incompatible with numpy 2). >=0.60
+    # forces a coherent modern numba/numpy stack. Drop only if cooltools ever floors numba itself.
     "numba>=0.60",
 ]
 requires-python = ">=3.12"

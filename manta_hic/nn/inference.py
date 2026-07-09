@@ -27,7 +27,7 @@ import torch
 from manta_hic.io.banded import BandedHicFile
 from manta_hic.nn.manta import Manta
 from manta_hic.nn.specs import Spec
-from manta_hic.ops.hic_ops import create_expected_matrix
+from manta_hic.ops.hic_ops import adaptive_coarsegrain_torch, create_expected_matrix
 
 
 class MantaInference:
@@ -345,20 +345,27 @@ class MantaInference:
         return self.target_file.is_eligible(chrom, start_bp, self.n_bins, min_fraction=min_fraction, fold=fold)
 
     @torch.no_grad()
-    def target(self, chrom, start_bp, *, observed_over_expected=True):
+    def target(self, chrom, start_bp, *, observed_over_expected=True, adaptive_coarsegrain=False):
         """
         Observed Hi-C map for the same window from the banded ``target`` file, as ``[output_channels, n, n]``.
 
         With ``observed_over_expected`` (default) the map is divided by the per-arm distance expectation via
         :func:`create_expected_matrix` (matching the training target and the model's output convention);
-        otherwise raw balanced counts are returned. Returns ``None`` if no target file is attached.
+        otherwise raw balanced counts are returned. With ``adaptive_coarsegrain`` the observed-over-expected map
+        is additionally smoothed by :func:`adaptive_coarsegrain_torch` (pooling sparse pixels using the raw
+        counts) -- this is the exact form the model is scored against and the cleanest thing to plot next to a
+        prediction (view it as ``log2``). Returns ``None`` if no target file is attached.
         """
         if self.target_file is None:
             return None
+        if adaptive_coarsegrain and not observed_over_expected:
+            raise ValueError("adaptive_coarsegrain=True requires observed_over_expected=True")
         hic, weight, exp = self.target_file.get_window(chrom, start_bp, self.n_bins)
         t = lambda x: torch.from_numpy(np.ascontiguousarray(x)).float().unsqueeze(0).to(self.device)
         snippet, expmat = create_expected_matrix(t(hic), t(weight), t(exp))
         if not observed_over_expected:
             return snippet[0]
         ooe = torch.where(expmat > 0, snippet / expmat.clamp_min(1e-9), torch.zeros_like(snippet))
+        if adaptive_coarsegrain:
+            ooe = adaptive_coarsegrain_torch(ooe, snippet)  # raw (balanced) counts drive the pooling
         return ooe[0]

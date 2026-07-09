@@ -1,8 +1,8 @@
 # Spec-based Manta inference
 
-How to predict Hi-C maps (and mutation effects) from a trained Manta model. This is the *usage* guide and
-the record of the **conventions** the stack relies on; the design rationale is in
-`docs/INFERENCE_SPEC_PLAN.md` (the design log).
+Reference for predicting Hi-C maps (and mutation effects) from a trained Manta model: the layered API, the
+**conventions** the stack relies on, and the design rationale. For a gentle introduction start with the
+`example_notebooks/` instead; this is the deep dive.
 
 ## Quick start
 
@@ -89,7 +89,7 @@ does no tiling or merging; it shifts and runs. Each tile recomputes only the mut
 ### Patch tolerance = `soft_causality + max_shift` (in **bins**)
 A patch extends `soft_causality_bp + max_shift_bp` beyond each mutation, so after any shift up to `max_shift`
 the mutation stays ≥ `soft_causality` from the recomputed/cached seam. Defaults are **256 bins each** (a
-512-bin tolerance, 256-bin post-shift margin) — placeholders pending calibration. `soft_causality` is the
+512-bin tolerance, 256-bin post-shift margin) — conservative heuristics, not empirically tuned. `soft_causality` is the
 assumed reach of a mutation's influence through MicroZoi; `max_shift` is the augmentation shift range.
 
 ### Mutations are independent of specs; random ops are *frozen* before use
