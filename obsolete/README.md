@@ -11,7 +11,7 @@ rep) and ran every Manta head, then aggregated WT-vs-mutant log-ratios. **This i
 publication sweep was produced with** — keep it readable so those results stay reproducible.
 
 Superseded by the spec-based inference stack (`nn/specs.py` + `fetch_activations_batch`; see
-`docs/INFERENCE_SPEC_PLAN.md`), which reuses cached activations instead of recomputing from scratch. A
+`docs/INFERENCE.md`), which reuses cached activations instead of recomputing from scratch. A
 rewrite is planned (the old path likely under-randomized). It still imports live package symbols
 (`Manta`, `fetch_tile_microzoi_activations`, `make_quiescent_seq`), so `python obsolete/mutate_manta.py`
 continues to run.

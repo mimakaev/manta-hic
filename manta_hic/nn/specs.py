@@ -1,5 +1,5 @@
 """
-L0 of the spec-based inference stack (see docs/INFERENCE_SPEC_PLAN.md). **Pure data + geometry** -- no
+L0 of the spec-based inference stack (see docs/INFERENCE.md). **Pure data + geometry** -- no
 torch, no h5py, no GPU, so it is fully unit-testable on CPU.
 
 A *spec* concretely and completely describes ONE Manta inference (one output map): which cached MicroZoi

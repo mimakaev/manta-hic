@@ -4,9 +4,11 @@
 # preferred, especially when it keeps the code simpler. These are modern *minimum* floors only: no upper
 # caps, no legacy pins, no compatibility shims. Requires Python >= 3.12.
 #
-# Install note: the `numba>=0.60` floor stops the resolver backtracking to numba 0.53 (which won't build on
-# 3.12). k-let sequence shuffling is now pure-Python (manta_hic/ops/kshuffle.py), so the old `ushuffle` C
-# dependency (which needed a rebuild hack on 3.12) is gone -- these are all plain `pip install -r`-able.
+# Install note: these are all plain `pip install -r`-able (no build hacks). k-let sequence shuffling is
+# pure-Python (manta_hic/ops/kshuffle.py), so the old `ushuffle` C dependency is gone. numba is NOT imported
+# by manta_hic -- it is a resolver pin: cooltools requires `numba` unversioned, and without a floor the
+# solver backtracks to numba 0.53 (won't build on 3.12, incompatible with numpy 2). >=0.60 forces a coherent
+# modern numba/numpy stack.
 
 torch>=2.6
 numpy>=2.0

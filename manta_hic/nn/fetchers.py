@@ -4,7 +4,7 @@ recompute spliced into the cache -- into Manta inputs.
 
 - :class:`CachedMicrozoiFetcher` reads the HDF5 activation cache, averages cached runs (a training
   augmentation), and patches mutations. Its :meth:`fetch_activations_batch` is the **L1** engine of the
-  spec-based inference stack (see docs/INFERENCE_SPEC_PLAN.md).
+  spec-based inference stack (see docs/INFERENCE.md).
 - :class:`SequenceFetcher` fetches one-hot sequence instead, for Akita-style one-shot models.
 
 The offline builder that *writes* this cache is in ``nn/fill_cache.py``.
@@ -267,7 +267,7 @@ class CachedMicrozoiFetcher(object):
     ) -> list[torch.Tensor]:
         """
         Turn a list of specs (``manta_hic.nn.specs.Spec``) into their activation tensors on ``device``, ready
-        for Manta -- the L1 engine of the spec-based inference stack (see docs/INFERENCE_SPEC_PLAN.md).
+        for Manta -- the L1 engine of the spec-based inference stack (see docs/INFERENCE.md).
 
         Two levels of dedup within the batch: identical **cache reads** (specs whose Background shares a cache
         window, ``run_idx`` and orientation) happen once; and identical **recompute jobs** -- a tile window +
