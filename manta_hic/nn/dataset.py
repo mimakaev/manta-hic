@@ -32,7 +32,7 @@ from manta_hic.ops.hic_ops import (
     create_expected_matrix,
     hic_hierarchical_loss,
 )
-from manta_hic.ops.tensor_ops import list_to_tensor_batch
+from manta_hic.ops.tensor_ops import list_to_tensor_batch, torch_device_type
 
 
 def _parse_fold(fold):
@@ -257,7 +257,7 @@ def run_epoch(model, dataloader, device, is_train=True, optimizer=None, scaler=N
         exp = list_to_tensor_batch([i["exp"] for i in batch], device)
         target, weightmat = create_expected_matrix(target, weight, exp)
 
-        with torch.autocast("cuda"):
+        with torch.autocast(torch_device_type(device)):
             if is_train:
                 acts.requires_grad = True
                 optimizer.zero_grad()

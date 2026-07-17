@@ -6,6 +6,13 @@ import numpy as np
 import torch
 
 
+def torch_device_type(device) -> str:
+    """Device *type* (``"cuda"``/``"mps"``/``"cpu"``) for ``torch.autocast`` / ``torch.GradScaler``, which want
+    a type -- not a full device string. Accepts a ``torch.device`` or a string like ``"cuda:1"`` (so callers
+    keep the freedom to target a specific device) and strips the index."""
+    return device.type if isinstance(device, torch.device) else str(device).split(":")[0]
+
+
 def round_mantissa(arr: np.ndarray, keep_bits: int) -> np.ndarray:
     """
     Zero the low mantissa bits of a float16 array (round-to-nearest), keeping ``keep_bits`` of the 10 mantissa

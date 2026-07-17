@@ -31,7 +31,12 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu
     import torch
 
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        DEVICE = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        DEVICE = torch.device("mps")
+    else:
+        DEVICE = torch.device("cpu")
     torch.set_float32_matmul_precision("high")
     import torch.optim as optim
     from torch import GradScaler, autocast
@@ -89,7 +94,7 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
     ramp_up_epochs = train_params["ramp_up_epochs"]
     num_epochs = train_params["num_epochs"]
     optimizer = optim.Adam(model.parameters(), lr=max_lr)
-    scaler = GradScaler("cuda")
+    scaler = GradScaler(DEVICE.type, enabled=DEVICE.type in ("cuda", "mps"))
     run_corr = 0
 
     for epoch in range(st_epoch, num_epochs):
@@ -117,7 +122,7 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
                 shift_bins = -shift_bins
 
             optimizer.zero_grad()
-            with autocast("cuda"):
+            with autocast(DEVICE.type):
                 output = model(in_data, genome=genome, offset=shift_bins)  # [B, C, N]
                 loss = borzoi_loss(output, target)
 
@@ -149,7 +154,7 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
                 target = list_to_tensor_batch(target, DEVICE, dtype=torch.float32).permute(0, 2, 1)
                 target.requires_grad = False
 
-                with torch.no_grad(), autocast("cuda"):
+                with torch.no_grad(), autocast(DEVICE.type):
                     assert shift_bins == 0
                     output = model(in_data, genome=genome, offset=shift_bins)
                     val_corrs_epoch.append(mean_corr := float(corr(target, output)))

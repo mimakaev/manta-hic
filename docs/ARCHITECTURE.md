@@ -28,12 +28,32 @@ A cache (`microzoi_cache_<genome>_<fold>.h5`, built by `manta_hic io fill-cache`
   weights the cache was built with (so a fetcher reconstructs the right model for mutation recompute).
 - `N_runs` (=16) **stochastic runs** as groups `run0`…`run{N-1}`. Each run is a different augmentation
   (sub-bin shift, tile offset, crop) and holds both the **forward** and **reverse-complement** activations per
-  chromosome. Averaging over runs smooths predictions; `scripts/subsample_cache.py` copies a cache keeping only
-  a few runs for a smaller, shareable file.
+  chromosome. Averaging over runs smooths predictions; build a smaller, shareable cache by rerunning
+  `manta_hic io fill-cache` with a lower `--n-runs` (e.g. `--n-runs 4`).
 
 `CachedMicrozoiFetcher` (`manta_hic/nn/fetchers.py`) reads windows from the cache and, for a **mutation**,
 recomputes only the tiles the edit touches (rebuilding MicroZoi from `model_blob`, using the FASTA) and splices
 them in — so a wild-type/mutant pair differs only where the mutation acts.
+
+### Building vs. downloading a cache
+
+Building a genome-wide cache is the one genuinely GPU-heavy step. On an Apple-Silicon laptop (M4 Pro, `mps`)
+`fill-cache` runs at roughly one MicroZoi tile-batch of 4 in ~2.2 s and stores ~6.7 MB per Mb per run
+(compressed float16). For hg38 (chr1–22+X, ~3.0 Gb) that works out to about:
+
+| runs | build time (M4 Pro) | size on disk |
+|---|---|---|
+| 2  | ~6.4 h  | ~41 GB  |
+| 4  | ~12.5 h | ~81 GB  |
+| 8  | ~24.7 h | ~162 GB |
+| 16 | ~49 h   | ~325 GB |
+
+(Higher runs are progressively slower per run: `crop_mha` grows across runs, so later runs lay more overlapping
+tiles.) **Recommendation: download a prebuilt cache rather than building on a laptop** — the shared host carries
+genome-wide caches (~90 GB / 4 runs each, one per held-out MicroZoi fold). Building locally only makes sense on
+a CUDA machine, for a genome with no prebuilt cache, or for a single chromosome. Note MicroZoi batching does
+**not** speed up `mps` (per-sample time is flat and memory scales linearly — ~8 GB per batch item), so on a Mac
+use `--batch-size 1` or `2`; the CUDA default of 4 reserves ~26 GB and can push a laptop into swap.
 
 ## Resolutions
 

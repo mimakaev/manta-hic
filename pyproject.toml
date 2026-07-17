@@ -27,7 +27,7 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# Modern floors only -- no backwards compatibility, no old Python/library support (see CLAUDE.md / requirements.txt).
+# Modern floors only -- no backwards compatibility, no old Python/library support (see requirements.txt).
 dependencies = [
     "torch>=2.6",
     "numpy>=2.0",

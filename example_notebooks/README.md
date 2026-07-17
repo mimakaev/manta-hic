@@ -11,7 +11,8 @@ Runnable examples of using a trained Manta model for inference. Read them in ord
 
 ## Prerequisites
 
-- `manta-hic` installed (see the top-level [README](../README.md)) and a **CUDA GPU** for the inference notebooks.
+- `manta-hic` installed (see the top-level [README](../README.md)). A **CUDA GPU** is fastest, but the
+  notebooks also run on **Apple Silicon (`mps`)** and CPU — the setup cell auto-detects the device.
 - The data files in [`data/`](data/) — they are git-ignored; download them once (see [`data/README.md`](data/README.md)).
 
 The notebooks resolve their inputs from `data/` relative to this folder, so launch Jupyter from here (or with
