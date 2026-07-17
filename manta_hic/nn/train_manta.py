@@ -19,6 +19,7 @@ from manta_hic.nn.dataset import (
 )
 from manta_hic.nn.fetchers import CachedMicrozoiFetcher
 from manta_hic.nn.manta import Manta, save_manta_checkpoint
+from manta_hic.ops.tensor_ops import torch_device_type
 
 
 @contextmanager
@@ -201,7 +202,10 @@ def train_manta(
         # to persist in the checkpoint so it reloads without them being re-supplied
         model_arch = {k: v for k, v in params.items() if k not in ("tower_height", "n_bins", "bins_pad")}
         optimizer = optim.Adam(model.parameters(), lr=lr)
-        scaler = torch.GradScaler()
+        # autocast uses fp16 on cuda/mps (needs loss scaling) and bf16 on cpu (does not) -- so enable the
+        # scaler only for the fp16 backends. Device *type* keeps cuda:0/cuda:1 targeting intact.
+        dev_type = torch_device_type(device)
+        scaler = torch.GradScaler(dev_type, enabled=dev_type in ("cuda", "mps"))
         os.makedirs(output_folder, exist_ok=True)
 
         for epoch in range(n_epochs):

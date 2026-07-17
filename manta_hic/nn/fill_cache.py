@@ -18,7 +18,7 @@ from torch.utils.checkpoint import checkpoint
 from manta_hic.nn.fetchers import BIN_BP, CACHE_OVERHANG_BP, MICROZOI_RECEPTIVE_FIELD
 from manta_hic.nn.microzoi import Microzoi
 from manta_hic.ops.seq_ops import make_seq_1hot, open_fasta_chromsizes
-from manta_hic.ops.tensor_ops import list_to_tensor_batch, round_mantissa
+from manta_hic.ops.tensor_ops import list_to_tensor_batch, round_mantissa, torch_device_type
 
 # Activation-cache codec: Blosc-zstd + BIT shuffle (was plain Zstd level 9). Decompresses multi-threaded --
 # with BLOSC_NTHREADS=4 (set in the package __init__) a fetch reads ~30% faster than the old single-threaded
@@ -351,7 +351,7 @@ def populate_microzoi_cache(
                         block_start_bp = start_of_chrom + block_idx * block_bp
                         block_end_bp = min(start_of_chrom + (block_idx + 1) * block_bp, end_of_chrom)
                         # fetch
-                        with torch.no_grad(), torch.autocast(device):
+                        with torch.no_grad(), torch.autocast(torch_device_type(device)):
                             activ = fetch_tile_microzoi_activations(
                                 model=base_model,
                                 fasta_open=fasta_open,

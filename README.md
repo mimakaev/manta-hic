@@ -26,7 +26,7 @@ recomputed on the fly — so a wild-type-vs-mutant comparison is cheap and exact
 
 ## Install
 
-Requires **Python ≥ 3.12**, PyTorch ≥ 2.6, and a CUDA GPU for real inference.
+Requires **Python ≥ 3.12** and PyTorch ≥ 2.6.
 
 ```bash
 pip install git+https://github.com/mimakaev/manta-hic
@@ -35,6 +35,16 @@ pip install -e .
 ```
 
 Everything is plain `pip`-installable (no build hacks). See `requirements.txt` for the dependency floors.
+
+**Device.** A CUDA GPU is fastest, but not required: the model also runs on **Apple Silicon (Metal / `mps`)**
+and on CPU. Pass the device to `MantaInference(..., device=...)` (and `--device` to the CLI). On a MacBook
+(M4 Pro) a single 1024×1024 map at 2048 bp predicts in ~4 s and uses well under 1 GB — inference and
+batch-size-1 training both fit comfortably in unified memory. A portable device pick:
+
+```python
+import torch
+device = "cuda:0" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+```
 
 ## Data
 
@@ -48,8 +58,8 @@ Inference needs two files plus a genome:
 
 Trained models and MicroZoi caches are available from a shared HTTP host — **contact the authors for access**
 (some of it is still being finalized). The reference genomes are public (e.g. UCSC `hg38.fa`). Caches are
-large (genome-wide, 16 stochastic runs); a 4-run subset (~4× smaller) is enough for most inference and can be
-made with `scripts/subsample_cache.py`.
+large (genome-wide, 16 stochastic runs); a **4-run cache** (~4× smaller) is enough for most inference — build
+one for any genome with `manta_hic io fill-cache --n-runs 4` (see `docs/ARCHITECTURE.md`).
 
 ## Quick start
 
