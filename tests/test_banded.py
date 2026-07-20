@@ -20,6 +20,11 @@ from manta_hic.io.banded import BandedHicFile, band_from_dense, square_from_band
 from manta_hic.ops.hic_ops import create_expected_matrix
 
 
+def _positions(bf, n, **kw):
+    """Eligible global start positions (eligible_positions was removed; nonzero of the mask)."""
+    return np.nonzero(bf.eligible_mask(n, **kw))[0]
+
+
 def _symmetric_counts(L, C):
     """A small Hi-C-like symmetric count matrix [C, L, L] that decays with distance."""
     rng = np.random.default_rng(L * 100 + C)  # local + seeded: deterministic, order-independent
@@ -105,7 +110,7 @@ def _brute_eligible(bf, n, max_bad_fraction, fold, overlap_threshold=0.9):
 @pytest.mark.parametrize("fold", [None, 0, 1, 2])
 def test_eligible_positions_match_brute_force(n, max_bad_fraction, fold):
     bf, _ = _make_file()
-    got = bf.eligible_positions(n, max_bad_fraction=max_bad_fraction, fold=fold)
+    got = _positions(bf, n, max_bad_fraction=max_bad_fraction, fold=fold)
     want = _brute_eligible(bf, n, max_bad_fraction, fold)
     np.testing.assert_array_equal(got, want)
 
@@ -117,7 +122,7 @@ def test_eligible_start_fraction_matches_file():
     bf, _ = _make_file()
     for n, mf in [(16, 0.1), (16, 0.5), (32, 1.0)]:
         frac, n_elig, n_cand = eligible_start_fraction(bf.bad, bf.arm_id, n, max_bad_fraction=mf)
-        assert n_elig == len(bf.eligible_positions(n, max_bad_fraction=mf, fold=None))
+        assert n_elig == len(_positions(bf, n, max_bad_fraction=mf, fold=None))
         assert n_cand >= n_elig and (frac == (n_elig / n_cand if n_cand else 0.0))
 
 
@@ -127,7 +132,7 @@ def test_eligible_start_fraction_matches_file():
 def test_is_eligible_matches_eligible_positions(n, max_bad_fraction, fold):
     """The O(1) coordinate check must agree with the vectorized position set for every bin (resolution=1)."""
     bf, _ = _make_file()
-    starts = set(int(a) for a in bf.eligible_positions(n, max_bad_fraction=max_bad_fraction, fold=fold))
+    starts = set(int(a) for a in _positions(bf, n, max_bad_fraction=max_bad_fraction, fold=fold))
     for a in range(bf.total_bins - n + 1):
         assert bf.is_eligible("chr1", a, n, max_bad_fraction=max_bad_fraction, fold=fold) == (a in starts)
 
@@ -144,9 +149,9 @@ def test_fold_fraction_tolerates_boundaries():
     the union of single-fold {0} and {2} windows, and every kept window is really >= 90% inside {0,2}."""
     bf, _ = _make_file()
     n = 16
-    only0 = set(int(a) for a in bf.eligible_positions(n, fold=0))
-    only2 = set(int(a) for a in bf.eligible_positions(n, fold=2))
-    both = set(int(a) for a in bf.eligible_positions(n, fold={0, 2}))
+    only0 = set(int(a) for a in _positions(bf, n, fold=0))
+    only2 = set(int(a) for a in _positions(bf, n, fold=2))
+    both = set(int(a) for a in _positions(bf, n, fold={0, 2}))
     assert (only0 | only2) <= both
     for a in both:
         assert np.isin(bf.fold_id[a : a + n], [0, 2]).mean() >= 0.9
@@ -170,10 +175,10 @@ def test_window_at_rejects_arm_crossing_and_nonpositive_n():
 def test_eligibility_never_crosses_centromere_or_arm():
     bf, _ = _make_file()
     n = 16
-    for a in bf.eligible_positions(n, max_bad_fraction=1.0):
+    for a in _positions(bf, n, max_bad_fraction=1.0):
         seg = bf.arm_id[a : a + n]
         assert seg[0] != -1 and np.all(seg == seg[0])  # one arm, not excluded
-    assert not any(a < 100 and a + n > 90 and a + n <= 100 for a in bf.eligible_positions(n, max_bad_fraction=1.0))
+    assert not any(a < 100 and a + n > 90 and a + n <= 100 for a in _positions(bf, n, max_bad_fraction=1.0))
 
 
 # --------------------------------------------------------------------------- #
@@ -182,7 +187,7 @@ def test_eligibility_never_crosses_centromere_or_arm():
 def test_create_expected_matrix_parity():
     bf, M = _make_file()
     n = 16
-    a = int(bf.eligible_positions(n, max_bad_fraction=1.0)[3])  # some valid window
+    a = int(_positions(bf, n, max_bad_fraction=1.0)[3])  # some valid window
     arm = int(bf.arm_id[a])
 
     hic_b, weight_b, exp_b = bf.window_at(a, n)  # from the band
