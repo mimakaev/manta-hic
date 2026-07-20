@@ -15,8 +15,8 @@ chromosome band is gigabytes and must never be materialized), the per-arm expect
 Two coordinate systems sit on top of it:
 
 - **humans / inference / plotting** use ``(chrom, start_bp)`` -- :meth:`get_window`, :meth:`is_eligible`;
-- **sampling / training** use a single global bin index ``pos`` in ``[0, total_bins)`` -- :meth:`eligible_positions`,
-  :meth:`window_at`, with :meth:`pos_to_coord` / :meth:`coord_to_pos` bridging the two.
+- **sampling / training** use a single global bin index ``pos`` in ``[0, total_bins)`` -- :meth:`eligible_mask`
+  (``np.nonzero`` it for the pool), :meth:`window_at`, with :meth:`pos_to_coord` / :meth:`coord_to_pos` bridging.
 
 There is no per-chromosome store object: the file *is* the store. Because ``arm_id`` is globally unique per arm,
 a window that would straddle a chromosome (or arm) boundary spans two arm ids and is rejected automatically, so
@@ -24,6 +24,8 @@ the flat genome-wide axis needs no special-casing at the seams.
 
 The build side (reading real coolers + ``cooltools`` expected) lives in ``io/banded_write.py``.
 """
+
+from functools import lru_cache
 
 import h5py
 import hdf5plugin  # noqa: F401  -- registers the Blosc filter so bands written with it are readable
@@ -213,7 +215,8 @@ class BandedHicFile:
         # prefix-sum scaffolding for the vectorized (genome-wide, single-pass) eligibility computation
         self._arm_changes = np.concatenate([[0], np.cumsum(self.arm_id[1:] != self.arm_id[:-1])])
         self._bad_cum = np.concatenate([np.zeros((self.C, 1)), np.cumsum(self.bad.astype(np.float64), axis=1)], axis=1)
-        self._mask_cache: dict = {}  # (n, max_bad_fraction, fold_key, overlap_threshold) -> global bool mask
+        # per-instance memo of the eligibility masks (a handful per file, all actively reused; freed with the file)
+        self._eligible_mask = lru_cache(maxsize=None)(self._compute_eligible_mask)
 
     # -- coordinate mapping: humans use (chrom, start_bp); sampling uses global pos --------------------------- #
     def bp_to_bin(self, start_bp: int) -> int:
@@ -234,13 +237,7 @@ class BandedHicFile:
             raise IndexError(f"pos {pos} outside [0, {self.total_bins})")
         return self.chroms[ci], int(pos - self._offsets[ci]) * self.resolution
 
-    # -- eligibility: the single source of truth (genome-wide, one vectorized pass) -------------------------- #
-    @staticmethod
-    def _fold_key(fold):
-        if fold is None:
-            return None
-        return int(fold) if np.isscalar(fold) else frozenset(int(x) for x in fold)
-
+    # -- eligibility: the single source of truth (genome-wide, one vectorized pass, lru-cached) -------------- #
     def eligible_mask(
         self, n: int, *, max_bad_fraction: float = 0.1, fold=None, overlap_threshold: float = 0.9
     ) -> np.ndarray:
@@ -255,16 +252,14 @@ class BandedHicFile:
 
         The fold rule tolerates fold boundaries (Borzoi's short randomly-offset snippets): a window straddling
         several *train* folds is all-train and kept; train/val boundaries are dropped unless one side clears the
-        threshold. Pass ``fold=train_folds`` for the train pool, ``fold={val}`` for validation. Memoized.
+        threshold. Pass ``fold=train_folds`` for the train pool, ``fold={val}`` for validation. For a flat int
+        array of the eligible positions themselves, ``np.nonzero(eligible_mask(...))[0]``. lru-cached per file.
         """
-        key = (int(n), float(max_bad_fraction), self._fold_key(fold), float(overlap_threshold))
-        mask = self._mask_cache.get(key)
-        if mask is None:
-            mask = self._compute_mask(n, max_bad_fraction, fold, overlap_threshold)
-            self._mask_cache[key] = mask
-        return mask
+        if fold is not None:  # make it hashable for the cache (a frozenset of ints)
+            fold = frozenset({int(fold)} if np.isscalar(fold) else (int(x) for x in fold))
+        return self._eligible_mask(int(n), float(max_bad_fraction), fold, float(overlap_threshold))
 
-    def _compute_mask(self, n, max_bad_fraction, fold, overlap_threshold):
+    def _compute_eligible_mask(self, n, max_bad_fraction, fold, overlap_threshold):
         N = self.total_bins
         if n <= 0 or n > N:
             return np.zeros(0, dtype=bool)
@@ -275,20 +270,10 @@ class BandedHicFile:
         if fold is None:
             fold_ok = np.ones_like(a, dtype=bool)
         else:
-            fset = {int(fold)} if np.isscalar(fold) else {int(x) for x in fold}
-            in_set = np.isin(self.fold_id, np.fromiter(fset, dtype=self.fold_id.dtype, count=len(fset)))
+            in_set = np.isin(self.fold_id, np.fromiter(fold, dtype=self.fold_id.dtype, count=len(fold)))
             cum = np.concatenate([[0], np.cumsum(in_set.astype(np.int64))])
             fold_ok = (cum[a + n] - cum[a]) / n >= overlap_threshold
         return arm_ok & bad_ok & fold_ok
-
-    def eligible_positions(
-        self, n: int, *, max_bad_fraction: float = 0.1, fold=None, overlap_threshold: float = 0.9
-    ) -> np.ndarray:
-        """Global start positions passing every criterion -- ``nonzero`` of :meth:`eligible_mask`. THE window pool
-        for sampling: a flat int array, uniform draws over it are uniform over the genome (no per-chrom bias)."""
-        return np.nonzero(
-            self.eligible_mask(n, max_bad_fraction=max_bad_fraction, fold=fold, overlap_threshold=overlap_threshold)
-        )[0].astype(np.int64)
 
     # -- window reconstruction ----------------------------------------------- #
     def window_at(self, pos: int, n: int):
@@ -343,11 +328,13 @@ class BandedHicFile:
     def eligible_starts(
         self, chrom: str, n_bins: int, *, max_bad_fraction: float = 0.1, fold=None, overlap_threshold: float = 0.9
     ) -> np.ndarray:
-        """Eligible *local* start bins within ``chrom`` (human convenience; sampling should use
-        :meth:`eligible_positions`)."""
-        pos = self.eligible_positions(
-            n_bins, max_bad_fraction=max_bad_fraction, fold=fold, overlap_threshold=overlap_threshold
-        )
+        """Eligible *local* start bins within ``chrom`` (human convenience; training samples over global
+        positions from :meth:`eligible_mask` instead)."""
+        pos = np.nonzero(
+            self.eligible_mask(
+                n_bins, max_bad_fraction=max_bad_fraction, fold=fold, overlap_threshold=overlap_threshold
+            )
+        )[0]
         lo = self.chrom_start[chrom]
         hi = lo + self.chrom_nbins[chrom]
         return (pos[(pos >= lo) & (pos < hi)] - lo).astype(np.int64)

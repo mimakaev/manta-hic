@@ -8,31 +8,31 @@ are otherwise independent (own weights, optimizer, output channels).
 
 How the data pipeline is organized (all precomputed up front, pure numpy):
 
-* **Eligibility is a genome-wide array, per (model, n_bins).** ``BandedHicFile.eligible_mask`` gives, over the
-  genome-wide global-position axis, the full inclusion mask (arm + bad-fraction + fold-fraction) for a fold set.
-  We stack it across models on that shared axis, yielding, per n_bins, a *superset* of train (and val) global
-  positions plus an ``(n_windows x n_models)`` eligibility matrix. No round-robin over chromosomes, no per-model
-  random draws that would break the shared fetch; a window is just one global bin index.
-* **Windows are sampled uniformly** over the superset (so coverage is proportional to genome, not per-chromosome
-  -- big chromosomes are not under-sampled), with random reverse-complement.
-* **One epoch = the genome seen ~once in both directions** = ``2 * n_eligible / n_bins`` windows (half the old
-  stride-n_bins/4 epoch). With several ``n_bins`` values (variable-window training) each contributes its own
-  windows; a batch is homogeneous in n_bins (so activations stack), and the per-batch size is drawn in
-  batch-size blocks.
-* **No activation cache.** Train and val are the same loop minus gradients; activations are always fetched from
-  disk, overlapped with GPU compute by a background prefetch thread. Validation windows are sampled once and
-  frozen (deterministic curves); training windows are re-sampled each epoch.
+* **Eligibility is a genome-wide mask, per (model, n_bins).** ``BandedHicFile.eligible_mask`` gives, over the
+  global-position axis, the full inclusion mask (arm + bad-fraction + fold-fraction) for a fold set. We stack it
+  across models, yielding, per n_bins, a *superset* of train (and val) global positions plus an
+  ``(n_windows x n_models)`` eligibility matrix. A window is just one global bin index; no per-chromosome
+  bookkeeping, no per-model random draws that would break the shared fetch.
+* **Windows are sampled uniformly** over the superset (coverage proportional to the genome, not per-chromosome),
+  with random reverse-complement.
+* **One epoch = the genome seen ~once in both directions** = ``2 * n_eligible / n_bins`` windows. With several
+  ``n_bins`` values (variable-window training) each contributes its own windows; a batch is homogeneous in
+  n_bins so activations stack.
+* **No activation cache.** Train and val are the same loop minus gradients; activations are fetched from disk,
+  overlapped with GPU compute by a background prefetch thread. Validation windows are sampled once and frozen.
 
-Precision: ``--compute-dtype`` (autocast math, default ``bfloat16``) and ``--param-dtype`` (weights, default
-``float32``). Equal dtypes => fixed precision (autocast + scaler both no-op). GradScaler is enabled only for
-genuine fp16-mixed on cuda/mps; bf16 needs no scaler.
+Precision: params are always ``float32``; ``--compute-dtype`` picks the autocast math dtype -- ``bfloat16``
+(default, no scaler), ``float16`` (fp16 mixed, GradScaler on cuda/mps), or ``float32`` (plain fp32, no autocast).
+
+Default ``--n-bins`` is ``512,768,896,960,1024`` -- every distributed model is trained on all of these (weighted
+to the upper range) so it can be asked for any of them, and in particular for a 512-bin map (laptop / fast
+sweeps). Pass a single value (e.g. ``--n-bins 512``) to train one size.
 
 The checkpoint is the log: each model is one ``<output-dir>/<name>.pth`` re-saved as it trains, carrying its
 per-epoch ``history`` (mean train/val loss + mean of each correlation) in the config. No side-car folders.
 
 Specify models three interchangeable ways (they merge): ``--input-file`` (single); repeated ``--model
 name=path``; or ``--models manifest.json`` (list of ``{name, input_file, [cache_path], [genome], [params]}``).
-``--cache-path`` / ``--genome`` / ``--params`` are shared defaults.
 """
 
 import json
@@ -54,46 +54,8 @@ from manta_hic.ops.tensor_ops import list_to_tensor_batch, torch_device_type
 
 CORR_NAMES = ["spearman", "pearson", "msd", "spearman_bm", "pearson_bm", "msd_bm"]
 RES_EPOCHS = {256: 20, 512: 30, 1024: 50, 2048: 100, 4096: 150, 8192: 200, 16384: 200}
-
-_DTYPES = {
-    "fp16": torch.float16,
-    "float16": torch.float16,
-    "half": torch.float16,
-    "bf16": torch.bfloat16,
-    "bfloat16": torch.bfloat16,
-    "fp32": torch.float32,
-    "float32": torch.float32,
-    "full": torch.float32,
-}
-
-
-def parse_dtype(s):
-    key = str(s).lower()
-    if key not in _DTYPES:
-        raise ValueError(f"unknown dtype {s!r}; choose from {sorted(set(_DTYPES))}")
-    return _DTYPES[key]
-
-
-def amp_settings(compute_dtype, param_dtype, dev_type):
-    """Mixed precision unless the two dtypes are equal. Returns (autocast_on, scaler_on) -- both False for fixed
-    precision, so autocast and GradScaler degrade to no-ops and one code path serves every mode."""
-    autocast_on = compute_dtype != param_dtype
-    scaler_on = autocast_on and compute_dtype == torch.float16 and dev_type in ("cuda", "mps")
-    return autocast_on, scaler_on
-
-
-def _parse_fold(fold):
-    """Accept a fold as ``int`` or ``"foldN"`` string (the banded file stores integer fold ids)."""
-    if isinstance(fold, str):
-        return int(fold[4:]) if fold.startswith("fold") else int(fold)
-    return int(fold)
-
-
-def train_val_test_folds(banded_file, val_fold, test_fold):
-    """Standard 3-way split of the file's present Borzoi folds: ``(train_set, {val}, {test})`` as int sets."""
-    val, test = _parse_fold(val_fold), _parse_fold(test_fold)
-    present = set(banded_file.present_folds())
-    return present - {val, test}, {val}, {test}
+N_BINS_DEFAULT = (512, 768, 896, 960, 1024)  # every distributed model sees these; upper range weighted
+DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
 
 
 def resolve_specs(input_file, model, models, cache_path, genome, params):
@@ -137,10 +99,10 @@ def resolve_specs(input_file, model, models, cache_path, genome, params):
 
 
 class _Model:
-    """Lightweight per-model holder: the network + optimizer + scaler + its banded target file + log. Eligibility
-    lives in the shared per-n_bins index, not here."""
+    """Lightweight per-model holder: network + optimizer + scaler + banded target file + log. Eligibility lives in
+    the shared per-n_bins index, not here. Params are always float32 (autocast handles the low-precision math)."""
 
-    def __init__(self, spec, *, max_n_bins, bins_pad, device, param_dtype, lr, tower_h):
+    def __init__(self, spec, *, max_n_bins, bins_pad, device, lr, tower_h):
         self.name = spec["name"]
         self.banded = BandedHicFile(spec["input_file"])
         self.nch = self.banded.n_channels
@@ -150,62 +112,25 @@ class _Model:
         self.model_arch = prm
         self.model = Manta(
             n_bins=max_n_bins, bins_pad=bins_pad, tower_height=tower_h, output_channels=self.nch, **prm
-        ).to(device=device, dtype=param_dtype)
+        ).to(device=device, dtype=torch.float32)
         self.opt = optim.Adam(self.model.parameters(), lr=lr)
         self.n_params = sum(p.numel() for p in self.model.parameters())
         self.history = []
 
 
-def _rc_target(banded, pos, n_bins, reverse):
-    """(hic, weight, exp) for the window at global ``pos``, reverse-complemented (flip map + weight) when set."""
-    hic, weight, exp = banded.window_at(pos, n_bins)
-    if reverse:
-        hic = hic[:, ::-1, ::-1]
-        weight = weight[:, ::-1]
-    return np.ascontiguousarray(hic), np.ascontiguousarray(weight), np.ascontiguousarray(exp)
+def make_batches(sub, nb, batch_size, rng):
+    """Sample ~genome-once-in-both-directions = ``2 * n_eligible / n_bins`` windows (rounded up to a batch
+    multiple) uniformly from a superset ``{pos, elig}`` and cut them into homogeneous batches. Returns a list of
+    ``(nb, positions, elig, reverse)`` tuples, each of length ``batch_size``."""
+    nwin = int(np.ceil(2 * len(sub["pos"]) / nb / batch_size) * batch_size)
+    rows = rng.integers(0, len(sub["pos"]), size=nwin)
+    positions, elig, rev = sub["pos"][rows], sub["elig"][rows], (rng.random(nwin) < 0.5)
+    return [
+        (nb, positions[i : i + batch_size], elig[i : i + batch_size], rev[i : i + batch_size])
+        for i in range(0, nwin, batch_size)
+    ]
 
 
-# ---------------------------------------------------------------------------------------------------------- #
-# eligibility index: per n_bins, the train/val supersets (global positions) + (S x n_models) elig matrices    #
-# ---------------------------------------------------------------------------------------------------------- #
-def build_index(models, n_bins, train_folds, val_folds, max_bad_fraction, overlap_threshold):
-    """For one ``n_bins`` and one fold split: per model, ``eligible_mask`` (arm + bad + fold-fraction) over the
-    shared genome-wide position axis; stack the models into an ``(S x M)`` eligibility matrix and keep the
-    positions at least one model is eligible for. Positions are global bin indices (same across the models)."""
-    N = models[0].banded.total_bins
-    for m in models:
-        if m.banded.total_bins != N:
-            raise ValueError(f"models do not share a genome axis (total_bins {m.banded.total_bins} != {N}): {m.name}")
-
-    def split(fold_set):
-        cols = [
-            m.banded.eligible_mask(
-                n_bins, max_bad_fraction=max_bad_fraction, fold=fold_set, overlap_threshold=overlap_threshold
-            )
-            for m in models
-        ]
-        E = np.stack(cols, axis=1)  # [n_cand, M]
-        pos = np.nonzero(E.any(axis=1))[0].astype(np.int64)
-        return {"pos": pos, "elig": E[pos]}  # elig: [S, M]
-
-    return {"n_bins": n_bins, "train": split(train_folds), "val": split(val_folds)}
-
-
-def _sample_windows(sub, n_windows, rng):
-    """Draw ``n_windows`` uniform superset rows -> (positions[n], elig[n,M], reverse[n])."""
-    rows = rng.integers(0, len(sub["pos"]), size=n_windows)
-    return sub["pos"][rows], sub["elig"][rows], (rng.random(n_windows) < 0.5)
-
-
-def _epoch_windows(n_eligible, n_bins, batch_size):
-    """~genome once in both directions = 2 * n_eligible / n_bins windows, rounded up to a batch multiple."""
-    w = int(np.ceil(2 * n_eligible / n_bins))
-    return int(np.ceil(w / batch_size) * batch_size)
-
-
-# ---------------------------------------------------------------------------------------------------------- #
-# background prefetch: turns a list of batch specs into ready (acts, targets, elig) payloads                   #
-# ---------------------------------------------------------------------------------------------------------- #
 class _Prefetcher:
     """Single background thread (so the one h5py file set is touched by one thread only) that materializes each
     batch -- shared activation fetch + per-eligible-model target windows -- while the main thread runs the GPU."""
@@ -216,8 +141,7 @@ class _Prefetcher:
         self.q = queue.Queue(maxsize=queue_size)
 
     def _work(self):
-        for spec in self.batches:
-            nb, positions, elig, rev = spec
+        for nb, positions, elig, rev in self.batches:
             acts = []
             for pos, rc in zip(positions, rev):
                 chrom, start_bp = self.models[0].banded.pos_to_coord(int(pos))  # same coord for all models
@@ -238,10 +162,12 @@ class _Prefetcher:
                     continue
                 hs, ws, es = [], [], []
                 for r in rows:
-                    h, w, e = _rc_target(m.banded, int(positions[r]), nb, bool(rev[r]))
-                    hs.append(h)
-                    ws.append(w)
-                    es.append(e)
+                    hic, weight, exp = m.banded.window_at(int(positions[r]), nb)
+                    if rev[r]:  # reverse-complement flips the map on both axes and the weights on one
+                        hic, weight = hic[:, ::-1, ::-1], weight[:, ::-1]
+                    hs.append(np.ascontiguousarray(hic))
+                    ws.append(np.ascontiguousarray(weight))
+                    es.append(np.ascontiguousarray(exp))
                 targets[mi] = (rows, np.stack(hs), np.stack(ws), np.stack(es))
             self.q.put((nb, torch.stack(acts), elig, targets))
         self.q.put(None)
@@ -257,27 +183,21 @@ class _Prefetcher:
         t.join()
 
 
-# ---------------------------------------------------------------------------------------------------------- #
-# core trainer                                                                                                 #
-# ---------------------------------------------------------------------------------------------------------- #
 def train_manta_multi(
     specs,
     output_dir,
     *,
     device="cuda:0",
-    n_bins=(512,),
+    n_bins=N_BINS_DEFAULT,
     bins_pad=64,
     batch_size=8,
     n_epochs=0,
     epoch_multiplier=1.0,
     lr=2e-4,
-    val_fold="fold3",
-    test_fold="fold4",
-    max_val_windows=2000,
-    max_train_windows=0,
+    val_fold=3,
+    test_fold=4,
     save_every=5,
     compute_dtype="bfloat16",
-    param_dtype="float32",
     max_bad_fraction=0.1,
     overlap_threshold=0.9,
     train_corr=False,
@@ -286,10 +206,12 @@ def train_manta_multi(
     n_bins = sorted({int(x) for x in ([n_bins] if isinstance(n_bins, int) else n_bins)})
     max_nb = max(n_bins)
     dev_type = torch_device_type(device)
-    cdt, pdt = parse_dtype(compute_dtype), parse_dtype(param_dtype)
-    autocast_on, scaler_on = amp_settings(cdt, pdt, dev_type)
-    mode = "fixed" if not autocast_on else ("mixed-fp16(scaler)" if scaler_on else f"mixed-{compute_dtype}")
-    print(f"[train] precision: compute={compute_dtype} param={param_dtype} -> {mode}", flush=True)
+    # params are float32; compute_dtype is the autocast math dtype. fp32 -> no autocast; fp16 -> GradScaler.
+    cdt = DTYPES[compute_dtype]
+    autocast_on = cdt is not torch.float32
+    scaler_on = cdt is torch.float16 and dev_type in ("cuda", "mps")
+    mode = "fp32" if not autocast_on else ("mixed-fp16(scaler)" if scaler_on else "mixed-bf16")
+    print(f"[train] precision: params float32, compute {compute_dtype} -> {mode}", flush=True)
 
     caches = set(s["cache_path"] for s in specs)
     genomes = set(s["genome"] for s in specs)
@@ -303,35 +225,52 @@ def train_manta_multi(
     if fetcher.genome is not None and fetcher.genome != genome:
         raise ValueError(f"cache genome {fetcher.genome!r} != requested {genome!r}")
 
-    # resolution + tower height from the first banded file (all must match)
-    probe = BandedHicFile(specs[0]["input_file"])
+    probe = BandedHicFile(specs[0]["input_file"])  # resolution + tower height (all models must match)
     res = probe.resolution
     tower_h = int(np.round(np.log2(res))) - 9
     probe.close()
 
-    models = [
-        _Model(s, max_n_bins=max_nb, bins_pad=bins_pad, device=device, param_dtype=pdt, lr=lr, tower_h=tower_h)
-        for s in specs
-    ]
+    models = [_Model(s, max_n_bins=max_nb, bins_pad=bins_pad, device=device, lr=lr, tower_h=tower_h) for s in specs]
     for m in models:
         if m.banded.resolution != res:
             raise ValueError(f"model {m.name!r} resolution {m.banded.resolution} != run resolution {res}")
         if m.banded.genome != genome:
             raise ValueError(f"model {m.name!r} genome {m.banded.genome!r} != run genome {genome!r}")
-    train_folds, val_folds, _ = train_val_test_folds(models[0].banded, val_fold, test_fold)
+        if m.banded.total_bins != models[0].banded.total_bins:
+            raise ValueError(f"model {m.name!r} does not share the genome axis (different chromosomes?)")
+
+    # train/val fold split (folds are integer Borzoi ids and must be present in the file -- else error, no silent skip)
+    present = set(models[0].banded.present_folds())
+    if val_fold not in present or test_fold not in present:
+        raise ValueError(f"val_fold {val_fold} / test_fold {test_fold} not among the file's folds {sorted(present)}")
+    train_folds, val_folds = present - {val_fold, test_fold}, {val_fold}
 
     if n_epochs == 0:
         n_epochs = RES_EPOCHS.get(res, 50)
     n_epochs = max(1, int(n_epochs * epoch_multiplier))
-
     print(
         f"[train] res={res}bp n_bins={n_bins} bins_pad={bins_pad} genome={genome} epochs={n_epochs} "
         f"batch={batch_size} lr={lr} train_corr={train_corr}",
         flush=True,
     )
 
-    # -- eligibility index + frozen validation windows (sampled once) -------------------------------------- #
-    index = {nb: build_index(models, nb, train_folds, val_folds, max_bad_fraction, overlap_threshold) for nb in n_bins}
+    # -- eligibility index: per n_bins, stack each model's eligible_mask for the train & val fold sets --------- #
+    index = {}
+    for nb in n_bins:
+        entry = {}
+        for split, fold_set in (("train", train_folds), ("val", val_folds)):
+            E = np.stack(
+                [
+                    m.banded.eligible_mask(
+                        nb, max_bad_fraction=max_bad_fraction, fold=fold_set, overlap_threshold=overlap_threshold
+                    )
+                    for m in models
+                ],
+                axis=1,
+            )
+            pos = np.nonzero(E.any(axis=1))[0].astype(np.int64)
+            entry[split] = {"pos": pos, "elig": E[pos]}  # elig: [S, M]
+        index[nb] = entry
     for m in models:
         print(f"  - {m.name}: {m.nch}ch {m.n_params / 1e6:.2f}M", flush=True)
     for nb in n_bins:
@@ -342,17 +281,11 @@ def train_manta_multi(
             flush=True,
         )
 
+    # frozen validation batches (sampled once)
     val_rng = np.random.default_rng(12345)
     val_batches = []
     for nb in n_bins:
-        va = index[nb]["val"]
-        if not len(va["pos"]):
-            continue
-        nwin = min(_epoch_windows(len(va["pos"]), nb, batch_size), max_val_windows)
-        positions, elig, rev = _sample_windows(va, nwin, val_rng)
-        for i in range(0, nwin, batch_size):
-            sl = slice(i, i + batch_size)
-            val_batches.append((nb, positions[sl], elig[sl], rev[sl]))
+        val_batches += make_batches(index[nb]["val"], nb, batch_size, val_rng)
     print(
         f"[train] frozen val: {sum(b[2].shape[0] for b in val_batches)} windows in {len(val_batches)} batches",
         flush=True,
@@ -366,7 +299,7 @@ def train_manta_multi(
 
     def run_batch(nb, acts, elig, targets, *, train):
         """One shared batch across all eligible models. Returns {mi: (loss, corr6|None)} of per-window means."""
-        acts = acts.to(device=device, dtype=pdt)
+        acts = acts.to(device=device, dtype=torch.float32)
         out = {}
         for mi, m in enumerate(models):
             if mi not in targets:
@@ -417,7 +350,6 @@ def train_manta_multi(
         bins_pad=bins_pad,
         n_epochs=n_epochs,
         compute_dtype=compute_dtype,
-        param_dtype=param_dtype,
         precision_mode=mode,
         max_bad_fraction=max_bad_fraction,
         overlap_threshold=overlap_threshold,
@@ -427,33 +359,25 @@ def train_manta_multi(
     )
 
     for epoch in range(n_epochs):
-        # build this epoch's training batches: per n_bins, sample windows, split into batch-size blocks; shuffle blocks
-        train_batches = []
+        train_batches = []  # re-sampled each epoch; homogeneous-n_bins batches, shuffled together
         for nb in n_bins:
-            tr = index[nb]["train"]
-            if not len(tr["pos"]):
-                continue
-            nwin = _epoch_windows(len(tr["pos"]), nb, batch_size)
-            if max_train_windows:
-                nwin = min(nwin, int(np.ceil(max_train_windows / batch_size) * batch_size))
-            positions, elig, rev = _sample_windows(tr, nwin, rng)
-            for i in range(0, nwin, batch_size):
-                sl = slice(i, i + batch_size)
-                train_batches.append((nb, positions[sl], elig[sl], rev[sl]))
+            train_batches += make_batches(index[nb]["train"], nb, batch_size, rng)
         rng.shuffle(train_batches)
 
         t0 = time.time()
         tr_acc = {mi: [] for mi in range(len(models))}
-        loader = _Prefetcher(train_batches, models, fetcher, bins_pad=bins_pad, res=res, n_runs_fn=sample_n_runs)
-        for nb, acts, elig, targets in loader:
+        for nb, acts, elig, targets in _Prefetcher(
+            train_batches, models, fetcher, bins_pad=bins_pad, res=res, n_runs_fn=sample_n_runs
+        ):
             for mi, r in run_batch(nb, acts, elig, targets, train=True).items():
                 tr_acc[mi].append(r)
         t_train = time.time() - t0
 
         t0 = time.time()
         va_acc = {mi: [] for mi in range(len(models))}
-        vloader = _Prefetcher(val_batches, models, fetcher, bins_pad=bins_pad, res=res, n_runs_fn=lambda: 1)
-        for nb, acts, elig, targets in vloader:
+        for nb, acts, elig, targets in _Prefetcher(
+            val_batches, models, fetcher, bins_pad=bins_pad, res=res, n_runs_fn=lambda: 1
+        ):
             for mi, r in run_batch(nb, acts, elig, targets, train=False).items():
                 va_acc[mi].append(r)
         t_val = time.time() - t0
@@ -501,13 +425,12 @@ def train_manta(
     n_epochs=0,
     lr=2e-4,
     save_every=5,
-    n_bins=512,
+    n_bins=N_BINS_DEFAULT,
     bins_pad=64,
-    val_fold="fold3",
-    test_fold="fold4",
+    val_fold=3,
+    test_fold=4,
     epoch_multiplier=1.0,
     compute_dtype="bfloat16",
-    param_dtype="float32",
 ):
     """Train a single Manta model (thin wrapper over :func:`train_manta_multi`)."""
     name = os.path.splitext(os.path.basename(input_file))[0]
@@ -516,7 +439,7 @@ def train_manta(
         specs,
         output_folder,
         device=device,
-        n_bins=(n_bins,),
+        n_bins=n_bins,
         bins_pad=bins_pad,
         batch_size=batch_size,
         n_epochs=n_epochs,
@@ -526,7 +449,6 @@ def train_manta(
         val_fold=val_fold,
         test_fold=test_fold,
         compute_dtype=compute_dtype,
-        param_dtype=param_dtype,
     )
 
 
@@ -551,22 +473,24 @@ file = click.Path(exists=True, dir_okay=False)
 @click.option("--genome", "-g", default="hg38", help="Genome (all models must share it).")
 @click.option("--params", type=click.Path(exists=True), default=None, help="Default architecture params JSON.")
 @click.option(
-    "--n-bins", default="512", help="Hi-C map size(s) in bins, comma-separated for variable-window (e.g. 512,768,1024)."
+    "--n-bins",
+    default=",".join(map(str, N_BINS_DEFAULT)),
+    help="Hi-C map size(s) in bins, comma-separated for variable-window training. Pass one value to train one size.",
 )
 @click.option("--bins-pad", default=64, help="Padding bins.")
-@click.option("--batch-size", default=8, help="Batch size (shared fetch; one n_bins per batch).")
+@click.option("--batch-size", default=8, help="Batch size (shared fetch; one n_bins per batch, sized for max n_bins).")
 @click.option("--n-epochs", "-e", default=0, help="Epochs (0 = auto by resolution).")
 @click.option("--epoch-multiplier", default=1.0, type=float, help="Scale the epoch count.")
 @click.option("--lr", default=2e-4, help="Learning rate.")
-@click.option("--val-fold", default="fold3", help="Validation fold.")
-@click.option("--test-fold", default="fold4", help="Test fold (held out, not evaluated here).")
-@click.option("--max-val-windows", default=2000, help="Cap on frozen validation windows per n_bins.")
-@click.option(
-    "--max-train-windows", default=0, help="Cap on train windows per n_bins per epoch (0 = full auto-sized epoch)."
-)
+@click.option("--val-fold", default=3, type=int, help="Validation fold (integer Borzoi id, must be in the file).")
+@click.option("--test-fold", default=4, type=int, help="Test fold (integer Borzoi id, held out, not evaluated here).")
 @click.option("--save-every", default=5, help="Re-save each <name>.pth every N epochs (always at the end).")
-@click.option("--compute-dtype", default="bfloat16", help="Autocast math dtype (bfloat16/float16/float32).")
-@click.option("--param-dtype", default="float32", help="Weight dtype. Equal to compute-dtype => fixed precision.")
+@click.option(
+    "--compute-dtype",
+    type=click.Choice(["float16", "bfloat16", "float32"]),
+    default="bfloat16",
+    help="Autocast math dtype (params are always float32).",
+)
 @click.option("--max-bad-fraction", default=0.1, help="Reject windows with RMS-over-channels bad fraction >= this.")
 @click.option(
     "--overlap-threshold",
@@ -591,11 +515,8 @@ def train_manta_click(
     lr,
     val_fold,
     test_fold,
-    max_val_windows,
-    max_train_windows,
     save_every,
     compute_dtype,
-    param_dtype,
     max_bad_fraction,
     overlap_threshold,
     train_corr,
@@ -615,11 +536,8 @@ def train_manta_click(
         lr=lr,
         val_fold=val_fold,
         test_fold=test_fold,
-        max_val_windows=max_val_windows,
-        max_train_windows=max_train_windows,
         save_every=save_every,
         compute_dtype=compute_dtype,
-        param_dtype=param_dtype,
         max_bad_fraction=max_bad_fraction,
         overlap_threshold=overlap_threshold,
         train_corr=train_corr,

@@ -13,7 +13,7 @@ over the whole genome:
 
 The band stores RAW counts (not zeroed at bad bins): the loss masks bad bins via the zeroed weights ->
 expected, and keeping raw counts means display shows real data everywhere. Tile eligibility is computed at
-sampling time from ``bad``/``arm_id``/``fold_id`` (see ``banded.BandedHicFile.eligible_positions``), so the
+sampling time from ``bad``/``arm_id``/``fold_id`` (see ``banded.BandedHicFile.eligible_mask``), so the
 window bad-fraction threshold is a knob, not baked in.
 
 See docs/HIC_STORAGE.md. The build side reads real coolers + cooltools, so it is meant to run un-sandboxed
@@ -192,7 +192,7 @@ def zero_bad_in_weights(weights, bad):
 def eligible_start_fraction(bad, arm_id, n, *, max_bad_fraction=0.1):
     """
     Fraction of length-``n`` window starts that pass the arm-containment + RMS bad-fraction gate -- the
-    fold-agnostic case of :meth:`banded.BandedHicFile.eligible_positions`, and *the* number to watch across a
+    fold-agnostic case of :meth:`banded.BandedHicFile.eligible_mask`, and *the* number to watch across a
     conversion: the share of candidate training windows that survive coverage filtering. A sudden drop vs
     other resolutions/datasets means a coverage/balancing problem.
 
