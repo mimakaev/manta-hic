@@ -75,7 +75,8 @@ class Microzoi(nn.Module):
             d_model=working_channels,
             n_bins=self.nbins,
             n_heads=n_heads,
-            drop_p=attn_dropout,
+            attn_drop_p=attn_dropout,  # preserve the old single-rate behavior (one rate on all branches)
+            ff_drop_p=attn_dropout,
             ff_mult=ff_mult,
         )
         if self.return_type in ["default"]:

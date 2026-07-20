@@ -20,7 +20,6 @@ from manta_hic.nn.layers import (
     TransformerTower,
 )
 
-
 # Centering/scaling constants: the mean and std of ``log10(|i-j|+3)`` over the canonical 1024x1024 map. These
 # are HARD-CODED (not recomputed per size) on purpose. Normalizing by a size-dependent mean/std would make a
 # slice of a big distance matrix differ from a freshly-computed small one; with fixed constants the two are
@@ -70,8 +69,10 @@ class Manta(nn.Module):
         Number of 1D conv+pool blocks (in total). Rescales the input by a factor 2^(H+1).
     transformer_layers : int
         Number of transformer layers in the TransformerTower.
-    transformer_dropout : float
-        Dropout rate in the transformer.
+    transformer_attn_dropout : float
+        Dropout on the attention branch (SDPA weights + residual projection); kept small (default 0.05).
+    transformer_ff_dropout : float
+        Dropout on the feed-forward branch output; the heavy regularizer (default 0.4).
     transformer_n_heads : int
         Number of attention heads in the transformer.
     direct_2d_input_channels : int
@@ -130,7 +131,8 @@ class Manta(nn.Module):
         channels_1d=512,
         tower_height=2,
         transformer_layers=8,
-        transformer_dropout=0.4,
+        transformer_attn_dropout=0.05,
+        transformer_ff_dropout=0.4,
         transformer_n_heads=8,
         direct_2d_input_channels=64,
         direct_2d_channels=48,
@@ -143,6 +145,7 @@ class Manta(nn.Module):
         output_channels=2,
         checkpoint_first=False,
         conv_blocks_checkpoint=0,
+        legacy=False,
     ):
         super(Manta, self).__init__()
         self.n_bins = n_bins
@@ -150,6 +153,7 @@ class Manta(nn.Module):
         self.channels_1d = channels_1d
         self.checkpoint_first = checkpoint_first
         self.conv_blocks_checkpoint = conv_blocks_checkpoint
+        self.legacy = bool(legacy)
 
         if final_channels < 2 * output_channels:
             raise ValueError("Final channels must be at least 2 times the output channels.")
@@ -182,7 +186,8 @@ class Manta(nn.Module):
             d_model=channels_1d,
             n_bins=mha_bins,
             n_heads=transformer_n_heads,
-            drop_p=transformer_dropout,
+            attn_drop_p=transformer_attn_dropout,
+            ff_drop_p=transformer_ff_dropout,
         )
 
         # Direct 2D branch
@@ -192,14 +197,19 @@ class Manta(nn.Module):
 
         # Tower 2D branch
         self.conv_tower_1d = ConvolutionalBlock1d(channels_1d, 2 * tower_2d_input_channels - 8, 1)
-        self.maxpool1d_tower = nn.MaxPool1d(kernel_size=2, stride=2)
         self.features_to_2d_tower = FeaturesTo2D(tower_2d_input_channels, tower_2d_channels, kernel_size=3)
 
         # Residual dilated tower
         self.residual_dilated_tower = FibonacciResidualTower(
             tower_2d_channels, tower_2d_height, tower_2d_width, dropout=tower_2d_dropout
         )
-        self.batchnorm_tower = nn.BatchNorm2d(tower_2d_channels, momentum=0.01)
+        # Normalize the residual-tower output before the GELU->deconv upsample. New models use GroupNorm (matching
+        # the rest of the network); ``legacy=True`` restores the old BatchNorm2d purely so pre-existing checkpoints
+        # (trained with that "oversight" norm) still load. Same forward ordering either way: norm -> GELU.
+        if self.legacy:
+            self.batchnorm_tower = nn.BatchNorm2d(tower_2d_channels, momentum=0.01)
+        else:
+            self.gn_tower = nn.GroupNorm(tower_2d_channels // 8, tower_2d_channels)
 
         # 2D deconv + groupnorm
         self.deconv = nn.ConvTranspose2d(tower_2d_channels, tower_2d_channels, kernel_size=2, stride=2, groups=4)
@@ -266,14 +276,13 @@ class Manta(nn.Module):
         # 6) Tower 2D branch
         x_tower = self.conv_tower_1d(x)  # [B, 2*tower_2d_input_channels - 8, n_bins + 2 * bins_pad]
         x_tower = x_tower[:, :, self.bins_pad : -self.bins_pad]  # [B, 2*tower_2d_input_channels - 8, n_bins]
-        x_tower = self.maxpool1d_tower(x_tower)  # [B, tower_2d_input_channels, n_bins//2]
+        x_tower = self.maxpool1d(x_tower)  # [B, tower_2d_input_channels, n_bins//2]
         x_tower = self.features_to_2d_tower(x_tower, self._dist(x_tower.shape[-1]))  # [B, tower_2d_ch, N/2, N/2]
 
         # 7) Residual tower in 2D
         x_tower = self.residual_dilated_tower(x_tower)  # [B, tower_2d_channels, n_bins//2, n_bins//2]
-        # This is an oversight, this batchnorm should be gone, but we are sticking to it due to the pre-trained models.
-        x_tower = self.batchnorm_tower(x_tower)  # [B, tower_2d_channels, n_bins//2, n_bins//2]
-        x_tower = F.gelu(x_tower)
+        norm_tower = self.batchnorm_tower if self.legacy else self.gn_tower  # BatchNorm only for legacy checkpoints
+        x_tower = F.gelu(norm_tower(x_tower))  # normalize before the upsample (see __init__)
         x_tower = self.deconv(x_tower)  # [B, tower_2d_channels, n_bins, n_bins]
         x_tower = F.gelu(self.gn_deconv(x_tower))
 
@@ -318,6 +327,7 @@ def save_manta_checkpoint(
         "bins_pad": int(model.bins_pad),
         "tower_height": int(model.tower_height),
         "output_channels": int(state["final_conv.weight"].shape[0]),
+        "legacy": bool(getattr(model, "legacy", False)),
     }
     if genome is not None:
         config["genome"] = str(genome)

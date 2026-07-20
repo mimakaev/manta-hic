@@ -50,7 +50,7 @@ from manta_hic.io.banded import BandedHicFile
 from manta_hic.nn.fetchers import CachedMicrozoiFetcher
 from manta_hic.nn.manta import MANTA_PRESETS, Manta, save_manta_checkpoint
 from manta_hic.ops.hic_ops import coarsegrained_hic_corrs, create_expected_matrix, hic_hierarchical_loss
-from manta_hic.ops.tensor_ops import list_to_tensor_batch, torch_device_type
+from manta_hic.ops.tensor_ops import torch_device_type
 
 CORR_NAMES = ["spearman", "pearson", "msd", "spearman_bm", "pearson_bm", "msd_bm"]
 RES_EPOCHS = {256: 20, 512: 30, 1024: 50, 2048: 100, 4096: 150, 8192: 200, 16384: 200}
@@ -116,6 +116,27 @@ class _Model:
         self.opt = optim.Adam(self.model.parameters(), lr=lr)
         self.n_params = sum(p.numel() for p in self.model.parameters())
         self.history = []
+
+
+def sample_n_runs(prob=0.1, lo=2, hi=6):
+    """MicroZoi run-averaging depth for a training batch: usually 1 (fast), occasionally a random 2..hi (a
+    smoother, more expensive activation) so the model sees both."""
+    return int(np.random.randint(lo, hi + 1)) if np.random.rand() < prob else 1
+
+
+def reduce_means(acc):
+    """``acc[mi] = list of (loss, corr6|None)`` -> ``{mi: {'loss':, <corr means>...}}`` (epoch means per model)."""
+    out = {}
+    for mi, rows in acc.items():
+        if not rows:
+            continue
+        d = {"loss": float(np.mean([r[0] for r in rows]))}
+        corrs = [r[1] for r in rows if r[1] is not None]
+        if corrs:
+            mean = np.nanmean(np.array(corrs), axis=0)
+            d.update({CORR_NAMES[k]: float(mean[k]) for k in range(len(CORR_NAMES))})
+        out[mi] = d
+    return out
 
 
 def make_batches(sub, nb, batch_size, rng):
@@ -291,9 +312,6 @@ def train_manta_multi(
         flush=True,
     )
 
-    def sample_n_runs(prob=0.1, lo=2, hi=6):
-        return int(np.random.randint(lo, hi + 1)) if np.random.rand() < prob else 1
-
     scalers = [torch.GradScaler(dev_type, enabled=scaler_on) for _ in models]
     rng = np.random.default_rng(0)
 
@@ -306,10 +324,8 @@ def train_manta_multi(
                 continue
             rows, hic, weight, exp = targets[mi]
             sub = acts[rows]
-            hic = list_to_tensor_batch([h for h in hic.astype(np.float32)], device)
-            weight = list_to_tensor_batch([w for w in weight.astype(np.float32)], device)
-            exp = list_to_tensor_batch([e for e in exp.astype(np.float32)], device)
-            target, weightmat = create_expected_matrix(hic, weight, exp)
+            to_t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device=device, dtype=torch.float32)
+            target, weightmat = create_expected_matrix(to_t(hic), to_t(weight), to_t(exp))
             if train:
                 m.model.train()
                 m.opt.zero_grad()
@@ -328,20 +344,6 @@ def train_manta_multi(
                 corr = [float(np.nanmean(x.cpu().numpy())) for x in cc]
             out[mi] = (float(loss), corr)
         return out
-
-    def reduce_means(acc):
-        """acc[mi] = list of (loss, corr|None) -> {mi: {'loss':, corr means...}}."""
-        res = {}
-        for mi, rows in acc.items():
-            if not rows:
-                continue
-            d = {"loss": float(np.mean([r[0] for r in rows]))}
-            corrs = [r[1] for r in rows if r[1] is not None]
-            if corrs:
-                mean = np.nanmean(np.array(corrs), axis=0)
-                d.update({CORR_NAMES[k]: float(mean[k]) for k in range(6)})
-            res[mi] = d
-        return res
 
     meta = dict(
         lr=lr,

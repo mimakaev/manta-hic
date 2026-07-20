@@ -81,6 +81,7 @@ class MantaInference:
         output_channels = int(cfg["output_channels"])
         config_channel_names = cfg.get("channel_names")
         self.genome = cfg.get("genome")  # the genome the model was trained on (None for older checkpoints)
+        legacy = bool(cfg.get("legacy", False))  # old checkpoints carry a BatchNorm in the 2D tower
         model_params = model_params or cfg.get("model_params")
 
         self.model = (
@@ -89,11 +90,15 @@ class MantaInference:
                 bins_pad=bins_pad,
                 tower_height=th,
                 output_channels=output_channels,
+                legacy=legacy,
                 **(model_params or {}),
             )
             .to(device)
             .eval()
         )
+        # ``freqs_cis`` used to be a persistent per-layer buffer; it is now a non-persistent buffer recomputed
+        # identically at init, so drop those keys (present only in old checkpoints) to load the rest strictly.
+        state = {k: v for k, v in state.items() if not k.endswith("freqs_cis")}
         self.model.load_state_dict(state)
 
         if self.target_file is not None:

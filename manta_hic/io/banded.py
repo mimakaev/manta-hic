@@ -259,6 +259,15 @@ class BandedHicFile:
             fold = frozenset({int(fold)} if np.isscalar(fold) else (int(x) for x in fold))
         return self._eligible_mask(int(n), float(max_bad_fraction), fold, float(overlap_threshold))
 
+    def eligible_positions(
+        self, n: int, *, max_bad_fraction: float = 0.1, fold=None, overlap_threshold: float = 0.9
+    ) -> np.ndarray:
+        """Flat global start positions of every eligible window -- ``np.nonzero(eligible_mask(...))[0]``. This is
+        the training-side pool (one global bin index per window); see :meth:`eligible_mask` for the criteria."""
+        return np.nonzero(
+            self.eligible_mask(n, max_bad_fraction=max_bad_fraction, fold=fold, overlap_threshold=overlap_threshold)
+        )[0]
+
     def _compute_eligible_mask(self, n, max_bad_fraction, fold, overlap_threshold):
         N = self.total_bins
         if n <= 0 or n > N:
@@ -329,12 +338,10 @@ class BandedHicFile:
         self, chrom: str, n_bins: int, *, max_bad_fraction: float = 0.1, fold=None, overlap_threshold: float = 0.9
     ) -> np.ndarray:
         """Eligible *local* start bins within ``chrom`` (human convenience; training samples over global
-        positions from :meth:`eligible_mask` instead)."""
-        pos = np.nonzero(
-            self.eligible_mask(
-                n_bins, max_bad_fraction=max_bad_fraction, fold=fold, overlap_threshold=overlap_threshold
-            )
-        )[0]
+        positions from :meth:`eligible_positions` instead)."""
+        pos = self.eligible_positions(
+            n_bins, max_bad_fraction=max_bad_fraction, fold=fold, overlap_threshold=overlap_threshold
+        )
         lo = self.chrom_start[chrom]
         hi = lo + self.chrom_nbins[chrom]
         return (pos[(pos >= lo) & (pos < hi)] - lo).astype(np.int64)

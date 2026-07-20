@@ -302,9 +302,12 @@ class Symmetrize(nn.Module):
 
 # This code is adapted from Llama 2 materials provided by Meta Platforms, Inc.
 # Licensed under the LLAMA 2 Community License, Copyright (c) Meta Platforms, Inc. All Rights Reserved.
-# Changes made: used SDPA, added dropout, and changed the FF block, plus heavy overal rewriting
+# Changes made: used SDPA, added dropout, and changed the FF block (Llama's SwiGLU -> a plain GELU MLP), plus
+# heavy overall rewriting.
 def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    "Apply the rotary embedding to the KQ tensors"
+    """Apply the rotary embedding to the Q/K tensors. The rotation is done in float32 (``xq``/``xk`` are cast up,
+    ``freqs_cis`` is already complex64) and cast back to the caller's dtype -- so it is exact under bf16/fp16
+    autocast, the classic silent-corruption spot for this llama-derived code."""
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))  # [B, N, H, C/H] -> [B, N, H, C/(2*H)]
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))  # dtype: complex64
     if not freqs_cis.shape == (xq_.shape[1], xq_.shape[-1]):
@@ -325,25 +328,38 @@ def precompute_freqs_cis(dim: int, N: int, theta: float = 10000.0) -> torch.Tens
 
 # Adopted from the post by a github user loubbrad https://github.com/pytorch/pytorch/issues/97899
 class FusedEncoderBlock(nn.Module):  # also from llama
-    """Transformer encoder block using F.scaled_dot_product_attention()"""
+    """
+    Pre-norm transformer encoder block using ``F.scaled_dot_product_attention`` and rotary position embeddings.
 
-    def __init__(self, d_model: int, n_bins: int, n_heads: int = 8, drop_p: float = 0.2, ff_mult: int = 4):
+    Dropout is split by branch on purpose: the attention branch (SDPA weights + the residual projection) is
+    lightly regularized (``attn_drop_p``, default 0.05) while the feed-forward branch carries the heavy dropout
+    (``ff_drop_p``, default 0.4). Dropping ~40% of attention weights (the old single-rate behavior) is far more
+    disruptive than the same rate on the FF branch output.
+
+    ``freqs_cis`` is passed into :meth:`forward` (owned/precomputed once by :class:`TransformerTower`), not stored
+    per block -- so it is neither duplicated across layers nor written to the checkpoint.
+    """
+
+    def __init__(
+        self, d_model: int, n_heads: int = 8, *, attn_drop_p: float = 0.05, ff_drop_p: float = 0.4, ff_mult: int = 4
+    ):
         super().__init__()
-        self.drop_p = drop_p
+        if (d_model // n_heads) % 2 != 0:
+            raise ValueError(f"d_head = d_model/n_heads = {d_model}/{n_heads} must be even for rotary embeddings")
+        self.attn_drop_p = attn_drop_p
         self.n_heads = n_heads
-        self.n_bins = n_bins
-        self.register_buffer("freqs_cis", precompute_freqs_cis(d_model // self.n_heads, self.n_bins))
         self.d_head = d_model // n_heads
 
-        # Attention
+        # Attention. att_proj_linear keeps its bias (the only biased Linear here) purely for weight-compat with the
+        # frozen MicroZoi checkpoints, which share this block; it is otherwise inconsequential.
         self.q = nn.Linear(in_features=d_model, out_features=d_model, bias=False)
         self.k = nn.Linear(in_features=d_model, out_features=d_model, bias=False)
         self.v = nn.Linear(in_features=d_model, out_features=d_model, bias=False)
         self.att_proj_linear = nn.Linear(in_features=d_model, out_features=d_model)
-        self.resid_dropout = nn.Dropout(drop_p)
+        self.resid_dropout = nn.Dropout(attn_drop_p)
 
         # FF Layer
-        self.ff_dropout = nn.Dropout(drop_p)
+        self.ff_dropout = nn.Dropout(ff_drop_p)
         self.ff_linear_1 = nn.Linear(in_features=d_model, out_features=d_model * ff_mult, bias=False)
         self.ff_linear_2 = nn.Linear(in_features=d_model * ff_mult, out_features=d_model, bias=False)
 
@@ -351,8 +367,8 @@ class FusedEncoderBlock(nn.Module):  # also from llama
         self.norm1 = nn.RMSNorm(d_model)
         self.norm2 = nn.RMSNorm(d_model)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self._att_block(self.norm1(x), self.freqs_cis)
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        x = x + self._att_block(self.norm1(x), freqs_cis)
         x = x + self._ff_block(self.norm2(x))
         return x
 
@@ -376,7 +392,7 @@ class FusedEncoderBlock(nn.Module):  # also from llama
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
 
-        att_dropout = self.drop_p if self.training else 0  # Required as we are not using a nn.Dropout layer
+        att_dropout = self.attn_drop_p if self.training else 0  # Required as we are not using a nn.Dropout layer
         att = F.scaled_dot_product_attention(query=xq, key=xk, value=xv, dropout_p=att_dropout, is_causal=False)
 
         out = att.transpose(1, 2).contiguous()
@@ -385,17 +401,26 @@ class FusedEncoderBlock(nn.Module):  # also from llama
 
 
 class TransformerTower(nn.Module):
-    """A stack of FusedEncoderBlocks with permute, since main architecture is convolutional (channel first)"""
+    """
+    A stack of :class:`FusedEncoderBlock` s with a channel-first <-> length-first permute (the surrounding
+    architecture is convolutional / channel-first).
+
+    Owns the rotary ``freqs_cis`` table: it is computed once for ``n_bins`` (the max window) and passed into every
+    block, so it is not duplicated per layer. It is a **non-persistent** buffer (like Manta's ``dist_mat``) -- it
+    is derived from ``n_bins`` and stays out of the state dict, so a checkpoint loads regardless of the ``n_bins``
+    it is instantiated at (each block just slices the first ``seq_len`` rows at runtime).
+    """
 
     def __init__(self, n_layers: int, d_model: int, n_bins: int, n_heads: int, **kwargs):
         super().__init__()
-        self.layers = nn.ModuleList([FusedEncoderBlock(d_model, n_bins, n_heads, **kwargs) for _ in range(n_layers)])
+        self.register_buffer("freqs_cis", precompute_freqs_cis(d_model // n_heads, n_bins), persistent=False)
+        self.layers = nn.ModuleList([FusedEncoderBlock(d_model, n_heads, **kwargs) for _ in range(n_layers)])
         self.norm = nn.RMSNorm(d_model)
 
     def forward(self, x):
         x = x.permute(0, 2, 1)
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, self.freqs_cis)
         x = self.norm(x)
         x = x.permute(0, 2, 1)
         return x
