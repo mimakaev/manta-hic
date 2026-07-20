@@ -21,16 +21,26 @@ from manta_hic.nn.layers import (
 )
 
 
-def calculate_distance_matrix(n_bins):
+# Centering/scaling constants: the mean and std of ``log10(|i-j|+3)`` over the canonical 1024x1024 map. These
+# are HARD-CODED (not recomputed per size) on purpose. Normalizing by a size-dependent mean/std would make a
+# slice of a big distance matrix differ from a freshly-computed small one; with fixed constants the two are
+# identical, so one big matrix can simply be sliced for any smaller (variable) window. The affine itself is
+# irrelevant to the network (a linear rescale of one input channel is absorbed by the following conv weights) --
+# fixing it to the 1024 values keeps every already-trained model, which saw exactly this normalization at
+# n_bins=1024, bit-for-bit compatible, while smaller windows just get a consistently rescaled distance map.
+DIST_LOG_MEAN_1024 = 2.373704535443669
+DIST_LOG_STD_1024 = 0.45213502867622113
+
+
+def calculate_distance_matrix(n_bins, *, mean=DIST_LOG_MEAN_1024, std=DIST_LOG_STD_1024):
     """
-    Compute a log10-based distance matrix, centered and scaled,
-    then return as a [1, H, W] tensor for broadcast.
+    Compute a log10-based distance matrix, centered and scaled by FIXED constants (the 1024-map mean/std by
+    default -- see :data:`DIST_LOG_MEAN_1024`), returned as a ``[1, H, W]`` tensor for broadcast. Because the
+    normalization is size-independent, ``calculate_distance_matrix(N)[:, :n, :n] == calculate_distance_matrix(n)``.
     """
     i, j = np.indices((n_bins, n_bins))
-    dist_mat = np.log10(np.abs(i - j) + 3)
-    dist_mat = (dist_mat - np.mean(dist_mat)) / np.std(dist_mat)
-    dist_mat = torch.from_numpy(dist_mat).float().unsqueeze(0)
-    return dist_mat
+    dist_mat = (np.log10(np.abs(i - j) + 3) - mean) / std
+    return torch.from_numpy(dist_mat).float().unsqueeze(0)
 
 
 class Manta(nn.Module):
@@ -144,11 +154,12 @@ class Manta(nn.Module):
         if final_channels < 2 * output_channels:
             raise ValueError("Final channels must be at least 2 times the output channels.")
 
-        # Distance matrices are computed on the fly per actual map size and cached (keyed by side length), so
-        # one model runs at variable window size (e.g. 512 for sweeps, 1024 for production). The normalization
-        # is over the NxN matrix, so a slice of a bigger dist_mat != dist_mat of a smaller size -- must recompute
-        # per size (cheap, cached). The n_bins passed here is the *max* size (sizes freqs_cis in the transformer).
-        self._dist_cache: dict[int, torch.Tensor] = {}
+        # One distance matrix at the max map size (n_bins), sliced for any smaller (variable) window -- the fixed
+        # normalization (see calculate_distance_matrix) makes a slice equal a freshly-computed smaller matrix.
+        # Non-persistent: it is derived from n_bins, so it stays out of the state dict and every checkpoint (old
+        # or new) loads regardless of the size it was built at. n_bins here is the *max* size (also sizes the
+        # transformer's freqs_cis), so windows larger than n_bins are not supported.
+        self.register_buffer("dist_mat", calculate_distance_matrix(n_bins), persistent=False)
 
         # 1D backbone
         self.first_conv_1d = nn.Conv1d(input_channels, channels_1d, kernel_size=3, padding=1)
@@ -203,13 +214,10 @@ class Manta(nn.Module):
         self.symm = Symmetrize()
 
     def _dist(self, n):
-        """Distance matrix for an ``n x n`` map, cached per size and on the model's device."""
-        cached = self._dist_cache.get(n)
-        dev = self.first_conv_1d.weight.device
-        if cached is None or cached.device != dev:
-            cached = calculate_distance_matrix(n).to(dev)
-            self._dist_cache[n] = cached
-        return cached
+        """Distance matrix for an ``n x n`` map -- a slice of the pre-built ``dist_mat`` (already on device)."""
+        if n > self.dist_mat.shape[-1]:
+            raise ValueError(f"requested map size {n} exceeds the model's max n_bins {self.dist_mat.shape[-1]}")
+        return self.dist_mat[:, :n, :n]
 
     def forward(self, x, symmetrize=True):
         """

@@ -33,9 +33,9 @@ Stored per chromosome (HDF5 group), gap-free over the whole chromosome:
 
 There is no baked-in tiling: a start `a` is eligible iff over `[a, a+n)` the `arm_id` is constant (no
 centromere/arm/chrom-end crossing), the `fold_id` is constant (and the desired fold), and the RMS-over-
-channels windowed mean of `bad` is `< min_fraction`. All three are **1-D prefix-sum window tests**
+channels windowed mean of `bad` is `< max_bad_fraction`. All three are **1-D prefix-sum window tests**
 (`arm`/`fold`: zero change-points inside the window; `bad`: cumsum windowed mean), so a threshold change
-(`BandedHicStore.eligible_starts(min_fraction=…)`) is free — no re-tiling, no re-writing.
+(`BandedHicStore.eligible_starts(max_bad_fraction=…)`) is free — no re-tiling, no re-writing.
 
 **Target pipeline**: reconstruct the `n×n` count square from `band`, slice `weights[:, a:a+n]`, take
 `exp[:, arm, :n]` → feed the existing `create_expected_matrix(hic, weight, exp)` → `(observed,
