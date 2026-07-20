@@ -144,11 +144,11 @@ class Manta(nn.Module):
         if final_channels < 2 * output_channels:
             raise ValueError("Final channels must be at least 2 times the output channels.")
 
-        # Precompute distance matrices for full (n_bins x n_bins) and half ((n_bins//2) x (n_bins//2))
-        dist_mat_full = calculate_distance_matrix(n_bins)
-        dist_mat_half = calculate_distance_matrix(n_bins // 2)
-        self.register_buffer("dist_mat_full", dist_mat_full, persistent=False)
-        self.register_buffer("dist_mat_half", dist_mat_half, persistent=False)
+        # Distance matrices are computed on the fly per actual map size and cached (keyed by side length), so
+        # one model runs at variable window size (e.g. 512 for sweeps, 1024 for production). The normalization
+        # is over the NxN matrix, so a slice of a bigger dist_mat != dist_mat of a smaller size -- must recompute
+        # per size (cheap, cached). The n_bins passed here is the *max* size (sizes freqs_cis in the transformer).
+        self._dist_cache: dict[int, torch.Tensor] = {}
 
         # 1D backbone
         self.first_conv_1d = nn.Conv1d(input_channels, channels_1d, kernel_size=3, padding=1)
@@ -202,6 +202,15 @@ class Manta(nn.Module):
         # Symmetrization helper
         self.symm = Symmetrize()
 
+    def _dist(self, n):
+        """Distance matrix for an ``n x n`` map, cached per size and on the model's device."""
+        cached = self._dist_cache.get(n)
+        dev = self.first_conv_1d.weight.device
+        if cached is None or cached.device != dev:
+            cached = calculate_distance_matrix(n).to(dev)
+            self._dist_cache[n] = cached
+        return cached
+
     def forward(self, x, symmetrize=True):
         """
         Forward pass.
@@ -243,14 +252,14 @@ class Manta(nn.Module):
         x_direct = self.conv_direct_1d(x)  # [B, 2*direct_2d_input_channels - 8, n_bins + 2 * bins_pad]
         # Crop out bins_pad on each side, leaving [B, 2*direct_2d_input_channels - 8, n_bins]
         x_direct = x_direct[:, :, self.bins_pad : -self.bins_pad]
-        # Convert to 2D using dist_mat_full
-        x_direct = self.features_to_2d_direct(x_direct, self.dist_mat_full)  # [B, direct_2d_channels, n_bins, n_bins]
+        # Convert to 2D using a distance matrix sized to the actual (possibly variable) map
+        x_direct = self.features_to_2d_direct(x_direct, self._dist(x_direct.shape[-1]))  # [B, direct_2d_ch, N, N]
 
         # 6) Tower 2D branch
         x_tower = self.conv_tower_1d(x)  # [B, 2*tower_2d_input_channels - 8, n_bins + 2 * bins_pad]
         x_tower = x_tower[:, :, self.bins_pad : -self.bins_pad]  # [B, 2*tower_2d_input_channels - 8, n_bins]
         x_tower = self.maxpool1d_tower(x_tower)  # [B, tower_2d_input_channels, n_bins//2]
-        x_tower = self.features_to_2d_tower(x_tower, self.dist_mat_half)  # [B, tower_2d_channels, n_bins//2, n_bins//2]
+        x_tower = self.features_to_2d_tower(x_tower, self._dist(x_tower.shape[-1]))  # [B, tower_2d_ch, N/2, N/2]
 
         # 7) Residual tower in 2D
         x_tower = self.residual_dilated_tower(x_tower)  # [B, tower_2d_channels, n_bins//2, n_bins//2]
@@ -276,7 +285,9 @@ class Manta(nn.Module):
         return x_2d
 
 
-def save_manta_checkpoint(model, path, *, channel_names=None, model_params=None, genome=None):
+def save_manta_checkpoint(
+    model, path, *, channel_names=None, model_params=None, genome=None, history=None, train_meta=None
+):
     """
     Save a Manta model as a **self-describing** checkpoint: ``{"state_dict": ..., "config": {...}}``.
 
@@ -286,6 +297,11 @@ def save_manta_checkpoint(model, path, *, channel_names=None, model_params=None,
     is genome-specific, so this lets inference reject a mismatched cache/target), ``channel_names`` (so channel
     labels no longer depend on the target file) and non-default ``model_params``. ``MantaInference`` reads this
     format directly.
+
+    ``history`` (optional) is the per-epoch training log -- a list of small dicts of *mean* metrics (train/val
+    loss and mean correlations). Stored right in the checkpoint so the model file IS its own training record; no
+    side-car folders. ``train_meta`` (optional) is a dict of run-level settings (lr, batch size, dtypes, ...).
+    Both are plain JSON-able Python, negligible in size even at hundreds of epochs.
     """
     state = model.state_dict()
     config = {
@@ -301,4 +317,8 @@ def save_manta_checkpoint(model, path, *, channel_names=None, model_params=None,
         config["channel_names"] = list(channel_names)
     if model_params:
         config["model_params"] = dict(model_params)
+    if history is not None:
+        config["history"] = list(history)
+    if train_meta is not None:
+        config["train_meta"] = dict(train_meta)
     torch.save({"state_dict": state, "config": config}, path)

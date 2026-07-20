@@ -367,7 +367,9 @@ class FusedEncoderBlock(nn.Module):  # also from llama
         xq = xq.view(batch_size, seq_len, self.n_heads, self.d_head)
         xk = xk.view(batch_size, seq_len, self.n_heads, self.d_head)
         xv = xv.view(batch_size, seq_len, self.n_heads, self.d_head)
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
+        # Rotary is position-indexed, so freqs_cis for a length-L sequence is exactly the first L rows of the
+        # freqs_cis precomputed for the max length -- slice, so ONE model runs at variable window size.
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis[:seq_len])
 
         # Reshape for attention calculation: (b_sz, n_head, s_len, d_head)
         xq = xq.transpose(1, 2)
