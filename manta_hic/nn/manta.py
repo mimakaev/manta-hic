@@ -330,3 +330,112 @@ def save_manta_checkpoint(
     if train_meta is not None:
         config["train_meta"] = dict(train_meta)
     torch.save({"state_dict": state, "config": config}, path)
+
+
+# --------------------------------------------------------------------------- #
+# Named architecture presets ("model sizes")                                  #
+# --------------------------------------------------------------------------- #
+# Each preset is the full set of architecture overrides that pins down a "size";
+# the per-use knobs -- ``n_bins``, ``bins_pad``, ``output_channels``, and
+# ``tower_height`` (= ``round(log2(resolution)) - 9``) -- are supplied at build
+# time (see :func:`manta_from_preset`). Param counts below are for the recommended
+# small map (``n_bins=512``); they barely move with ``output_channels`` (the 2D
+# tail dominates), and are near-identical at ``n_bins=1024``.
+#
+# What the shrink study (2026-07: krietenstein + masahiro-10B + a 6-dataset epoch
+# sweep) found, scored by ``combined`` = mean of raw and between-channel (cell-type
+# specific) coarse-grained Spearman, relative to the 29M "full" reference:
+#
+#   full       29.3M  the original Manta. Best raw structure (combined ~0.659) but
+#                     ~17x heavier / ~10x slower than opt1M for ~0.01 more.
+#   opt2M       2.84M  matches opt1M (~0.646). The extra 1D width buys nothing --
+#                     kept only to show the 1D backbone is not the bottleneck.
+#   opt1M       1.76M  RECOMMENDED baseline. Within ~0.006-0.013 per window of full
+#                     on a dense held-out head-to-head; generalizes (masahiro-10B
+#                     -0.011 vs full, same gap as krietenstein). The 1D transformer
+#                     does global routing; the 2D convs only refine locally, so a
+#                     small 2D tower loses very little.
+#   opt1M_th6   1.79M  opt1M with a deeper 2D tower (tower_2d_height 3 -> 6). The
+#                     extra Fibonacci-dilated blocks are ~free in params but widen
+#                     the 2D receptive field, which helps the slow between-channel /
+#                     differential signal. Used for the multi-dataset epoch sweep;
+#                     prefer it for multi-channel / cell-type-specific datasets.
+#   nano        0.94M  aggressive floor (~0.629). Still captures coarse biology
+#                     (e.g. dELS anti-insulation) but subtle/differential signal
+#                     starts to soften; use for laptop / extreme-throughput sweeps.
+MANTA_PRESETS = {
+    "full": dict(
+        channels_1d=512,
+        transformer_layers=8,
+        tower_2d_height=9,
+        tower_2d_channels=48,
+        direct_2d_channels=48,
+        tower_2d_input_channels=96,
+        direct_2d_input_channels=64,
+        final_channels=32,
+    ),
+    "opt2M": dict(
+        channels_1d=256,
+        transformer_layers=2,
+        tower_2d_height=3,
+        tower_2d_channels=16,
+        direct_2d_channels=16,
+        tower_2d_input_channels=48,
+        direct_2d_input_channels=32,
+        final_channels=16,
+    ),
+    "opt1M": dict(
+        channels_1d=192,
+        transformer_layers=2,
+        tower_2d_height=3,
+        tower_2d_channels=16,
+        direct_2d_channels=16,
+        tower_2d_input_channels=32,
+        direct_2d_input_channels=24,
+        final_channels=16,
+    ),
+    "opt1M_th6": dict(
+        channels_1d=192,
+        transformer_layers=2,
+        tower_2d_height=6,
+        tower_2d_channels=16,
+        direct_2d_channels=16,
+        tower_2d_input_channels=32,
+        direct_2d_input_channels=24,
+        final_channels=16,
+    ),
+    "nano": dict(
+        channels_1d=128,
+        transformer_layers=2,
+        tower_2d_height=3,
+        tower_2d_channels=16,
+        direct_2d_channels=16,
+        tower_2d_input_channels=32,
+        direct_2d_input_channels=24,
+        final_channels=16,
+    ),
+}
+
+
+def manta_from_preset(
+    preset="opt1M", *, n_bins=None, bins_pad=None, output_channels=None, tower_height=None, **overrides
+):
+    """
+    Build a :class:`Manta` from a named size preset (see :data:`MANTA_PRESETS`).
+
+    The preset supplies the architecture; pass the per-use knobs here -- ``n_bins`` (map size in bins),
+    ``bins_pad``, ``output_channels`` (Hi-C channels), and ``tower_height`` (``round(log2(resolution)) - 9``).
+    Anything left ``None`` falls back to :class:`Manta`'s own default; ``**overrides`` tweaks any other arch kwarg
+    on top of the preset. Example::
+
+        model = manta_from_preset("opt1M", n_bins=512, bins_pad=64, output_channels=4, tower_height=2)
+    """
+    if preset not in MANTA_PRESETS:
+        raise ValueError(f"unknown preset {preset!r}; choose from {sorted(MANTA_PRESETS)}")
+    params = dict(MANTA_PRESETS[preset])
+    for k, v in dict(
+        n_bins=n_bins, bins_pad=bins_pad, output_channels=output_channels, tower_height=tower_height, **overrides
+    ).items():
+        if v is not None:
+            params[k] = v
+    return Manta(**params)

@@ -48,7 +48,7 @@ import torch.optim as optim
 
 from manta_hic.io.banded import BandedHicFile
 from manta_hic.nn.fetchers import CachedMicrozoiFetcher
-from manta_hic.nn.manta import Manta, save_manta_checkpoint
+from manta_hic.nn.manta import MANTA_PRESETS, Manta, save_manta_checkpoint
 from manta_hic.ops.hic_ops import coarsegrained_hic_corrs, create_expected_matrix, hic_hierarchical_loss
 from manta_hic.ops.tensor_ops import list_to_tensor_batch, torch_device_type
 
@@ -471,7 +471,18 @@ file = click.Path(exists=True, dir_okay=False)
 )
 @click.option("--device", "-d", default="cuda:0", help="Torch device")
 @click.option("--genome", "-g", default="hg38", help="Genome (all models must share it).")
-@click.option("--params", type=click.Path(exists=True), default=None, help="Default architecture params JSON.")
+@click.option(
+    "--preset",
+    type=click.Choice(sorted(MANTA_PRESETS)),
+    default="opt1M",
+    help="Architecture size preset (see manta.MANTA_PRESETS); opt1M is the recommended small model.",
+)
+@click.option(
+    "--params",
+    type=click.Path(exists=True),
+    default=None,
+    help="Architecture params JSON, merged on top of --preset (overrides individual keys).",
+)
 @click.option(
     "--n-bins",
     default=",".join(map(str, N_BINS_DEFAULT)),
@@ -506,6 +517,7 @@ def train_manta_click(
     output_dir,
     device,
     genome,
+    preset,
     params,
     n_bins,
     bins_pad,
@@ -521,8 +533,10 @@ def train_manta_click(
     overlap_threshold,
     train_corr,
 ):
-    default_params = json.load(open(params)) if params else None
-    specs = resolve_specs(input_file, model, models, cache_path, genome, default_params)
+    arch = dict(MANTA_PRESETS[preset])  # size preset, then --params JSON overrides individual keys
+    if params:
+        arch.update(json.load(open(params)))
+    specs = resolve_specs(input_file, model, models, cache_path, genome, arch)
     sizes = tuple(int(x) for x in str(n_bins).split(","))
     train_manta_multi(
         specs,
