@@ -86,7 +86,9 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
         mods = glob.glob(f"{folder}/model_*.pth")
         assert len(mods) > 0, "No models found in output folder"
         mods = sorted(mods, key=lambda x: int(x.split("/")[-1].split("_")[1].split(".")[0]))
-        model.load_state_dict(torch.load(mods[-1]))
+        sd = torch.load(mods[-1])
+        sd = {k: v for k, v in sd.items() if not k.endswith("freqs_cis")}  # now a non-persistent buffer; see fetchers
+        model.load_state_dict(sd, strict=True)
         st_epoch = int(mods[-1].split("/")[-1].split("_")[1].split(".")[0]) + 1
 
     shutil.copy(param_file, f"{folder}/params.json")

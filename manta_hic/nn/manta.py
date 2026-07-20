@@ -20,17 +20,26 @@ from manta_hic.nn.layers import (
     TransformerTower,
 )
 
+# Centering/scaling constants: the mean and std of ``log10(|i-j|+3)`` over the canonical 1024x1024 map. These
+# are HARD-CODED (not recomputed per size) on purpose. Normalizing by a size-dependent mean/std would make a
+# slice of a big distance matrix differ from a freshly-computed small one; with fixed constants the two are
+# identical, so one big matrix can simply be sliced for any smaller (variable) window. The affine itself is
+# irrelevant to the network (a linear rescale of one input channel is absorbed by the following conv weights) --
+# fixing it to the 1024 values keeps every already-trained model, which saw exactly this normalization at
+# n_bins=1024, bit-for-bit compatible, while smaller windows just get a consistently rescaled distance map.
+DIST_LOG_MEAN_1024 = 2.373704535443669
+DIST_LOG_STD_1024 = 0.45213502867622113
 
-def calculate_distance_matrix(n_bins):
+
+def calculate_distance_matrix(n_bins, *, mean=DIST_LOG_MEAN_1024, std=DIST_LOG_STD_1024):
     """
-    Compute a log10-based distance matrix, centered and scaled,
-    then return as a [1, H, W] tensor for broadcast.
+    Compute a log10-based distance matrix, centered and scaled by FIXED constants (the 1024-map mean/std by
+    default -- see :data:`DIST_LOG_MEAN_1024`), returned as a ``[1, H, W]`` tensor for broadcast. Because the
+    normalization is size-independent, ``calculate_distance_matrix(N)[:, :n, :n] == calculate_distance_matrix(n)``.
     """
     i, j = np.indices((n_bins, n_bins))
-    dist_mat = np.log10(np.abs(i - j) + 3)
-    dist_mat = (dist_mat - np.mean(dist_mat)) / np.std(dist_mat)
-    dist_mat = torch.from_numpy(dist_mat).float().unsqueeze(0)
-    return dist_mat
+    dist_mat = (np.log10(np.abs(i - j) + 3) - mean) / std
+    return torch.from_numpy(dist_mat).float().unsqueeze(0)
 
 
 class Manta(nn.Module):
@@ -60,8 +69,10 @@ class Manta(nn.Module):
         Number of 1D conv+pool blocks (in total). Rescales the input by a factor 2^(H+1).
     transformer_layers : int
         Number of transformer layers in the TransformerTower.
-    transformer_dropout : float
-        Dropout rate in the transformer.
+    transformer_attn_dropout : float
+        Dropout on the attention branch (SDPA weights + residual projection); kept small (default 0.05).
+    transformer_ff_dropout : float
+        Dropout on the feed-forward branch output; the heavy regularizer (default 0.4).
     transformer_n_heads : int
         Number of attention heads in the transformer.
     direct_2d_input_channels : int
@@ -120,7 +131,8 @@ class Manta(nn.Module):
         channels_1d=512,
         tower_height=2,
         transformer_layers=8,
-        transformer_dropout=0.4,
+        transformer_attn_dropout=0.05,
+        transformer_ff_dropout=0.4,
         transformer_n_heads=8,
         direct_2d_input_channels=64,
         direct_2d_channels=48,
@@ -133,6 +145,7 @@ class Manta(nn.Module):
         output_channels=2,
         checkpoint_first=False,
         conv_blocks_checkpoint=0,
+        legacy=False,
     ):
         super(Manta, self).__init__()
         self.n_bins = n_bins
@@ -140,15 +153,17 @@ class Manta(nn.Module):
         self.channels_1d = channels_1d
         self.checkpoint_first = checkpoint_first
         self.conv_blocks_checkpoint = conv_blocks_checkpoint
+        self.legacy = bool(legacy)
 
         if final_channels < 2 * output_channels:
             raise ValueError("Final channels must be at least 2 times the output channels.")
 
-        # Precompute distance matrices for full (n_bins x n_bins) and half ((n_bins//2) x (n_bins//2))
-        dist_mat_full = calculate_distance_matrix(n_bins)
-        dist_mat_half = calculate_distance_matrix(n_bins // 2)
-        self.register_buffer("dist_mat_full", dist_mat_full, persistent=False)
-        self.register_buffer("dist_mat_half", dist_mat_half, persistent=False)
+        # One distance matrix at the max map size (n_bins), sliced for any smaller (variable) window -- the fixed
+        # normalization (see calculate_distance_matrix) makes a slice equal a freshly-computed smaller matrix.
+        # Non-persistent: it is derived from n_bins, so it stays out of the state dict and every checkpoint (old
+        # or new) loads regardless of the size it was built at. n_bins here is the *max* size (also sizes the
+        # transformer's freqs_cis), so windows larger than n_bins are not supported.
+        self.register_buffer("dist_mat", calculate_distance_matrix(n_bins), persistent=False)
 
         # 1D backbone
         self.first_conv_1d = nn.Conv1d(input_channels, channels_1d, kernel_size=3, padding=1)
@@ -171,7 +186,8 @@ class Manta(nn.Module):
             d_model=channels_1d,
             n_bins=mha_bins,
             n_heads=transformer_n_heads,
-            drop_p=transformer_dropout,
+            attn_drop_p=transformer_attn_dropout,
+            ff_drop_p=transformer_ff_dropout,
         )
 
         # Direct 2D branch
@@ -181,14 +197,19 @@ class Manta(nn.Module):
 
         # Tower 2D branch
         self.conv_tower_1d = ConvolutionalBlock1d(channels_1d, 2 * tower_2d_input_channels - 8, 1)
-        self.maxpool1d_tower = nn.MaxPool1d(kernel_size=2, stride=2)
         self.features_to_2d_tower = FeaturesTo2D(tower_2d_input_channels, tower_2d_channels, kernel_size=3)
 
         # Residual dilated tower
         self.residual_dilated_tower = FibonacciResidualTower(
             tower_2d_channels, tower_2d_height, tower_2d_width, dropout=tower_2d_dropout
         )
-        self.batchnorm_tower = nn.BatchNorm2d(tower_2d_channels, momentum=0.01)
+        # Normalize the residual-tower output before the GELU->deconv upsample. New models use GroupNorm (matching
+        # the rest of the network); ``legacy=True`` restores the old BatchNorm2d purely so pre-existing checkpoints
+        # (trained with that "oversight" norm) still load. Same forward ordering either way: norm -> GELU.
+        if self.legacy:
+            self.batchnorm_tower = nn.BatchNorm2d(tower_2d_channels, momentum=0.01)
+        else:
+            self.gn_tower = nn.GroupNorm(tower_2d_channels // 8, tower_2d_channels)
 
         # 2D deconv + groupnorm
         self.deconv = nn.ConvTranspose2d(tower_2d_channels, tower_2d_channels, kernel_size=2, stride=2, groups=4)
@@ -201,6 +222,12 @@ class Manta(nn.Module):
 
         # Symmetrization helper
         self.symm = Symmetrize()
+
+    def _dist(self, n):
+        """Distance matrix for an ``n x n`` map -- a slice of the pre-built ``dist_mat`` (already on device)."""
+        if n > self.dist_mat.shape[-1]:
+            raise ValueError(f"requested map size {n} exceeds the model's max n_bins {self.dist_mat.shape[-1]}")
+        return self.dist_mat[:, :n, :n]
 
     def forward(self, x, symmetrize=True):
         """
@@ -243,20 +270,19 @@ class Manta(nn.Module):
         x_direct = self.conv_direct_1d(x)  # [B, 2*direct_2d_input_channels - 8, n_bins + 2 * bins_pad]
         # Crop out bins_pad on each side, leaving [B, 2*direct_2d_input_channels - 8, n_bins]
         x_direct = x_direct[:, :, self.bins_pad : -self.bins_pad]
-        # Convert to 2D using dist_mat_full
-        x_direct = self.features_to_2d_direct(x_direct, self.dist_mat_full)  # [B, direct_2d_channels, n_bins, n_bins]
+        # Convert to 2D using a distance matrix sized to the actual (possibly variable) map
+        x_direct = self.features_to_2d_direct(x_direct, self._dist(x_direct.shape[-1]))  # [B, direct_2d_ch, N, N]
 
         # 6) Tower 2D branch
         x_tower = self.conv_tower_1d(x)  # [B, 2*tower_2d_input_channels - 8, n_bins + 2 * bins_pad]
         x_tower = x_tower[:, :, self.bins_pad : -self.bins_pad]  # [B, 2*tower_2d_input_channels - 8, n_bins]
-        x_tower = self.maxpool1d_tower(x_tower)  # [B, tower_2d_input_channels, n_bins//2]
-        x_tower = self.features_to_2d_tower(x_tower, self.dist_mat_half)  # [B, tower_2d_channels, n_bins//2, n_bins//2]
+        x_tower = self.maxpool1d(x_tower)  # [B, tower_2d_input_channels, n_bins//2]
+        x_tower = self.features_to_2d_tower(x_tower, self._dist(x_tower.shape[-1]))  # [B, tower_2d_ch, N/2, N/2]
 
         # 7) Residual tower in 2D
         x_tower = self.residual_dilated_tower(x_tower)  # [B, tower_2d_channels, n_bins//2, n_bins//2]
-        # This is an oversight, this batchnorm should be gone, but we are sticking to it due to the pre-trained models.
-        x_tower = self.batchnorm_tower(x_tower)  # [B, tower_2d_channels, n_bins//2, n_bins//2]
-        x_tower = F.gelu(x_tower)
+        norm_tower = self.batchnorm_tower if self.legacy else self.gn_tower  # BatchNorm only for legacy checkpoints
+        x_tower = F.gelu(norm_tower(x_tower))  # normalize before the upsample (see __init__)
         x_tower = self.deconv(x_tower)  # [B, tower_2d_channels, n_bins, n_bins]
         x_tower = F.gelu(self.gn_deconv(x_tower))
 
@@ -276,7 +302,9 @@ class Manta(nn.Module):
         return x_2d
 
 
-def save_manta_checkpoint(model, path, *, channel_names=None, model_params=None, genome=None):
+def save_manta_checkpoint(
+    model, path, *, channel_names=None, model_params=None, genome=None, history=None, train_meta=None
+):
     """
     Save a Manta model as a **self-describing** checkpoint: ``{"state_dict": ..., "config": {...}}``.
 
@@ -286,6 +314,11 @@ def save_manta_checkpoint(model, path, *, channel_names=None, model_params=None,
     is genome-specific, so this lets inference reject a mismatched cache/target), ``channel_names`` (so channel
     labels no longer depend on the target file) and non-default ``model_params``. ``MantaInference`` reads this
     format directly.
+
+    ``history`` (optional) is the per-epoch training log -- a list of small dicts of *mean* metrics (train/val
+    loss and mean correlations). Stored right in the checkpoint so the model file IS its own training record; no
+    side-car folders. ``train_meta`` (optional) is a dict of run-level settings (lr, batch size, dtypes, ...).
+    Both are plain JSON-able Python, negligible in size even at hundreds of epochs.
     """
     state = model.state_dict()
     config = {
@@ -294,6 +327,7 @@ def save_manta_checkpoint(model, path, *, channel_names=None, model_params=None,
         "bins_pad": int(model.bins_pad),
         "tower_height": int(model.tower_height),
         "output_channels": int(state["final_conv.weight"].shape[0]),
+        "legacy": bool(getattr(model, "legacy", False)),
     }
     if genome is not None:
         config["genome"] = str(genome)
@@ -301,4 +335,117 @@ def save_manta_checkpoint(model, path, *, channel_names=None, model_params=None,
         config["channel_names"] = list(channel_names)
     if model_params:
         config["model_params"] = dict(model_params)
+    if history is not None:
+        config["history"] = list(history)
+    if train_meta is not None:
+        config["train_meta"] = dict(train_meta)
     torch.save({"state_dict": state, "config": config}, path)
+
+
+# --------------------------------------------------------------------------- #
+# Named architecture presets ("model sizes")                                  #
+# --------------------------------------------------------------------------- #
+# Each preset is the full set of architecture overrides that pins down a "size";
+# the per-use knobs -- ``n_bins``, ``bins_pad``, ``output_channels``, and
+# ``tower_height`` (= ``round(log2(resolution)) - 9``) -- are supplied at build
+# time (see :func:`manta_from_preset`). Param counts below are for the recommended
+# small map (``n_bins=512``); they barely move with ``output_channels`` (the 2D
+# tail dominates), and are near-identical at ``n_bins=1024``.
+#
+# What the shrink study (2026-07: krietenstein + masahiro-10B + a 6-dataset epoch
+# sweep) found, scored by ``combined`` = mean of raw and between-channel (cell-type
+# specific) coarse-grained Spearman, relative to the 29M "full" reference:
+#
+#   full       29.3M  the original Manta. Best raw structure (combined ~0.659) but
+#                     ~17x heavier / ~10x slower than opt1M for ~0.01 more.
+#   opt2M       2.84M  matches opt1M (~0.646). The extra 1D width buys nothing --
+#                     kept only to show the 1D backbone is not the bottleneck.
+#   opt1M       1.76M  RECOMMENDED baseline. Within ~0.006-0.013 per window of full
+#                     on a dense held-out head-to-head; generalizes (masahiro-10B
+#                     -0.011 vs full, same gap as krietenstein). The 1D transformer
+#                     does global routing; the 2D convs only refine locally, so a
+#                     small 2D tower loses very little.
+#   opt1M_th6   1.79M  opt1M with a deeper 2D tower (tower_2d_height 3 -> 6). The
+#                     extra Fibonacci-dilated blocks are ~free in params but widen
+#                     the 2D receptive field, which helps the slow between-channel /
+#                     differential signal. Used for the multi-dataset epoch sweep;
+#                     prefer it for multi-channel / cell-type-specific datasets.
+#   nano        0.94M  aggressive floor (~0.629). Still captures coarse biology
+#                     (e.g. dELS anti-insulation) but subtle/differential signal
+#                     starts to soften; use for laptop / extreme-throughput sweeps.
+MANTA_PRESETS = {
+    "full": dict(
+        channels_1d=512,
+        transformer_layers=8,
+        tower_2d_height=9,
+        tower_2d_channels=48,
+        direct_2d_channels=48,
+        tower_2d_input_channels=96,
+        direct_2d_input_channels=64,
+        final_channels=32,
+    ),
+    "opt2M": dict(
+        channels_1d=256,
+        transformer_layers=2,
+        tower_2d_height=3,
+        tower_2d_channels=16,
+        direct_2d_channels=16,
+        tower_2d_input_channels=48,
+        direct_2d_input_channels=32,
+        final_channels=16,
+    ),
+    "opt1M": dict(
+        channels_1d=192,
+        transformer_layers=2,
+        tower_2d_height=3,
+        tower_2d_channels=16,
+        direct_2d_channels=16,
+        tower_2d_input_channels=32,
+        direct_2d_input_channels=24,
+        final_channels=16,
+    ),
+    "opt1M_th6": dict(
+        channels_1d=192,
+        transformer_layers=2,
+        tower_2d_height=6,
+        tower_2d_channels=16,
+        direct_2d_channels=16,
+        tower_2d_input_channels=32,
+        direct_2d_input_channels=24,
+        final_channels=16,
+    ),
+    "nano": dict(
+        channels_1d=128,
+        transformer_layers=2,
+        tower_2d_height=3,
+        tower_2d_channels=16,
+        direct_2d_channels=16,
+        tower_2d_input_channels=32,
+        direct_2d_input_channels=24,
+        final_channels=16,
+    ),
+}
+
+
+def manta_from_preset(
+    preset="opt1M", *, n_bins=None, bins_pad=None, output_channels=None, tower_height=None, **overrides
+):
+    """
+    Build a :class:`Manta` from a named size preset (see :data:`MANTA_PRESETS`).
+
+    The preset supplies the architecture; pass the per-use knobs here -- ``n_bins`` (map size in bins),
+    ``bins_pad``, ``output_channels`` (Hi-C channels), and ``tower_height`` (``round(log2(resolution)) - 9``).
+    Anything left ``None`` falls back to :class:`Manta`'s own default; ``**overrides`` tweaks any other arch kwarg
+    on top of the preset. Example::
+
+        model = manta_from_preset("opt1M", n_bins=512, bins_pad=64, output_channels=4, tower_height=2)
+    """
+    if preset not in MANTA_PRESETS:
+        raise ValueError(f"unknown preset {preset!r}; choose from {sorted(MANTA_PRESETS)}")
+    params = dict(MANTA_PRESETS[preset])
+    for k, v in dict(
+        n_bins=n_bins, bins_pad=bins_pad, output_channels=output_channels, tower_height=tower_height, **overrides
+    ).items():
+        if v is not None:
+            params[k] = v
+    return Manta(**params)

@@ -1,9 +1,45 @@
+"""
+Mixed-precision, multi-model Manta trainer.
+
+One invocation co-trains **N Manta models** (one per Hi-C dataset) that share a single MicroZoi activation
+cache, genome and resolution. Every training step fetches the shared activations for a window **once** and each
+model that is *eligible* for that window trains on them, so 1 or 30 models cost almost the same in I/O. Models
+are otherwise independent (own weights, optimizer, output channels).
+
+How the data pipeline is organized (all precomputed up front, pure numpy):
+
+* **Eligibility is a genome-wide mask, per (model, n_bins).** ``BandedHicFile.eligible_mask`` gives, over the
+  global-position axis, the full inclusion mask (arm + bad-fraction + fold-fraction) for a fold set. We stack it
+  across models, yielding, per n_bins, a *superset* of train (and val) global positions plus an
+  ``(n_windows x n_models)`` eligibility matrix. A window is just one global bin index; no per-chromosome
+  bookkeeping, no per-model random draws that would break the shared fetch.
+* **Windows are sampled uniformly** over the superset (coverage proportional to the genome, not per-chromosome),
+  with random reverse-complement.
+* **One epoch = the genome seen ~once in both directions** = ``2 * n_eligible / n_bins`` windows. With several
+  ``n_bins`` values (variable-window training) each contributes its own windows; a batch is homogeneous in
+  n_bins so activations stack.
+* **No activation cache.** Train and val are the same loop minus gradients; activations are fetched from disk,
+  overlapped with GPU compute by a background prefetch thread. Validation windows are sampled once and frozen.
+
+Precision: params are always ``float32``; ``--compute-dtype`` picks the autocast math dtype -- ``bfloat16``
+(default, no scaler), ``float16`` (fp16 mixed, GradScaler on cuda/mps), or ``float32`` (plain fp32, no autocast).
+
+Default ``--n-bins`` is ``512,768,896,960,1024`` -- every distributed model is trained on all of these (weighted
+to the upper range) so it can be asked for any of them, and in particular for a 512-bin map (laptop / fast
+sweeps). Pass a single value (e.g. ``--n-bins 512``) to train one size.
+
+The checkpoint is the log: each model is one ``<output-dir>/<name>.pth`` re-saved as it trains, carrying its
+per-epoch ``history`` (mean train/val loss + mean of each correlation) in the config. No side-car folders.
+
+Specify models three interchangeable ways (they merge): ``--input-file`` (single); repeated ``--model
+name=path``; or ``--models manifest.json`` (list of ``{name, input_file, [cache_path], [genome], [params]}``).
+"""
+
 import json
 import os
-import pickle
-import random
-import shutil
-from contextlib import contextmanager, nullcontext
+import queue
+import threading
+import time
 
 import click
 import numpy as np
@@ -11,241 +47,514 @@ import torch
 import torch.optim as optim
 
 from manta_hic.io.banded import BandedHicFile
-from manta_hic.nn.dataset import (
-    HiCDataset,
-    ThreadedDataLoader,
-    run_epoch,
-    train_val_test_folds,
-)
 from manta_hic.nn.fetchers import CachedMicrozoiFetcher
-from manta_hic.nn.manta import Manta, save_manta_checkpoint
+from manta_hic.nn.manta import MANTA_PRESETS, Manta, save_manta_checkpoint
+from manta_hic.ops.hic_ops import coarsegrained_hic_corrs, create_expected_matrix, hic_hierarchical_loss
 from manta_hic.ops.tensor_ops import torch_device_type
 
-
-@contextmanager
-def ephemeral_copy(src_path: str, dst_path: str):
-    """
-    Copies src_path to dst_path. Yields dst_path, then automatically
-    removes it on exit or exception.
-    """
-    print(f"Copying {src_path} to {dst_path}")
-    shutil.copy2(src_path, dst_path)
-    print(f"Copied {src_path} to {dst_path}")
-    try:
-        yield dst_path
-    finally:
-        if os.path.exists(dst_path):
-            os.remove(dst_path)
+CORR_NAMES = ["spearman", "pearson", "msd", "spearman_bm", "pearson_bm", "msd_bm"]
+RES_EPOCHS = {256: 20, 512: 30, 1024: 50, 2048: 100, 4096: 150, 8192: 200, 16384: 200}
+N_BINS_DEFAULT = (512, 768, 896, 960, 1024)  # every distributed model sees these; upper range weighted
+DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
 
 
-file = click.Path(exists=True, dir_okay=False)
+def resolve_specs(input_file, model, models, cache_path, genome, params):
+    """Merge the three ways of naming models into a list of {name, input_file, cache_path, genome, params}."""
+    specs = []
 
-
-@click.command(name="manta", context_settings={"show_default": True})
-@click.option("--input-file", "-i", type=file, required=True, help="Path to the datafile.")
-@click.option("--cache-path", "-c", type=file, required=True, help="Path to the cachefile, should be on SSD")
-@click.option("--output-folder", "-o", type=click.Path(file_okay=False), required=True, help="Output folder.")
-@click.option("--device", "-d", default="cuda:0", help="Torch device")
-@click.option("--genome", "-g", default="hg38", help="Genome")
-@click.option("--n-epochs", "-e", default=0, help="Number of epochs. (0 is auto)")
-@click.option("--work-dir", default=None, help="Working directory in a fast location to store the datafile.")
-@click.option("--overwrite", is_flag=True, help="Overwrite the output folder.")
-@click.option("--params", type=click.Path(exists=True), help="Path to the parameters file JSON file")
-@click.option("--batch-size", default=2, help="Batch size.")
-@click.option("--lr", default=0.0001, help="Learning rate.")
-@click.option("--save-every", default=10, help="Save model every n epochs.")
-@click.option("--n-bins", default=1024, help="Number of bins in the Hi-C map")
-@click.option("--bins-pad", default=128, help="Number of padding bins.")
-@click.option("--val-fold", default="fold3", help="Validation fold")
-@click.option("--test-fold", default="fold4", help="Test fold")
-@click.option("--use-all-data", is_flag=True, help="Use all data without train/test splits")
-@click.option("--epoch-multiplier", default=1.0, type=float, help="Multiplier for number of epochs")
-def train_manta_click(
-    input_file,
-    cache_path,
-    output_folder,
-    device="cuda:0",
-    genome="hg38",
-    params=None,
-    overwrite=False,
-    batch_size=2,
-    n_epochs=0,
-    work_dir=None,
-    lr=0.0001,
-    save_every=10,
-    n_bins=1024,
-    bins_pad=128,
-    val_fold="fold3",
-    test_fold="fold4",
-    use_all_data=False,
-    epoch_multiplier=1.0,
-):
-    if os.path.exists(output_folder):
-        if overwrite:
-            shutil.rmtree(output_folder)
-        else:
-            raise ValueError(f"Output folder {output_folder} already exists.")
-    os.makedirs(output_folder, exist_ok=True)
-
-    if params is not None:
-        params = json.load(open(params))
-
-    if work_dir is not None:  # need to copy the datafile to the work_dir in a safe way
-        random_suffix = str(random.randint(0, 1000000)) + "_"
-        copied_input_file = os.path.join(work_dir, random_suffix + os.path.basename(input_file))
-        manager = ephemeral_copy(input_file, copied_input_file)
-    else:
-        manager = nullcontext(input_file)
-    with manager as input_file:
-        # keyword args: a previous positional call had val_fold/test_fold swapped (now fixed)
-        train_manta(
-            input_file,
-            cache_path,
-            output_folder,
-            device=device,
-            genome=genome,
-            params=params,
-            batch_size=batch_size,
-            n_epochs=n_epochs,
-            lr=lr,
-            save_every=save_every,
-            n_bins=n_bins,
-            bins_pad=bins_pad,
-            val_fold=val_fold,
-            test_fold=test_fold,
-            use_all_data=use_all_data,
-            epoch_multiplier=epoch_multiplier,
+    def add(name, path, cache=None, gen=None, prm=None):
+        specs.append(
+            {
+                "name": name,
+                "input_file": path,
+                "cache_path": cache or cache_path,
+                "genome": gen or genome,
+                "params": prm if prm is not None else params,
+            }
         )
+
+    if models:
+        entries = json.load(open(models))
+        if not isinstance(entries, list):
+            raise ValueError("--models manifest must be a JSON list of objects")
+        for e in entries:
+            add(e["name"], e["input_file"], e.get("cache_path"), e.get("genome"), e.get("params"))
+    for m in model or ():
+        if "=" not in m:
+            raise ValueError(f"--model must be 'name=path', got {m!r}")
+        name, path = m.split("=", 1)
+        add(name, path)
+    if input_file:
+        add(os.path.splitext(os.path.basename(input_file))[0], input_file)
+
+    if not specs:
+        raise ValueError("no models: pass --input-file, one/more --model name=path, or --models manifest.json")
+    for s in specs:
+        if s["cache_path"] is None:
+            raise ValueError(f"model {s['name']!r} has no cache: pass --cache-path or set it in the manifest")
+    names = [s["name"] for s in specs]
+    if len(set(names)) != len(names):
+        raise ValueError(f"duplicate model names: {names}")
+    return specs
+
+
+class _Model:
+    """Lightweight per-model holder: network + optimizer + scaler + banded target file + log. Eligibility lives in
+    the shared per-n_bins index, not here. Params are always float32 (autocast handles the low-precision math)."""
+
+    def __init__(self, spec, *, max_n_bins, bins_pad, device, lr, tower_h):
+        self.name = spec["name"]
+        self.banded = BandedHicFile(spec["input_file"])
+        self.nch = self.banded.n_channels
+        prm = dict(spec.get("params") or {})
+        for k in ("tower_height", "n_bins", "bins_pad"):
+            prm.pop(k, None)
+        self.model_arch = prm
+        self.model = Manta(
+            n_bins=max_n_bins, bins_pad=bins_pad, tower_height=tower_h, output_channels=self.nch, **prm
+        ).to(device=device, dtype=torch.float32)
+        self.opt = optim.Adam(self.model.parameters(), lr=lr)
+        self.n_params = sum(p.numel() for p in self.model.parameters())
+        self.history = []
+
+
+def sample_n_runs(prob=0.1, lo=2, hi=6):
+    """MicroZoi run-averaging depth for a training batch: usually 1 (fast), occasionally a random 2..hi (a
+    smoother, more expensive activation) so the model sees both."""
+    return int(np.random.randint(lo, hi + 1)) if np.random.rand() < prob else 1
+
+
+def reduce_means(acc):
+    """``acc[mi] = list of (loss, corr6|None)`` -> ``{mi: {'loss':, <corr means>...}}`` (epoch means per model)."""
+    out = {}
+    for mi, rows in acc.items():
+        if not rows:
+            continue
+        d = {"loss": float(np.mean([r[0] for r in rows]))}
+        corrs = [r[1] for r in rows if r[1] is not None]
+        if corrs:
+            mean = np.nanmean(np.array(corrs), axis=0)
+            d.update({CORR_NAMES[k]: float(mean[k]) for k in range(len(CORR_NAMES))})
+        out[mi] = d
+    return out
+
+
+def make_batches(sub, nb, batch_size, rng):
+    """Sample ~genome-once-in-both-directions = ``2 * n_eligible / n_bins`` windows (rounded up to a batch
+    multiple) uniformly from a superset ``{pos, elig}`` and cut them into homogeneous batches. Returns a list of
+    ``(nb, positions, elig, reverse)`` tuples, each of length ``batch_size``."""
+    nwin = int(np.ceil(2 * len(sub["pos"]) / nb / batch_size) * batch_size)
+    rows = rng.integers(0, len(sub["pos"]), size=nwin)
+    positions, elig, rev = sub["pos"][rows], sub["elig"][rows], (rng.random(nwin) < 0.5)
+    return [
+        (nb, positions[i : i + batch_size], elig[i : i + batch_size], rev[i : i + batch_size])
+        for i in range(0, nwin, batch_size)
+    ]
+
+
+class _Prefetcher:
+    """Single background thread (so the one h5py file set is touched by one thread only) that materializes each
+    batch -- shared activation fetch + per-eligible-model target windows -- while the main thread runs the GPU."""
+
+    def __init__(self, batches, models, fetcher, *, bins_pad, res, n_runs_fn, queue_size=3):
+        self.batches, self.models, self.fetcher = batches, models, fetcher
+        self.bins_pad, self.res, self.n_runs_fn = bins_pad, res, n_runs_fn
+        self.q = queue.Queue(maxsize=queue_size)
+
+    def _work(self):
+        for nb, positions, elig, rev in self.batches:
+            acts = []
+            for pos, rc in zip(positions, rev):
+                chrom, start_bp = self.models[0].banded.pos_to_coord(int(pos))  # same coord for all models
+                acts.append(
+                    self.fetcher.fetch(
+                        chrom,
+                        start_bp - self.bins_pad * self.res,
+                        start_bp + (nb + self.bins_pad) * self.res,
+                        reverse=bool(rc),
+                        n_runs=self.n_runs_fn(),
+                        device="cpu",
+                    )
+                )
+            targets = {}
+            for mi, m in enumerate(self.models):
+                rows = np.nonzero(elig[:, mi])[0]
+                if not len(rows):
+                    continue
+                hs, ws, es = [], [], []
+                for r in rows:
+                    hic, weight, exp = m.banded.window_at(int(positions[r]), nb)
+                    if rev[r]:  # reverse-complement flips the map on both axes and the weights on one
+                        hic, weight = hic[:, ::-1, ::-1], weight[:, ::-1]
+                    hs.append(np.ascontiguousarray(hic))
+                    ws.append(np.ascontiguousarray(weight))
+                    es.append(np.ascontiguousarray(exp))
+                targets[mi] = (rows, np.stack(hs), np.stack(ws), np.stack(es))
+            self.q.put((nb, torch.stack(acts), elig, targets))
+        self.q.put(None)
+
+    def __iter__(self):
+        t = threading.Thread(target=self._work, daemon=True)
+        t.start()
+        while True:
+            item = self.q.get()
+            if item is None:
+                break
+            yield item
+        t.join()
+
+
+def train_manta_multi(
+    specs,
+    output_dir,
+    *,
+    device="cuda:0",
+    n_bins=N_BINS_DEFAULT,
+    bins_pad=64,
+    batch_size=8,
+    n_epochs=0,
+    epoch_multiplier=1.0,
+    lr=2e-4,
+    val_fold=3,
+    test_fold=4,
+    save_every=5,
+    compute_dtype="bfloat16",
+    max_bad_fraction=0.1,
+    overlap_threshold=0.9,
+    train_corr=False,
+):
+    os.makedirs(output_dir, exist_ok=True)
+    n_bins = sorted({int(x) for x in ([n_bins] if isinstance(n_bins, int) else n_bins)})
+    max_nb = max(n_bins)
+    dev_type = torch_device_type(device)
+    # params are float32; compute_dtype is the autocast math dtype. fp32 -> no autocast; fp16 -> GradScaler.
+    cdt = DTYPES[compute_dtype]
+    autocast_on = cdt is not torch.float32
+    scaler_on = cdt is torch.float16 and dev_type in ("cuda", "mps")
+    mode = "fp32" if not autocast_on else ("mixed-fp16(scaler)" if scaler_on else "mixed-bf16")
+    print(f"[train] precision: params float32, compute {compute_dtype} -> {mode}", flush=True)
+
+    caches = set(s["cache_path"] for s in specs)
+    genomes = set(s["genome"] for s in specs)
+    if len(caches) != 1 or len(genomes) != 1:
+        raise ValueError(
+            f"all models in one run must share cache+genome (caches={caches}, genomes={genomes}); "
+            "run separate invocations per cache/genome"
+        )
+    fetcher = CachedMicrozoiFetcher(next(iter(caches)))
+    genome = next(iter(genomes))
+    if fetcher.genome is not None and fetcher.genome != genome:
+        raise ValueError(f"cache genome {fetcher.genome!r} != requested {genome!r}")
+
+    probe = BandedHicFile(specs[0]["input_file"])  # resolution + tower height (all models must match)
+    res = probe.resolution
+    tower_h = int(np.round(np.log2(res))) - 9
+    probe.close()
+
+    models = [_Model(s, max_n_bins=max_nb, bins_pad=bins_pad, device=device, lr=lr, tower_h=tower_h) for s in specs]
+    for m in models:
+        if m.banded.resolution != res:
+            raise ValueError(f"model {m.name!r} resolution {m.banded.resolution} != run resolution {res}")
+        if m.banded.genome != genome:
+            raise ValueError(f"model {m.name!r} genome {m.banded.genome!r} != run genome {genome!r}")
+        if m.banded.total_bins != models[0].banded.total_bins:
+            raise ValueError(f"model {m.name!r} does not share the genome axis (different chromosomes?)")
+
+    # train/val fold split (folds are integer Borzoi ids and must be present in the file -- else error, no silent skip)
+    present = set(models[0].banded.present_folds())
+    if val_fold not in present or test_fold not in present:
+        raise ValueError(f"val_fold {val_fold} / test_fold {test_fold} not among the file's folds {sorted(present)}")
+    train_folds, val_folds = present - {val_fold, test_fold}, {val_fold}
+
+    if n_epochs == 0:
+        n_epochs = RES_EPOCHS.get(res, 50)
+    n_epochs = max(1, int(n_epochs * epoch_multiplier))
+    print(
+        f"[train] res={res}bp n_bins={n_bins} bins_pad={bins_pad} genome={genome} epochs={n_epochs} "
+        f"batch={batch_size} lr={lr} train_corr={train_corr}",
+        flush=True,
+    )
+
+    # -- eligibility index: per n_bins, stack each model's eligible_mask for the train & val fold sets --------- #
+    index = {}
+    for nb in n_bins:
+        entry = {}
+        for split, fold_set in (("train", train_folds), ("val", val_folds)):
+            E = np.stack(
+                [
+                    m.banded.eligible_mask(
+                        nb, max_bad_fraction=max_bad_fraction, fold=fold_set, overlap_threshold=overlap_threshold
+                    )
+                    for m in models
+                ],
+                axis=1,
+            )
+            pos = np.nonzero(E.any(axis=1))[0].astype(np.int64)
+            entry[split] = {"pos": pos, "elig": E[pos]}  # elig: [S, M]
+        index[nb] = entry
+    for m in models:
+        print(f"  - {m.name}: {m.nch}ch {m.n_params / 1e6:.2f}M", flush=True)
+    for nb in n_bins:
+        tr, va = index[nb]["train"], index[nb]["val"]
+        print(
+            f"  n_bins={nb}: train superset={len(tr['pos'])} val superset={len(va['pos'])} "
+            f"(avg models/window {tr['elig'].mean() * len(models):.1f})",
+            flush=True,
+        )
+
+    # frozen validation batches (sampled once)
+    val_rng = np.random.default_rng(12345)
+    val_batches = []
+    for nb in n_bins:
+        val_batches += make_batches(index[nb]["val"], nb, batch_size, val_rng)
+    print(
+        f"[train] frozen val: {sum(b[2].shape[0] for b in val_batches)} windows in {len(val_batches)} batches",
+        flush=True,
+    )
+
+    scalers = [torch.GradScaler(dev_type, enabled=scaler_on) for _ in models]
+    rng = np.random.default_rng(0)
+
+    def run_batch(nb, acts, elig, targets, *, train):
+        """One shared batch across all eligible models. Returns {mi: (loss, corr6|None)} of per-window means."""
+        acts = acts.to(device=device, dtype=torch.float32)
+        out = {}
+        for mi, m in enumerate(models):
+            if mi not in targets:
+                continue
+            rows, hic, weight, exp = targets[mi]
+            sub = acts[rows]
+            to_t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device=device, dtype=torch.float32)
+            target, weightmat = create_expected_matrix(to_t(hic), to_t(weight), to_t(exp))
+            if train:
+                m.model.train()
+                m.opt.zero_grad()
+            else:
+                m.model.eval()
+            with torch.set_grad_enabled(train), torch.autocast(dev_type, dtype=cdt, enabled=autocast_on):
+                pred = m.model(sub)
+                loss = hic_hierarchical_loss(pred, target, weightmat)
+            if train:
+                scalers[mi].scale(loss).backward()
+                scalers[mi].step(m.opt)
+                scalers[mi].update()
+            corr = None
+            if not train or train_corr:
+                cc = coarsegrained_hic_corrs(pred.detach().float(), target, weight, exp, also_divide_by_mean=True)
+                corr = [float(np.nanmean(x.cpu().numpy())) for x in cc]
+            out[mi] = (float(loss), corr)
+        return out
+
+    meta = dict(
+        lr=lr,
+        batch_size=batch_size,
+        n_bins=n_bins,
+        bins_pad=bins_pad,
+        n_epochs=n_epochs,
+        compute_dtype=compute_dtype,
+        precision_mode=mode,
+        max_bad_fraction=max_bad_fraction,
+        overlap_threshold=overlap_threshold,
+        val_fold=val_fold,
+        test_fold=test_fold,
+        max_nb=max_nb,
+    )
+
+    for epoch in range(n_epochs):
+        train_batches = []  # re-sampled each epoch; homogeneous-n_bins batches, shuffled together
+        for nb in n_bins:
+            train_batches += make_batches(index[nb]["train"], nb, batch_size, rng)
+        rng.shuffle(train_batches)
+
+        t0 = time.time()
+        tr_acc = {mi: [] for mi in range(len(models))}
+        for nb, acts, elig, targets in _Prefetcher(
+            train_batches, models, fetcher, bins_pad=bins_pad, res=res, n_runs_fn=sample_n_runs
+        ):
+            for mi, r in run_batch(nb, acts, elig, targets, train=True).items():
+                tr_acc[mi].append(r)
+        t_train = time.time() - t0
+
+        t0 = time.time()
+        va_acc = {mi: [] for mi in range(len(models))}
+        for nb, acts, elig, targets in _Prefetcher(
+            val_batches, models, fetcher, bins_pad=bins_pad, res=res, n_runs_fn=lambda: 1
+        ):
+            for mi, r in run_batch(nb, acts, elig, targets, train=False).items():
+                va_acc[mi].append(r)
+        t_val = time.time() - t0
+
+        tr_means, va_means = reduce_means(tr_acc), reduce_means(va_acc)
+        line = [f"ep{epoch + 1}/{n_epochs} t_train={t_train:.0f}s t_val={t_val:.0f}s"]
+        for mi, m in enumerate(models):
+            rec = {"epoch": epoch}
+            if mi in tr_means:
+                rec["train"] = tr_means[mi]
+            if mi in va_means:
+                rec["val"] = va_means[mi]
+            m.history.append(rec)
+            vl = va_means.get(mi, {}).get("loss", float("nan"))
+            vs = va_means.get(mi, {}).get("spearman", float("nan"))
+            line.append(f"{m.name}:vl={vl:.3f}/vsp={vs:.3f}")
+        print("[train] " + "  ".join(line), flush=True)
+
+        if (epoch + 1) % save_every == 0 or (epoch + 1) == n_epochs:
+            for m in models:
+                save_manta_checkpoint(
+                    m.model,
+                    os.path.join(output_dir, f"{m.name}.pth"),
+                    channel_names=m.banded.shortnames,
+                    model_params=m.model_arch,
+                    genome=m.banded.genome,
+                    history=m.history,
+                    train_meta=meta,
+                )
+
+    for m in models:
+        m.banded.close()
+    print("[train] DONE", flush=True)
 
 
 def train_manta(
     input_file,
     cache_path,
     output_folder,
+    *,
     device="cuda:0",
     genome="hg38",
     params=None,
-    batch_size=2,
+    batch_size=8,
     n_epochs=0,
-    lr=0.0001,
-    save_every=10,
-    n_bins=1024,
-    bins_pad=128,
-    val_fold="fold3",
-    test_fold="fold4",
-    use_all_data=False,
+    lr=2e-4,
+    save_every=5,
+    n_bins=N_BINS_DEFAULT,
+    bins_pad=64,
+    val_fold=3,
+    test_fold=4,
     epoch_multiplier=1.0,
+    compute_dtype="bfloat16",
 ):
-    if params is None:
-        params = {}
+    """Train a single Manta model (thin wrapper over :func:`train_manta_multi`)."""
+    name = os.path.splitext(os.path.basename(input_file))[0]
+    specs = [{"name": name, "input_file": input_file, "cache_path": cache_path, "genome": genome, "params": params}]
+    train_manta_multi(
+        specs,
+        output_folder,
+        device=device,
+        n_bins=n_bins,
+        bins_pad=bins_pad,
+        batch_size=batch_size,
+        n_epochs=n_epochs,
+        epoch_multiplier=epoch_multiplier,
+        lr=lr,
+        save_every=save_every,
+        val_fold=val_fold,
+        test_fold=test_fold,
+        compute_dtype=compute_dtype,
+    )
 
-    # training only reads cached activations (no mutation patching), so no fasta handle is needed
-    fetcher = CachedMicrozoiFetcher(cache_path)
 
-    # One open banded file shared by train + val (per-bin fold ids live in it, so the fold split is here).
-    # The datasets slice it lazily for the whole run, so it stays open until training finishes -- the `with`
-    # guarantees the HDF5 handle is closed on normal exit and on any exception below.
-    with BandedHicFile(input_file) as banded:
-        if banded.genome != genome:
-            raise ValueError(f"banded file genome {banded.genome!r} != requested genome {genome!r}")
-        if fetcher.genome is not None and fetcher.genome != genome:
-            raise ValueError(f"cache genome {fetcher.genome!r} != requested genome {genome!r} (wrong cache?)")
-        train_folds, val_folds, _test_folds = train_val_test_folds(banded, val_fold, test_fold)
+file = click.Path(exists=True, dir_okay=False)
 
-        # Run-averaging augmentation policy lives here (the fetcher just averages whatever n_runs it is given):
-        # for ~10% of training samples average a random 2-6 cached runs (tilings/sub-bp shifts), else use 1.
-        def sample_n_runs(prob_mean=0.1, min_runs=2, max_runs=6):
-            return int(np.random.randint(min_runs, max_runs + 1)) if np.random.rand() < prob_mean else 1
 
-        ds_train = HiCDataset(
-            banded,
-            fetcher,
-            n_bins=n_bins,
-            bins_pad=bins_pad,
-            folds=None if use_all_data else train_folds,  # None = all data, no fold constraint
-            sampling="random",
-            n_runs=sample_n_runs,
-        )
-
-        if not use_all_data:
-            ds_val = HiCDataset(
-                banded,
-                fetcher,
-                n_bins=n_bins,
-                bins_pad=bins_pad,
-                folds=val_folds,
-                sampling="strided",  # deterministic eval tiling
-            )
-            assert len(ds_val) > 0, "No validation data"
-        else:
-            ds_val = None
-
-        assert len(ds_train) > 0, "No training data"
-
-        # The dataset already sizes an epoch (~N_eligible / stride windows), so iterate all of it.
-        train_dl = ThreadedDataLoader(ds_train, batch_size=batch_size, shuffle=True, fraction=1.0)
-
-        hic_res = ds_train.hic_res
-        # resolution of microzoi is 256bp, which has log2(256)=8. plus one because we maxpool after the first
-        # convolution which is not in a tower. Also tower is split before/after MHA, with one layer after MHA, so min
-        # resolution of the model is 1024bp:
-        # microzoi (256bp) -> maxpool (512bp) -> MHA (512bp) -> last conv block + maxpool (1024bp) -> Hi-C map (1024bp))
-        params["tower_height"] = int(np.round(np.log2(hic_res))) - 9
-
-        res_epoch_dict = {256: 20, 512: 30, 1024: 40, 2048: 50, 4096: 60, 8192: 70, 16384: 80}
-        if n_epochs == 0:
-            n_epochs = res_epoch_dict[hic_res]
-        n_epochs = int(n_epochs * epoch_multiplier)
-
-        model = Manta(**params, output_channels=ds_train.n_channels).to(device)
-        # any non-default architecture params (beyond tower_height/n_bins/bins_pad, which the model already knows)
-        # to persist in the checkpoint so it reloads without them being re-supplied
-        model_arch = {k: v for k, v in params.items() if k not in ("tower_height", "n_bins", "bins_pad")}
-        optimizer = optim.Adam(model.parameters(), lr=lr)
-        # autocast uses fp16 on cuda/mps (needs loss scaling) and bf16 on cpu (does not) -- so enable the
-        # scaler only for the fp16 backends. Device *type* keeps cuda:0/cuda:1 targeting intact.
-        dev_type = torch_device_type(device)
-        scaler = torch.GradScaler(dev_type, enabled=dev_type in ("cuda", "mps"))
-        os.makedirs(output_folder, exist_ok=True)
-
-        for epoch in range(n_epochs):
-            model.train()
-            corrs_train = run_epoch(
-                model,
-                train_dl,
-                device=device,
-                is_train=True,
-                optimizer=optimizer,
-                scaler=scaler,
-            )
-
-            # -- Validate
-            if not use_all_data:
-                val_dl = ThreadedDataLoader(ds_val, batch_size=batch_size * 2, shuffle=False, fraction=1)
-                corrs_val = run_epoch(model, val_dl, device=device, is_train=False)
-            else:
-                corrs_val = np.zeros((1, 1, 1, 1))
-
-            if (epoch + 1) % save_every == 0:
-                save_manta_checkpoint(
-                    model,
-                    f"{output_folder}/model_{epoch}.pth",
-                    channel_names=banded.shortnames,
-                    model_params=model_arch,
-                    genome=banded.genome,
-                )
-
-            with open(f"{output_folder}/corrs_{epoch}.pkl", "wb") as f:
-                pickle.dump([corrs_train, corrs_val], f)
-
-            ct = ", ".join([f"{i:.3f}" for i in np.mean(corrs_train, axis=(0, 2, 3))])
-            cv = ", ".join([f"{i:.3f}" for i in np.mean(corrs_val, axis=(0, 2, 3))])
-
-            print(f"Epoch {epoch + 1}/{n_epochs}: train_corrs={ct}, val_corr={cv}   ")
-        save_manta_checkpoint(
-            model,
-            os.path.join(output_folder, "saved_model.pth"),
-            channel_names=banded.shortnames,
-            model_params=model_arch,
-            genome=banded.genome,
-        )
+@click.command(name="manta", context_settings={"show_default": True})
+@click.option("--input-file", "-i", type=file, default=None, help="Single dataset (convenience; name from filename).")
+@click.option("--model", "-m", multiple=True, help="Repeatable 'name=path'. Add several to co-train.")
+@click.option("--models", type=file, default=None, help="JSON manifest: list of {name, input_file, [cache_path]...}.")
+@click.option(
+    "--cache-path", "-c", type=file, default=None, help="Shared MicroZoi cache (SSD). Default for all models."
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    type=click.Path(file_okay=False),
+    required=True,
+    help="Directory for the per-model <name>.pth checkpoints (each carries its own history).",
+)
+@click.option("--device", "-d", default="cuda:0", help="Torch device")
+@click.option("--genome", "-g", default="hg38", help="Genome (all models must share it).")
+@click.option(
+    "--preset",
+    type=click.Choice(sorted(MANTA_PRESETS)),
+    default="opt1M",
+    help="Architecture size preset (see manta.MANTA_PRESETS); opt1M is the recommended small model.",
+)
+@click.option(
+    "--params",
+    type=click.Path(exists=True),
+    default=None,
+    help="Architecture params JSON, merged on top of --preset (overrides individual keys).",
+)
+@click.option(
+    "--n-bins",
+    default=",".join(map(str, N_BINS_DEFAULT)),
+    help="Hi-C map size(s) in bins, comma-separated for variable-window training. Pass one value to train one size.",
+)
+@click.option("--bins-pad", default=64, help="Padding bins.")
+@click.option("--batch-size", default=8, help="Batch size (shared fetch; one n_bins per batch, sized for max n_bins).")
+@click.option("--n-epochs", "-e", default=0, help="Epochs (0 = auto by resolution).")
+@click.option("--epoch-multiplier", default=1.0, type=float, help="Scale the epoch count.")
+@click.option("--lr", default=2e-4, help="Learning rate.")
+@click.option("--val-fold", default=3, type=int, help="Validation fold (integer Borzoi id, must be in the file).")
+@click.option("--test-fold", default=4, type=int, help="Test fold (integer Borzoi id, held out, not evaluated here).")
+@click.option("--save-every", default=5, help="Re-save each <name>.pth every N epochs (always at the end).")
+@click.option(
+    "--compute-dtype",
+    type=click.Choice(["float16", "bfloat16", "float32"]),
+    default="bfloat16",
+    help="Autocast math dtype (params are always float32).",
+)
+@click.option("--max-bad-fraction", default=0.1, help="Reject windows with RMS-over-channels bad fraction >= this.")
+@click.option(
+    "--overlap-threshold",
+    default=0.9,
+    help="Min fraction of a window's bins in the fold set to keep it (fold-boundary tolerance).",
+)
+@click.option("--train-corr", is_flag=True, help="Also compute (expensive) train-set correlations each epoch.")
+def train_manta_click(
+    input_file,
+    model,
+    models,
+    cache_path,
+    output_dir,
+    device,
+    genome,
+    preset,
+    params,
+    n_bins,
+    bins_pad,
+    batch_size,
+    n_epochs,
+    epoch_multiplier,
+    lr,
+    val_fold,
+    test_fold,
+    save_every,
+    compute_dtype,
+    max_bad_fraction,
+    overlap_threshold,
+    train_corr,
+):
+    arch = dict(MANTA_PRESETS[preset])  # size preset, then --params JSON overrides individual keys
+    if params:
+        arch.update(json.load(open(params)))
+    specs = resolve_specs(input_file, model, models, cache_path, genome, arch)
+    sizes = tuple(int(x) for x in str(n_bins).split(","))
+    train_manta_multi(
+        specs,
+        output_dir,
+        device=device,
+        n_bins=sizes,
+        bins_pad=bins_pad,
+        batch_size=batch_size,
+        n_epochs=n_epochs,
+        epoch_multiplier=epoch_multiplier,
+        lr=lr,
+        val_fold=val_fold,
+        test_fold=test_fold,
+        save_every=save_every,
+        compute_dtype=compute_dtype,
+        max_bad_fraction=max_bad_fraction,
+        overlap_threshold=overlap_threshold,
+        train_corr=train_corr,
+    )

@@ -81,6 +81,7 @@ class MantaInference:
         output_channels = int(cfg["output_channels"])
         config_channel_names = cfg.get("channel_names")
         self.genome = cfg.get("genome")  # the genome the model was trained on (None for older checkpoints)
+        legacy = bool(cfg.get("legacy", False))  # old checkpoints carry a BatchNorm in the 2D tower
         model_params = model_params or cfg.get("model_params")
 
         self.model = (
@@ -89,11 +90,15 @@ class MantaInference:
                 bins_pad=bins_pad,
                 tower_height=th,
                 output_channels=output_channels,
+                legacy=legacy,
                 **(model_params or {}),
             )
             .to(device)
             .eval()
         )
+        # ``freqs_cis`` used to be a persistent per-layer buffer; it is now a non-persistent buffer recomputed
+        # identically at init, so drop those keys (present only in old checkpoints) to load the rest strictly.
+        state = {k: v for k, v in state.items() if not k.endswith("freqs_cis")}
         self.model.load_state_dict(state)
 
         if self.target_file is not None:
@@ -338,11 +343,11 @@ class MantaInference:
         return maps, (groups[0][2] if groups else [])
 
     # -- observed target (needs a banded file) ------------------------------- #
-    def is_eligible(self, chrom, start_bp, *, min_fraction=0.1, fold=None) -> bool:
+    def is_eligible(self, chrom, start_bp, *, max_bad_fraction=0.1, fold=None) -> bool:
         """O(1) check that the observed window is a clean training/eval target (requires a ``target`` file)."""
         if self.target_file is None:
             raise ValueError("no target file attached; pass target=… to check eligibility")
-        return self.target_file.is_eligible(chrom, start_bp, self.n_bins, min_fraction=min_fraction, fold=fold)
+        return self.target_file.is_eligible(chrom, start_bp, self.n_bins, max_bad_fraction=max_bad_fraction, fold=fold)
 
     @torch.no_grad()
     def target(self, chrom, start_bp, *, observed_over_expected=True, adaptive_coarsegrain=False):

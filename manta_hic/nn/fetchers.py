@@ -59,7 +59,12 @@ def create_microzoi_model_from_cache(cache_path, device="cuda", return_type="mha
     mod_args.update({"return_type": return_type})
 
     model = Microzoi(**mod_args).to(device)
-    model.load_state_dict(torch.load(io.BytesIO(model_bytes), map_location=device, weights_only=True))
+    sd = torch.load(io.BytesIO(model_bytes), map_location=device, weights_only=True)
+    # ``freqs_cis`` used to be a persistent per-layer buffer and is present in older blobs; it is now a
+    # non-persistent buffer that the model recomputes identically at init (deterministic from n_bins/theta), so
+    # drop those keys to load the real weights strictly. Removing this filter once all blobs are re-saved is safe.
+    sd = {k: v for k, v in sd.items() if not k.endswith("freqs_cis")}
+    model.load_state_dict(sd, strict=True)
     model.eval()
     return model
 

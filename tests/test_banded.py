@@ -1,21 +1,28 @@
 """
-Tests for the banded ("turned") Hi-C storage prototype (``manta_hic/io/banded.py``).
+Tests for the banded ("turned") Hi-C storage (``manta_hic/io/banded.py``).
 
 Three things are pinned down:
 1. **Round-trip** -- a window reconstructed from the band equals the direct dense submatrix (symmetry).
-2. **Eligibility** -- ``eligible_starts`` (prefix-sum inclusion criteria) matches a brute-force per-window
+2. **Eligibility** -- ``eligible_positions`` (prefix-sum inclusion criteria) matches a brute-force per-window
    check of the same criteria.
-3. **Target parity** -- feeding the reconstructed ``(hic, weight, exp)`` to the existing
-   ``create_expected_matrix`` yields the identical expected matrix as feeding the dense inputs, i.e. the
-   banded store reproduces the current training target exactly.
+3. **Target parity** -- feeding the reconstructed ``(hic, weight, exp)`` to ``create_expected_matrix`` yields the
+   identical expected matrix as feeding the dense inputs.
+
+The read side is a single owner, :class:`BandedHicFile`; these tests build a one-chromosome in-memory file via
+``from_arrays`` with ``resolution=1`` (so a global position, a local bin, and a base-pair coordinate coincide).
 """
 
 import numpy as np
 import pytest
 import torch
 
-from manta_hic.io.banded import BandedHicStore, band_from_dense, square_from_band
+from manta_hic.io.banded import BandedHicFile, band_from_dense, square_from_band
 from manta_hic.ops.hic_ops import create_expected_matrix
+
+
+def _positions(bf, n, **kw):
+    """Eligible global start positions (eligible_positions was removed; nonzero of the mask)."""
+    return np.nonzero(bf.eligible_mask(n, **kw))[0]
 
 
 def _symmetric_counts(L, C):
@@ -52,9 +59,9 @@ def test_band_rejects_out_of_range():
 
 
 # --------------------------------------------------------------------------- #
-# Fixture: a small chromosome with an excluded centromere, two arms, folds     #
+# Fixture: a one-chromosome file with an excluded centromere, two arms, folds   #
 # --------------------------------------------------------------------------- #
-def _make_store(n_bins=200, C=2, n_diag=24):
+def _make_file(n_bins=200, C=2, n_diag=24):
     rng = np.random.default_rng(1234)  # local + seeded: deterministic, order-independent
     M = _symmetric_counts(n_bins, C)
     weights = rng.uniform(0.2, 1.0, size=(C, n_bins)).astype(np.float32)
@@ -64,28 +71,33 @@ def _make_store(n_bins=200, C=2, n_diag=24):
     arm_id[:90] = 0
     arm_id[90:100] = -1
     arm_id[100:] = 1
-    weights[bad] = 0.0  # zero bad bins (bad is [C, n_bins], matching weights)
+    weights[bad] = 0.0
     # Borzoi-like contiguous fold blocks
     fold_id = np.zeros(n_bins, np.int32)
     fold_id[60:130] = 1
     fold_id[130:] = 2
     exp_per_arm = rng.uniform(0.1, 1.0, size=(C, 2, n_diag)).astype(np.float32)
     exp_per_arm[:, :, :2] = 0.0  # first two diagonals zeroed
-    store = BandedHicStore.from_dense(M, weights, bad, arm_id, fold_id, exp_per_arm, n_diag)
-    return store, M
+    band = band_from_dense(M, n_diag)
+    bf = BandedHicFile.from_arrays(
+        ["chr1"], [band], [weights], [bad], [arm_id], [fold_id], exp_per_arm, resolution=1, n_diag=n_diag
+    )
+    return bf, M
 
 
-def _brute_eligible(store, n, min_fraction, fold):
+def _brute_eligible(bf, n, max_bad_fraction, fold, overlap_threshold=0.9):
+    fset = None if fold is None else ({int(fold)} if np.isscalar(fold) else {int(x) for x in fold})
     out = []
-    for a in range(store.n_bins - n + 1):
-        seg_arm = store.arm_id[a : a + n]
+    for a in range(bf.total_bins - n + 1):
+        seg_arm = bf.arm_id[a : a + n]
         if seg_arm[0] == -1 or not np.all(seg_arm == seg_arm[0]):
             continue
-        if fold is not None and not np.all(store.fold_id[a : a + n] == fold):
+        win_mean = bf.bad[:, a : a + n].mean(axis=1)
+        if np.sqrt((win_mean**2).mean()) >= max_bad_fraction:
             continue
-        win_mean = store.bad[:, a : a + n].mean(axis=1)
-        if np.sqrt((win_mean**2).mean()) >= min_fraction:
-            continue
+        if fset is not None:  # keep if >= overlap_threshold of the window's bins are in the fold set
+            if np.isin(bf.fold_id[a : a + n], list(fset)).mean() < overlap_threshold:
+                continue
         out.append(a)
     return np.array(out, dtype=np.int64)
 
@@ -94,96 +106,95 @@ def _brute_eligible(store, n, min_fraction, fold):
 # 2. Eligibility == brute force, for every criterion                           #
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("n", [16, 32, 50])
-@pytest.mark.parametrize("min_fraction", [0.1, 0.5, 1.0])
+@pytest.mark.parametrize("max_bad_fraction", [0.1, 0.5, 1.0])
 @pytest.mark.parametrize("fold", [None, 0, 1, 2])
-def test_eligible_starts_matches_brute_force(n, min_fraction, fold):
-    store, _ = _make_store()
-    got = store.eligible_starts(n, min_fraction=min_fraction, fold=fold)
-    want = _brute_eligible(store, n, min_fraction, fold)
+def test_eligible_positions_match_brute_force(n, max_bad_fraction, fold):
+    bf, _ = _make_file()
+    got = _positions(bf, n, max_bad_fraction=max_bad_fraction, fold=fold)
+    want = _brute_eligible(bf, n, max_bad_fraction, fold)
     np.testing.assert_array_equal(got, want)
 
 
-def test_eligible_start_fraction_matches_store():
-    """The conversion's watch-metric helper must count exactly what eligible_starts(fold=None) returns."""
+def test_eligible_start_fraction_matches_file():
+    """The conversion's watch-metric helper must count exactly what eligible_positions(fold=None) returns."""
     from manta_hic.io.banded_write import eligible_start_fraction
 
-    store, _ = _make_store()
+    bf, _ = _make_file()
     for n, mf in [(16, 0.1), (16, 0.5), (32, 1.0)]:
-        frac, n_elig, n_cand = eligible_start_fraction(store.bad, store.arm_id, n, min_fraction=mf)
-        assert n_elig == len(store.eligible_starts(n, min_fraction=mf, fold=None))
+        frac, n_elig, n_cand = eligible_start_fraction(bf.bad, bf.arm_id, n, max_bad_fraction=mf)
+        assert n_elig == len(_positions(bf, n, max_bad_fraction=mf, fold=None))
         assert n_cand >= n_elig and (frac == (n_elig / n_cand if n_cand else 0.0))
 
 
 @pytest.mark.parametrize("n", [16, 32])
-@pytest.mark.parametrize("min_fraction", [0.1, 0.5, 1.0])
+@pytest.mark.parametrize("max_bad_fraction", [0.1, 0.5, 1.0])
 @pytest.mark.parametrize("fold", [None, 0, 1, 2])
-def test_is_eligible_matches_eligible_starts(n, min_fraction, fold):
-    """The O(1) single-window test must agree with the vectorized eligible_starts set for every bin."""
-    store, _ = _make_store()
-    starts = set(int(a) for a in store.eligible_starts(n, min_fraction=min_fraction, fold=fold))
-    for a in range(store.n_bins - n + 1):
-        assert store.is_eligible(a, n, min_fraction=min_fraction, fold=fold) == (a in starts)
+def test_is_eligible_matches_eligible_positions(n, max_bad_fraction, fold):
+    """The O(1) coordinate check must agree with the vectorized position set for every bin (resolution=1)."""
+    bf, _ = _make_file()
+    starts = set(int(a) for a in _positions(bf, n, max_bad_fraction=max_bad_fraction, fold=fold))
+    for a in range(bf.total_bins - n + 1):
+        assert bf.is_eligible("chr1", a, n, max_bad_fraction=max_bad_fraction, fold=fold) == (a in starts)
 
 
 def test_is_eligible_rejects_out_of_bounds_and_nonpositive():
-    store, _ = _make_store()
-    assert not store.is_eligible(store.n_bins - 5, 16)  # runs off the end
-    assert not store.is_eligible(-1, 16) and not store.is_eligible(0, 0)
+    bf, _ = _make_file()
+    assert not bf.is_eligible("chr1", bf.total_bins - 5, 16)  # runs off the end
+    assert not bf.is_eligible("chr1", 0, 0)
+    assert not bf.is_eligible("chrZ", 0, 16)  # unknown chromosome
 
 
-def test_eligible_starts_fold_set_is_union_of_single_folds():
-    """eligible_starts(fold={a,b}) must equal the union of the single-fold results (used for the train split)."""
-    store, _ = _make_store()
+def test_fold_fraction_tolerates_boundaries():
+    """A fold set keeps windows that are >= overlap_threshold in that set, so a superset {0,2} contains at least
+    the union of single-fold {0} and {2} windows, and every kept window is really >= 90% inside {0,2}."""
+    bf, _ = _make_file()
     n = 16
-    union = set(int(a) for f in (0, 2) for a in store.eligible_starts(n, fold=f))
-    got = set(int(a) for a in store.eligible_starts(n, fold={0, 2}))
-    assert got == union
-    assert 1 not in set(int(store.fold_id[a]) for a in got)  # fold 1 windows excluded
+    only0 = set(int(a) for a in _positions(bf, n, fold=0))
+    only2 = set(int(a) for a in _positions(bf, n, fold=2))
+    both = set(int(a) for a in _positions(bf, n, fold={0, 2}))
+    assert (only0 | only2) <= both
+    for a in both:
+        assert np.isin(bf.fold_id[a : a + n], [0, 2]).mean() >= 0.9
 
 
-def test_get_window_rejects_excluded_arm():
-    """get_window on a bin in an excluded region (arm_id=-1) must raise, not silently use the last arm."""
-    store, _ = _make_store()
-    n = 8
-    assert store.arm_id[92] == -1  # inside the excluded centromere [90,100)
+def test_window_at_rejects_excluded_arm():
+    bf, _ = _make_file()
+    assert bf.arm_id[92] == -1  # inside the excluded centromere [90,100)
     with pytest.raises(ValueError, match="excluded region"):
-        store.get_window(92, n)
+        bf.window_at(92, 8)
 
 
-def test_get_window_rejects_arm_crossing_and_nonpositive_n():
-    """A window that crosses an arm boundary (ambiguous per-arm exp) or has n<=0 must raise."""
-    store, _ = _make_store()
+def test_window_at_rejects_arm_crossing_and_nonpositive_n():
+    bf, _ = _make_file()
     with pytest.raises(ValueError, match="crosses an arm boundary"):
-        store.get_window(85, 20)  # [85,105) spans arm0 -> excluded -> arm1
+        bf.window_at(85, 20)  # [85,105) spans arm0 -> excluded -> arm1
     with pytest.raises(ValueError, match="must be positive"):
-        store.get_window(10, 0)
+        bf.window_at(10, 0)
 
 
 def test_eligibility_never_crosses_centromere_or_arm():
-    store, _ = _make_store()
+    bf, _ = _make_file()
     n = 16
-    for a in store.eligible_starts(n, min_fraction=1.0):
-        seg = store.arm_id[a : a + n]
+    for a in _positions(bf, n, max_bad_fraction=1.0):
+        seg = bf.arm_id[a : a + n]
         assert seg[0] != -1 and np.all(seg == seg[0])  # one arm, not excluded
-    # a window straddling the centromere [90,100) must never be returned
-    assert not any(a < 100 and a + n > 90 and a + n <= 100 for a in store.eligible_starts(n, min_fraction=1.0))
+    assert not any(a < 100 and a + n > 90 and a + n <= 100 for a in _positions(bf, n, max_bad_fraction=1.0))
 
 
 # --------------------------------------------------------------------------- #
 # 3. Target parity: banded reconstruction -> create_expected_matrix == dense   #
 # --------------------------------------------------------------------------- #
 def test_create_expected_matrix_parity():
-    store, M = _make_store()
+    bf, M = _make_file()
     n = 16
-    a = int(store.eligible_starts(n, min_fraction=1.0)[3])  # some valid window
-    arm = int(store.arm_id[a])
+    a = int(_positions(bf, n, max_bad_fraction=1.0)[3])  # some valid window
+    arm = int(bf.arm_id[a])
 
-    hic_b, weight_b, exp_b = store.get_window(a, n)  # from the band
+    hic_b, weight_b, exp_b = bf.window_at(a, n)  # from the band
     hic_d = M[:, a : a + n, a : a + n]  # from the dense matrix
-    weight_d = store.weights[:, a : a + n]
-    exp_d = store.exp[:, arm]
+    weight_d = bf.weights[:, a : a + n]
+    exp_d = bf.exp[:, arm]
 
-    # the reconstructions themselves must be identical
     np.testing.assert_array_equal(hic_b, hic_d)
     np.testing.assert_array_equal(weight_b, weight_d)
     np.testing.assert_array_equal(exp_b, exp_d)

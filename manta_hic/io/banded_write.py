@@ -13,7 +13,7 @@ over the whole genome:
 
 The band stores RAW counts (not zeroed at bad bins): the loss masks bad bins via the zeroed weights ->
 expected, and keeping raw counts means display shows real data everywhere. Tile eligibility is computed at
-sampling time from ``bad``/``arm_id``/``fold_id`` (see ``banded.BandedHicStore.eligible_starts``), so the
+sampling time from ``bad``/``arm_id``/``fold_id`` (see ``banded.BandedHicFile.eligible_mask``), so the
 window bad-fraction threshold is a knob, not baked in.
 
 See docs/HIC_STORAGE.md. The build side reads real coolers + cooltools, so it is meant to run un-sandboxed
@@ -189,10 +189,10 @@ def zero_bad_in_weights(weights, bad):
     return w
 
 
-def eligible_start_fraction(bad, arm_id, n, *, min_fraction=0.1):
+def eligible_start_fraction(bad, arm_id, n, *, max_bad_fraction=0.1):
     """
     Fraction of length-``n`` window starts that pass the arm-containment + RMS bad-fraction gate -- the
-    fold-agnostic case of :meth:`banded.BandedHicStore.eligible_starts`, and *the* number to watch across a
+    fold-agnostic case of :meth:`banded.BandedHicFile.eligible_mask`, and *the* number to watch across a
     conversion: the share of candidate training windows that survive coverage filtering. A sudden drop vs
     other resolutions/datasets means a coverage/balancing problem.
 
@@ -209,7 +209,7 @@ def eligible_start_fraction(bad, arm_id, n, *, min_fraction=0.1):
     arm_ok = (arm_changes[a + n - 1] - arm_changes[a] == 0) & (arm_id[a] != -1)
     bad_cum = np.concatenate([np.zeros((C, 1)), np.cumsum(bad.astype(np.float64), axis=1)], axis=1)
     win_mean = (bad_cum[:, a + n] - bad_cum[:, a]) / n
-    bad_ok = np.sqrt((win_mean**2).mean(axis=0)) < min_fraction
+    bad_ok = np.sqrt((win_mean**2).mean(axis=0)) < max_bad_fraction
     n_cand = int(arm_ok.sum())
     n_elig = int((arm_ok & bad_ok).sum())
     return (n_elig / n_cand if n_cand else 0.0), n_elig, n_cand
@@ -324,8 +324,10 @@ def coolers_to_banded(
     # The watch metric: fraction of candidate n_diag-windows that survive coverage filtering. Persisted in
     # the file (autonomous) so a conversion can be audited afterwards without recomputing. One source of
     # truth for the threshold so the recorded attr can't drift from the computed metric.
-    accept_min_fraction = 0.1
-    accept_frac, n_elig, n_cand = eligible_start_fraction(bad_all, arm_id_all, n_diag, min_fraction=accept_min_fraction)
+    accept_max_bad_fraction = 0.1
+    accept_frac, n_elig, n_cand = eligible_start_fraction(
+        bad_all, arm_id_all, n_diag, max_bad_fraction=accept_max_bad_fraction
+    )
 
     str_dt = h5py.string_dtype()
 
@@ -341,7 +343,7 @@ def coolers_to_banded(
                 accepted_fraction=accept_frac,
                 n_eligible=n_elig,
                 n_candidate=n_cand,
-                accept_min_fraction=accept_min_fraction,
+                accept_max_bad_fraction=accept_max_bad_fraction,
             )
         )
         prov = f.create_group("provenance")
