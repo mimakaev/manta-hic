@@ -81,7 +81,8 @@ class MantaInference:
         output_channels = int(cfg["output_channels"])
         config_channel_names = cfg.get("channel_names")
         self.genome = cfg.get("genome")  # the genome the model was trained on (None for older checkpoints)
-        legacy = bool(cfg.get("legacy", False))  # old checkpoints carry a BatchNorm in the 2D tower
+        # old checkpoints carry a BatchNorm in the 2D tower; honor the config flag, else detect it from the keys
+        legacy = bool(cfg.get("legacy", any(k.startswith("batchnorm_tower.") for k in state)))
         model_params = model_params or cfg.get("model_params")
 
         self.model = (

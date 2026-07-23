@@ -38,8 +38,10 @@ name=path``; or ``--models manifest.json`` (list of ``{name, input_file, [cache_
 import json
 import os
 import queue
+import sys
 import threading
 import time
+import traceback
 
 import click
 import numpy as np
@@ -53,9 +55,31 @@ from manta_hic.ops.hic_ops import coarsegrained_hic_corrs, create_expected_matri
 from manta_hic.ops.tensor_ops import torch_device_type
 
 CORR_NAMES = ["spearman", "pearson", "msd", "spearman_bm", "pearson_bm", "msd_bm"]
-RES_EPOCHS = {256: 20, 512: 30, 1024: 50, 2048: 100, 4096: 150, 8192: 200, 16384: 200}
+# How long to train the flagship per Hi-C resolution, from the 4096/8192/2048 convergence study (val 'combined'
+# stops growing -- there is no overfitting decay, it just plateaus). Coarser resolution needs many more epochs
+# (same number of *snippets* seen -- an epoch has fewer windows at coarse res). Two schedules:
+#   RES_EPOCHS       -- full convergence (~99% of peak).
+#   RES_EPOCHS_EARLY -- economical early stop (~95% of peak; where the curve visibly flattens).
+# 256/512/1024 are provisional (under test); 2048..16384 are measured.
+RES_EPOCHS = {256: 10, 512: 20, 1024: 30, 2048: 50, 4096: 80, 8192: 120, 16384: 160}
+RES_EPOCHS_EARLY = {256: 7, 512: 14, 1024: 20, 2048: 30, 4096: 40, 8192: 50, 16384: 60}
 N_BINS_DEFAULT = (512, 768, 896, 960, 1024)  # every distributed model sees these; upper range weighted
 DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+
+
+def _install_crash_on_uncaught():
+    """Make ANY uncaught exception -- in the main thread OR a background (prefetch) thread -- print its traceback
+    and hard-kill the whole process. The prefetch thread holds native h5py/CUDA locks; letting it (or the main
+    thread) die the normal way wedges interpreter shutdown, so the process hangs holding the GPU instead of
+    failing loudly. ``os._exit`` bypasses that shutdown. Installed at the start of a training run."""
+
+    def crash(exc_type, exc_value, exc_tb):
+        traceback.print_exception(exc_type, exc_value, exc_tb)
+        sys.stderr.flush()
+        os._exit(1)
+
+    sys.excepthook = crash
+    threading.excepthook = lambda a: crash(a.exc_type, a.exc_value, a.exc_traceback)
 
 
 def resolve_specs(input_file, model, models, cache_path, genome, params):
@@ -213,6 +237,7 @@ def train_manta_multi(
     bins_pad=64,
     batch_size=8,
     n_epochs=0,
+    early_stop=False,
     epoch_multiplier=1.0,
     lr=2e-4,
     val_fold=3,
@@ -223,6 +248,7 @@ def train_manta_multi(
     overlap_threshold=0.9,
     train_corr=False,
 ):
+    _install_crash_on_uncaught()  # any thread's uncaught error -> loud traceback + hard exit (never a silent hang)
     os.makedirs(output_dir, exist_ok=True)
     n_bins = sorted({int(x) for x in ([n_bins] if isinstance(n_bins, int) else n_bins)})
     max_nb = max(n_bins)
@@ -257,8 +283,22 @@ def train_manta_multi(
             raise ValueError(f"model {m.name!r} resolution {m.banded.resolution} != run resolution {res}")
         if m.banded.genome != genome:
             raise ValueError(f"model {m.name!r} genome {m.banded.genome!r} != run genome {genome!r}")
-        if m.banded.total_bins != models[0].banded.total_bins:
-            raise ValueError(f"model {m.name!r} does not share the genome axis (different chromosomes?)")
+
+    # Co-training needs a shared genome axis. Datasets may differ only by trailing chromosomes (e.g. chrY present
+    # in some files, absent in others); since chroms are in canonical order, the shared axis is their identical
+    # (chrom, n_bins) PREFIX -- a global position < common_bins maps to the same (chrom, start) in every model.
+    seqs = [[(c, m.banded.chrom_nbins[c]) for c in m.banded.chroms] for m in models]
+    common_bins = 0
+    for col in zip(*seqs):  # one chromosome position across all models
+        if len(set(col)) != 1:
+            break
+        common_bins += col[0][1]
+    if common_bins == 0:
+        raise ValueError("models share no common leading chromosome; cannot co-train them on one axis")
+    dropped = {m.name: m.banded.total_bins - common_bins for m in models if m.banded.total_bins != common_bins}
+    if dropped:
+        print(f"[train] shared axis = {common_bins} bins (common chrom prefix); trailing bins dropped per longer "
+              f"file: {dropped}", flush=True)
 
     # train/val fold split (folds are integer Borzoi ids and must be present in the file -- else error, no silent skip)
     present = set(models[0].banded.present_folds())
@@ -267,7 +307,7 @@ def train_manta_multi(
     train_folds, val_folds = present - {val_fold, test_fold}, {val_fold}
 
     if n_epochs == 0:
-        n_epochs = RES_EPOCHS.get(res, 50)
+        n_epochs = (RES_EPOCHS_EARLY if early_stop else RES_EPOCHS).get(res, 30 if early_stop else 50)
     n_epochs = max(1, int(n_epochs * epoch_multiplier))
     print(
         f"[train] res={res}bp n_bins={n_bins} bins_pad={bins_pad} genome={genome} epochs={n_epochs} "
@@ -284,7 +324,7 @@ def train_manta_multi(
                 [
                     m.banded.eligible_mask(
                         nb, max_bad_fraction=max_bad_fraction, fold=fold_set, overlap_threshold=overlap_threshold
-                    )
+                    )[: common_bins - nb + 1]  # truncate to the shared prefix so all models align + stack
                     for m in models
                 ],
                 axis=1,
@@ -325,7 +365,8 @@ def train_manta_multi(
             rows, hic, weight, exp = targets[mi]
             sub = acts[rows]
             to_t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device=device, dtype=torch.float32)
-            target, weightmat = create_expected_matrix(to_t(hic), to_t(weight), to_t(exp))
+            hic, weight, exp = to_t(hic), to_t(weight), to_t(exp)  # to tensors ONCE; the corr call below reuses them
+            target, weightmat = create_expected_matrix(hic, weight, exp)
             if train:
                 m.model.train()
                 m.opt.zero_grad()
@@ -476,7 +517,7 @@ file = click.Path(exists=True, dir_okay=False)
 @click.option(
     "--preset",
     type=click.Choice(sorted(MANTA_PRESETS)),
-    default="opt1M",
+    default="medium",
     help="Architecture size preset (see manta.MANTA_PRESETS); opt1M is the recommended small model.",
 )
 @click.option(
@@ -493,6 +534,7 @@ file = click.Path(exists=True, dir_okay=False)
 @click.option("--bins-pad", default=64, help="Padding bins.")
 @click.option("--batch-size", default=8, help="Batch size (shared fetch; one n_bins per batch, sized for max n_bins).")
 @click.option("--n-epochs", "-e", default=0, help="Epochs (0 = auto by resolution).")
+@click.option("--early-stop", is_flag=True, help="Use the economical early-stop schedule (~95% of peak) when --n-epochs is auto.")
 @click.option("--epoch-multiplier", default=1.0, type=float, help="Scale the epoch count.")
 @click.option("--lr", default=2e-4, help="Learning rate.")
 @click.option("--val-fold", default=3, type=int, help="Validation fold (integer Borzoi id, must be in the file).")
@@ -525,6 +567,7 @@ def train_manta_click(
     bins_pad,
     batch_size,
     n_epochs,
+    early_stop,
     epoch_multiplier,
     lr,
     val_fold,
@@ -548,6 +591,7 @@ def train_manta_click(
         bins_pad=bins_pad,
         batch_size=batch_size,
         n_epochs=n_epochs,
+        early_stop=early_stop,
         epoch_multiplier=epoch_multiplier,
         lr=lr,
         val_fold=val_fold,

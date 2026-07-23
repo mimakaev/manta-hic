@@ -132,7 +132,7 @@ class Manta(nn.Module):
         tower_height=2,
         transformer_layers=8,
         transformer_attn_dropout=0.05,
-        transformer_ff_dropout=0.4,
+        transformer_ff_dropout=0.25,
         transformer_n_heads=8,
         direct_2d_input_channels=64,
         direct_2d_channels=48,
@@ -356,23 +356,17 @@ def save_manta_checkpoint(
 # sweep) found, scored by ``combined`` = mean of raw and between-channel (cell-type
 # specific) coarse-grained Spearman, relative to the 29M "full" reference:
 #
-#   full       29.3M  the original Manta. Best raw structure (combined ~0.659) but
-#                     ~17x heavier / ~10x slower than opt1M for ~0.01 more.
-#   opt2M       2.84M  matches opt1M (~0.646). The extra 1D width buys nothing --
-#                     kept only to show the 1D backbone is not the bottleneck.
-#   opt1M       1.76M  RECOMMENDED baseline. Within ~0.006-0.013 per window of full
-#                     on a dense held-out head-to-head; generalizes (masahiro-10B
-#                     -0.011 vs full, same gap as krietenstein). The 1D transformer
-#                     does global routing; the 2D convs only refine locally, so a
-#                     small 2D tower loses very little.
-#   opt1M_th6   1.79M  opt1M with a deeper 2D tower (tower_2d_height 3 -> 6). The
-#                     extra Fibonacci-dilated blocks are ~free in params but widen
-#                     the 2D receptive field, which helps the slow between-channel /
-#                     differential signal. Used for the multi-dataset epoch sweep;
-#                     prefer it for multi-channel / cell-type-specific datasets.
-#   nano        0.94M  aggressive floor (~0.629). Still captures coarse biology
-#                     (e.g. dELS anti-insulation) but subtle/differential signal
-#                     starts to soften; use for laptop / extreme-throughput sweeps.
+#   full     29.3M  the original Manta. Best raw structure but ~10x slower than medium
+#                   for ~0.01 more combined; a reference / accuracy ceiling.
+#   medium    2.90M  the RECOMMENDED production model (the ablation "combined" flagship):
+#                   opt1M + the three wins from the 4096 architecture ablation --
+#                   transformer_layers=4, tower_2d_height=9, and an asymmetric 2D split
+#                   (lean direct / rich dilated tower). Beat every single-change variant
+#                   and the 1.76M baseline (+0.010 combined, most of it on the between-
+#                   channel / cell-type-specific signal). ~1.27x the baseline step time --
+#                   the cost is the deep 2D tower; the extra transformer layers are ~free.
+#   small    ~0.9M  PLACEHOLDER for a laptop / compute-time-optimized model at <4 output
+#                   channels -- to be tuned by a follow-up agent. Currently nano-sized.
 MANTA_PRESETS = {
     "full": dict(
         channels_1d=512,
@@ -384,37 +378,21 @@ MANTA_PRESETS = {
         direct_2d_input_channels=64,
         final_channels=32,
     ),
-    "opt2M": dict(
-        channels_1d=256,
-        transformer_layers=2,
-        tower_2d_height=3,
-        tower_2d_channels=16,
-        direct_2d_channels=16,
+    # medium = the flagship "combined" from the 4096 ablation: opt1M + transformer_layers=4 + tower_2d_height=9
+    # + an asymmetric 2D split (lean direct / rich dilated tower).
+    "medium": dict(
+        channels_1d=192,
+        transformer_layers=4,
+        tower_2d_height=9,
+        tower_2d_channels=24,
+        direct_2d_channels=8,
         tower_2d_input_channels=48,
-        direct_2d_input_channels=32,
+        direct_2d_input_channels=16,
         final_channels=16,
     ),
-    "opt1M": dict(
-        channels_1d=192,
-        transformer_layers=2,
-        tower_2d_height=3,
-        tower_2d_channels=16,
-        direct_2d_channels=16,
-        tower_2d_input_channels=32,
-        direct_2d_input_channels=24,
-        final_channels=16,
-    ),
-    "opt1M_th6": dict(
-        channels_1d=192,
-        transformer_layers=2,
-        tower_2d_height=6,
-        tower_2d_channels=16,
-        direct_2d_channels=16,
-        tower_2d_input_channels=32,
-        direct_2d_input_channels=24,
-        final_channels=16,
-    ),
-    "nano": dict(
+    # PLACEHOLDER -- a follow-up agent will optimize this for laptop / compute-time at <4 output channels.
+    # A shallow 2D tower (compute-cheap) + narrow channels; nano-sized starting point (~0.9M) for now.
+    "small": dict(
         channels_1d=128,
         transformer_layers=2,
         tower_2d_height=3,
