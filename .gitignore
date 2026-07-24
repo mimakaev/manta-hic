@@ -178,3 +178,6 @@ scripts-dev
 # Downloaded demo data -- the README stays tracked; the large files are downloaded, not committed
 example_notebooks/data/*
 !example_notebooks/data/README.md
+
+# Scripts for testing etc. 
+scripts

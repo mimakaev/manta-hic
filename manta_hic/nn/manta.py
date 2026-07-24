@@ -365,8 +365,20 @@ def save_manta_checkpoint(
 #                   and the 1.76M baseline (+0.010 combined, most of it on the between-
 #                   channel / cell-type-specific signal). ~1.27x the baseline step time --
 #                   the cost is the deep 2D tower; the extra transformer layers are ~free.
-#   small    ~0.9M  PLACEHOLDER for a laptop / compute-time-optimized model at <4 output
-#                   channels -- to be tuned by a follow-up agent. Currently nano-sized.
+#   small    2.66M  the LAPTOP / compute-time model (<=4 output channels). Tuned 2026-07 from a
+#                   fwd+bwd step-time attribution of medium (2048bp, bs8, oc4, bf16): the ENTIRE
+#                   cost is the 2D side -- the dilated tower plus the fixed full-resolution 2D convs.
+#                   The 1D backbone and transformer are ~free: channels_1d 192->96 saves 1.7% and
+#                   transformer_layers 4->2 saves 1.4% of step time, while the 2D tower knobs save
+#                   26% (height 9->5), 21% (width 5->3) and 16% (channels 24->16). So small KEEPS the
+#                   full-quality front-end (channels_1d=192, transformer_layers=4 -- both free) and
+#                   only trims the 2D tower geometry (height 9->5, width 5->3), keeping the rich
+#                   tower_2d_channels=24 that the medium ablation tied to cell-type-specific (between-
+#                   channel) signal. Result: 1.6x faster than medium at equal front-end capacity --
+#                   ~30 epochs @2048bp fit ~3h (n_bins=768) / ~4h (n_bins=1024) on a 1/10-of-4090
+#                   laptop (M4), with headroom for the 50-epoch full-convergence schedule. For more
+#                   speed at some quality risk, trim the tower further: height=3 or channels=16 each
+#                   buy ~1.85x, height=3+channels=16 ~2.1x (the front-end stays free regardless).
 MANTA_PRESETS = {
     "full": dict(
         channels_1d=512,
@@ -390,16 +402,18 @@ MANTA_PRESETS = {
         direct_2d_input_channels=16,
         final_channels=16,
     ),
-    # PLACEHOLDER -- a follow-up agent will optimize this for laptop / compute-time at <4 output channels.
-    # A shallow 2D tower (compute-cheap) + narrow channels; nano-sized starting point (~0.9M) for now.
+    # small = medium's (free) 1D/transformer front-end kept intact; only the 2D tower geometry is
+    # trimmed (height 9->5, width 5->3) while the rich tower_2d_channels=24 is retained. ~1.6x faster
+    # than medium for laptop training at <=4 channels. See the block comment above for the attribution.
     "small": dict(
-        channels_1d=128,
-        transformer_layers=2,
-        tower_2d_height=3,
-        tower_2d_channels=16,
-        direct_2d_channels=16,
-        tower_2d_input_channels=32,
-        direct_2d_input_channels=24,
+        channels_1d=192,
+        transformer_layers=4,
+        tower_2d_height=5,
+        tower_2d_channels=24,
+        tower_2d_width=3,
+        direct_2d_channels=8,
+        tower_2d_input_channels=48,
+        direct_2d_input_channels=16,
         final_channels=16,
     ),
 }

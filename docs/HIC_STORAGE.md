@@ -55,6 +55,17 @@ Source coolers (one per channel, sharing a bin grid) → one self-contained band
 - **Expected per arm**, not per window: `exp[C, n_arms, n_diag]` — the same vector for every window in an arm.
 - **Raw counts in the band** (not zeroed at bad bins): bad bins are masked in the loss via their zeroed
   *weights* → zeroed expected, so keeping raw counts costs nothing and makes display show real data.
+- **Chunk layout `(C, 256, n_diag)` + Blosc-zstd clevel 7, bitshuffle.** Reads are `band[:, a:a+n, :n]` (all
+  channels at once). A *full-width* chunk holding every channel reads a 1024-bin window ~1.3–1.5× faster than
+  a per-channel `(1, 512, n_diag)` chunk — but only with multi-threaded Blosc (`BLOSC_NTHREADS`): a 1-channel
+  ~1 MB chunk has too few Blosc blocks to spread across threads; a C-channel chunk does. **Blosc de/compresses
+  single-threaded unless `BLOSC_NTHREADS` is set** — set it on the reader (the loader reads in one thread, so
+  no oversubscription) to get the win; without threads the layouts are ~tied. 256 rows (not 512/1024) keeps
+  over-read on unaligned windows low; `n_diag` is left unchunked since reads always take `:n≤1024`. bitshuffle
+  beats byteshuffle (smaller *and* faster); Blosc2 was slower here. clevel 7 (vs 5) trims ~10% for negligible
+  read cost — worth it since these files are written once. The writer assembles all C channels per 8192-row
+  block and writes `band[:, b0:b1, :]` once (8192 is a multiple of 256), so writes land on whole chunks with
+  no read-modify-write despite the full-width channel dimension.
 
 ### The file is autonomous (no external manifest)
 Provenance is stored *in* the file, so nothing external is needed to train or plot:

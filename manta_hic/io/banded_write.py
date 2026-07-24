@@ -37,11 +37,11 @@ COUNT_CLIP = 32000  # clip raw counts to fit int16
 
 # Band codec: Blosc-zstd with BIT shuffle. On int16 Hi-C counts bitshuffle beats byteshuffle -- a further
 # ~19% smaller (Hi-C counts are small, so high bit-planes are mostly zero -> long zero runs) and ~2x faster
-# to compress, at the same read speed. Overall ~3x smaller than the original lzf. clevel=5 is the sweet spot;
-# clevel=9 shrinks a bit more but compresses much slower. Reading needs the Blosc filter registered --
-# `import hdf5plugin` (here and in io/banded.py) does that process-wide; the shuffle type is stored in the
-# stream, so readers un-shuffle automatically (no extra config).
-BAND_COMPRESSION = hdf5plugin.Blosc(cname="zstd", clevel=5, shuffle=hdf5plugin.Blosc.BITSHUFFLE)
+# to compress, at the same read speed. Overall ~3x smaller than the original lzf. clevel=7 (up from 5) shrinks
+# another ~10% for little extra read cost -- these files are written once, so we spend the compression time.
+# Reading needs the Blosc filter registered -- `import hdf5plugin` (here and in io/banded.py) does that
+# process-wide; the shuffle type is stored in the stream, so readers un-shuffle automatically (no extra config).
+BAND_COMPRESSION = hdf5plugin.Blosc(cname="zstd", clevel=7, shuffle=hdf5plugin.Blosc.BITSHUFFLE)
 
 
 # --------------------------------------------------------------------------- #
@@ -364,33 +364,37 @@ def coolers_to_banded(
         av.create_dataset("end", data=arms["end"].values.astype(np.int64))
         f.create_dataset("exp", data=exp)
 
-        block = 8192  # write granularity (transient memory ~ one block x n_diag int16 chunk, ~16 MB)
-        # HDF5 read chunk, decoupled from the write block. With the Blosc-zstd+shuffle codec (multi-threaded
-        # de/compress, see BAND_COMPRESSION) a 512-row chunk is the sweet spot: it reads a 1024-bin window
-        # faster than smaller chunks (bigger chunk -> more blocks -> the 4 threads parallelize decompression)
-        # AND compresses multi-threaded (~330 vs ~120 MB/s for a 128-row chunk, which starves the threads),
-        # at identical file size. Divides the 8192 write block so each write lands on whole chunks.
-        read_chunk = 512
+        block = 8192  # write granularity: assemble all C channels for a block, then one whole-chunk write
+        # HDF5 read-chunk layout, decoupled from the write block. Band reads are band[:, a:a+n, :n] (all
+        # channels, n<=1024 rows, first n diagonals). A FULL-WIDTH chunk holding every channel with 256 rows --
+        # (C, 256, n_diag) -- reads a 1024-bin window ~1.3-1.5x faster than the old per-channel (1, 512, n_diag),
+        # but ONLY with multi-threaded Blosc (set BLOSC_NTHREADS on the reader): a 1-channel ~1 MB chunk has too
+        # few Blosc blocks to spread across threads, a C-channel chunk does. NB Blosc de/compresses single-
+        # threaded unless BLOSC_NTHREADS is set. 256 rows (not 512/1024) keeps unaligned-window over-read low;
+        # n_diag stays unchunked since reads always take :n<=1024. 8192 is a multiple of 256, so each block
+        # write lands on whole chunks (no read-modify-write despite the full-width channel dim). See the
+        # chunk-layout benchmark in docs/HIC_STORAGE.md.
+        read_chunk = 256
         for chrom in use_chroms:
             lo, hi = coolers[0].extent(chrom)
             nb = hi - lo
             clen = int(coolers[0].chromsizes[chrom])
             g = f.create_group(chrom)
-            # Create the band dataset empty and fill it block-by-block per channel: transient memory is one
-            # (block x n_diag) int16 chunk (~16 MB), never the whole [C, nb, n_diag] chromosome (~GBs at
-            # 256 bp). Each (channel, block) is an independent read+write, so this also parallelizes.
+            # Fill block-by-block, all channels at once so each write covers whole (C, 256, n_diag) chunks
+            # (writing one channel at a time would read-modify-write the full-width chunk). Transient memory is
+            # one [C, block, n_diag] int16 slab (~C x 16 MB), never the whole [C, nb, n_diag] chromosome.
             band_ds = g.create_dataset(
                 "band",
                 shape=(C, nb, n_diag),
                 dtype=np.int16,
-                chunks=(1, min(read_chunk, nb), n_diag),
+                chunks=(C, min(read_chunk, nb), n_diag),
                 **BAND_COMPRESSION,
             )
-            for ci, clr in enumerate(coolers):
-                sel = clr.matrix(balance=False, as_pixels=True, join=False)
-                for b0 in range(0, nb, block):
-                    b1 = min(b0 + block, nb)
-                    band_ds[ci, b0:b1, :] = _band_block(sel, chrom, lo, nb, b0, b1, n_diag, resolution, clen)
+            sels = [clr.matrix(balance=False, as_pixels=True, join=False) for clr in coolers]
+            for b0 in range(0, nb, block):
+                b1 = min(b0 + block, nb)
+                block_cd = np.stack([_band_block(s, chrom, lo, nb, b0, b1, n_diag, resolution, clen) for s in sels])
+                band_ds[:, b0:b1, :] = block_cd
             g.create_dataset("weights", data=weight_all[:, lo:hi])
             g.create_dataset("bad", data=bad_all[:, lo:hi])
             g.create_dataset("arm_id", data=arm_id_all[lo:hi])
