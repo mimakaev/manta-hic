@@ -178,8 +178,8 @@ def create_expected_matrix(
     """
     Creates an expected matrix from weights and expected values, and adjusts the Hi-C snippet to match missing bins.
 
-    This function modifies the given Hi-C snippet based on provided weights and expected values,
-    while also generating a matching expected matrix.
+    Pure function: the inputs are not modified. Returns a copy of the snippet with zeros wherever the expected
+    matrix is zero (missing bins), plus the matching expected matrix.
 
     Parameters
     ----------
@@ -200,9 +200,7 @@ def create_expected_matrix(
 
     pred = torch.ones_like(snippet[:, 0], dtype=torch.float32).unsqueeze(1)  # [B,1, N, N]
     mask = weight == 0
-    weight[mask] = 1
-    weight = 1 / weight
-    weight[mask] = 0
+    weight = (1 / weight.masked_fill(mask, 1)).masked_fill(mask, 0)  # out-of-place: caller's weight is kept intact
 
     # Expand dimensions for broadcasting over N, N
     pred = pred * weight.unsqueeze(3) * weight.unsqueeze(2)  # [B, C, N, N]
@@ -217,8 +215,7 @@ def create_expected_matrix(
     expmat = torch.gather(exp, 2, dist_expanded)  # [B, C, N*N]
     pred = pred * expmat.view(dsize)  # [B, C, N, N]
 
-    final_mask = pred == 0
-    snippet[final_mask] = 0
+    snippet = snippet.masked_fill(pred == 0, 0)  # out-of-place: zeros at missing bins, input untouched
     return snippet, pred  # [B, C, N, N], [B, C, N, N]
 
 
@@ -239,6 +236,9 @@ def hic_hierarchical_loss(
     - Multinomial loss to measure discrepancies between predicted and observed data distributions.
     - Hierarchical loss through recursive aggregation in 2x2 blocks.
     - Sum matching loss to align total sums of predicted and observed matrices.
+
+    Pure function: ``pred_ooe`` / ``raw`` / ``exp_mat`` are not modified (all in-place work happens on clones).
+    ``N`` must be divisible by ``2 ** hierarchical_levels`` (16 by default) for the 2x2 aggregation.
 
     Parameters
     ----------
@@ -267,11 +267,14 @@ def hic_hierarchical_loss(
     epsilon = 1e-6  # Small value to avoid division by zero and log(0)
     huber_delta = 0.3  # Delta parameter for Huber loss
 
-    # Reshape tensors from [B, C, N, N] to [B*C, N, N]
+    # Reshape to [B*C, N, N] and clone: reshape of a contiguous tensor is a VIEW, and this function mutates its
+    # working copies in place (+= epsilon, masked zeroing). Cloning keeps the function pure -- the caller's
+    # pred/target tensors are untouched and safe to reuse for metrics. clone() is differentiable, so gradients
+    # still flow into pred_ooe.
     B, C, N, _ = raw.shape
-    raw = raw.reshape(-1, N, N).detach()  # [B*C, N, N]
-    pred_ooe = pred_ooe.reshape(-1, N, N)  # [B*C, N, N]
-    exp_mat = exp_mat.reshape(-1, N, N).detach()  # [B*C, N, N]
+    raw = raw.reshape(-1, N, N).detach().clone()  # [B*C, N, N]
+    pred_ooe = pred_ooe.reshape(-1, N, N).clone()  # [B*C, N, N]
+    exp_mat = exp_mat.reshape(-1, N, N).detach().clone()  # [B*C, N, N]
     batch_size = raw.shape[0]  # B*C
 
     # Create a mask for positions with zero expected values (those are missing bins)
@@ -447,8 +450,8 @@ def coarsegrained_hic_corrs(
           <something>2: Corresponding values after dividing by mean over channels
     """
 
-    # Calculate expected matrix from weights and expected values
-    raw, expected_matrix = create_expected_matrix(raw.clone(), weight, exp)
+    # Calculate expected matrix from weights and expected values (pure: raw/weight/exp are not modified)
+    raw, expected_matrix = create_expected_matrix(raw, weight, exp)
 
     # Compute OOE (observed-over-expected)
     # Avoid division by zero by setting expected_matrix zeros to NaN

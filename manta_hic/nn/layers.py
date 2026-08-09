@@ -308,6 +308,11 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     """Apply the rotary embedding to the Q/K tensors. The rotation is done in float32 (``xq``/``xk`` are cast up,
     ``freqs_cis`` is already complex64) and cast back to the caller's dtype -- so it is exact under bf16/fp16
     autocast, the classic silent-corruption spot for this llama-derived code."""
+    if not freqs_cis.is_complex():  # a real table = cos(theta) silently degrades rotation to scaling
+        raise TypeError(
+            f"freqs_cis must be complex, got {freqs_cis.dtype}. Did something call model.to(dtype=...)? "
+            "Module.to(dtype) casts complex buffers to real; use .to(device) / .float() / autocast instead."
+        )
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))  # [B, N, H, C/H] -> [B, N, H, C/(2*H)]
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))  # dtype: complex64
     if not freqs_cis.shape == (xq_.shape[1], xq_.shape[-1]):
