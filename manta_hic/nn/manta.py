@@ -94,7 +94,8 @@ class Manta(nn.Module):
     tower_2d_height : int
         Number of residual dilated blocks in the tower (Fibonacci dilation).
     final_channels : int
-        Channel dimension after joining the two 2D branches.
+        Channel dimension after joining the two 2D branches. Acts as a floor: it is auto-expanded up to the
+        smallest multiple of 8 that is >= 2 * output_channels, so one preset works for any channel count.
     output_channels : int
         Number of output channels in the final 2D convolution.
     checkpoint_first : bool
@@ -155,8 +156,14 @@ class Manta(nn.Module):
         self.conv_blocks_checkpoint = conv_blocks_checkpoint
         self.legacy = bool(legacy)
 
-        if final_channels < 2 * output_channels:
-            raise ValueError("Final channels must be at least 2 times the output channels.")
+        # The 2D tail needs final_channels >= 2 * output_channels (final_conv maps final_channels//2 -> output).
+        # Rather than reject, auto-expand final_channels UP to the smallest multiple of 8 that satisfies this, so
+        # a single fixed preset (e.g. medium's final_channels=16) works for any channel count without a per-model
+        # override. Multiple-of-8 keeps the GroupNorm groupings and the grouped join conv valid; the preset value
+        # is a floor, so low-channel models are untouched. The expansion is a deterministic function of
+        # (final_channels, output_channels), so a checkpoint reloads at the same shape without recording it.
+        min_final = -(-2 * output_channels // 8) * 8  # ceil(2*output_channels / 8) * 8
+        final_channels = max(final_channels, min_final)
 
         # One distance matrix at the max map size (n_bins), sliced for any smaller (variable) window -- the fixed
         # normalization (see calculate_distance_matrix) makes a slice equal a freshly-computed smaller matrix.

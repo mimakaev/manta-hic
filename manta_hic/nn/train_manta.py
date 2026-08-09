@@ -15,8 +15,10 @@ How the data pipeline is organized (all precomputed up front, pure numpy):
   bookkeeping, no per-model random draws that would break the shared fetch.
 * **Windows are sampled uniformly** over the superset (coverage proportional to the genome, not per-chromosome),
   with random reverse-complement.
-* **One epoch = the genome seen ~once in both directions** = ``2 * n_eligible / n_bins`` windows. With several
-  ``n_bins`` values (variable-window training) each contributes its own windows; a batch is homogeneous in
+* **One epoch = the genome seen ~once in both directions**, i.e. ``~2 * n_eligible`` bins of total window
+  coverage, regardless of how many ``n_bins`` sizes are trained: each size draws the same window count
+  (``2 * n_eligible / sum(n_bins)``), so variable-window training costs the same per epoch as single-window and
+  the RES_EPOCHS schedule (calibrated at ``n_bins=[1024]``) transfers directly. A batch is homogeneous in
   n_bins so activations stack.
 * **No activation cache.** Train and val are the same loop minus gradients; activations are fetched from disk,
   overlapped with GPU compute by a background prefetch thread. Validation windows are sampled once and frozen.
@@ -24,9 +26,9 @@ How the data pipeline is organized (all precomputed up front, pure numpy):
 Precision: params are always ``float32``; ``--compute-dtype`` picks the autocast math dtype -- ``bfloat16``
 (default, no scaler), ``float16`` (fp16 mixed, GradScaler on cuda/mps), or ``float32`` (plain fp32, no autocast).
 
-Default ``--n-bins`` is ``512,768,896,960,1024`` -- every distributed model is trained on all of these (weighted
-to the upper range) so it can be asked for any of them, and in particular for a 512-bin map (laptop / fast
-sweeps). Pass a single value (e.g. ``--n-bins 512``) to train one size.
+Default ``--n-bins`` is ``512,768,896,960,1024`` -- every distributed model is trained on all of these (equal
+window counts per size, sharing one genome-pass epoch) so it can be asked for any of them, and in particular for
+a 512-bin map (laptop / fast sweeps). Pass a single value (e.g. ``--n-bins 512``) to train one size.
 
 The checkpoint is the log: each model is one ``<output-dir>/<name>.pth`` re-saved as it trains, carrying its
 per-epoch ``history`` (mean train/val loss + mean of each correlation) in the config. No side-car folders.
@@ -53,8 +55,15 @@ from manta_hic.ops.hic_ops import coarsegrained_hic_corrs, create_expected_matri
 from manta_hic.ops.tensor_ops import torch_device_type
 
 CORR_NAMES = ["spearman", "pearson", "msd", "spearman_bm", "pearson_bm", "msd_bm"]
-RES_EPOCHS = {256: 20, 512: 30, 1024: 50, 2048: 100, 4096: 150, 8192: 200, 16384: 200}
-N_BINS_DEFAULT = (512, 768, 896, 960, 1024)  # every distributed model sees these; upper range weighted
+# How long to train the flagship per Hi-C resolution, from the 4096/8192/2048 convergence study (val 'combined'
+# stops growing -- there is no overfitting decay, it just plateaus). Coarser resolution needs many more epochs
+# (same number of *snippets* seen -- an epoch has fewer windows at coarse res). Two schedules:
+#   RES_EPOCHS       -- full convergence (~99% of peak).
+#   RES_EPOCHS_EARLY -- economical early stop (~95% of peak; where the curve visibly flattens).
+# 256/512/1024 are provisional (under test); 2048..16384 are measured.
+RES_EPOCHS = {256: 10, 512: 20, 1024: 30, 2048: 50, 4096: 80, 8192: 120, 16384: 160}
+RES_EPOCHS_EARLY = {256: 7, 512: 14, 1024: 20, 2048: 30, 4096: 40, 8192: 50, 16384: 60}
+N_BINS_DEFAULT = (512, 768, 896, 960, 1024)  # every distributed model sees these; equal window counts per size
 DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
 
 
@@ -139,11 +148,17 @@ def reduce_means(acc):
     return out
 
 
-def make_batches(sub, nb, batch_size, rng):
-    """Sample ~genome-once-in-both-directions = ``2 * n_eligible / n_bins`` windows (rounded up to a batch
-    multiple) uniformly from a superset ``{pos, elig}`` and cut them into homogeneous batches. Returns a list of
-    ``(nb, positions, elig, reverse)`` tuples, each of length ``batch_size``."""
-    nwin = int(np.ceil(2 * len(sub["pos"]) / nb / batch_size) * batch_size)
+def make_batches(sub, nb, batch_size, rng, sum_nb):
+    """Sample this size's share of a genome-once-in-both-directions epoch: ``2 * n_eligible / sum_nb`` windows
+    (rounded up to a batch multiple), where ``sum_nb`` is the total of ALL n_bins sizes trained in this run.
+    Every size draws the same window count, and summed over sizes the epoch covers ``~2 * n_eligible`` bins --
+    one forward + one reverse pass -- no matter how many sizes are trained (with a single size this reduces to
+    the classic ``2 * n_eligible / n_bins``). Windows are drawn uniformly from a superset ``{pos, elig}`` and cut
+    into homogeneous batches. Returns a list of ``(nb, positions, elig, reverse)`` tuples of length
+    ``batch_size``."""
+    nwin = int(np.ceil(2 * len(sub["pos"]) / sum_nb / batch_size) * batch_size)
+    if nwin == 0:  # empty pool (e.g. no-holdout run's val split)
+        return []
     rows = rng.integers(0, len(sub["pos"]), size=nwin)
     positions, elig, rev = sub["pos"][rows], sub["elig"][rows], (rng.random(nwin) < 0.5)
     return [
@@ -260,11 +275,14 @@ def train_manta_multi(
         if m.banded.total_bins != models[0].banded.total_bins:
             raise ValueError(f"model {m.name!r} does not share the genome axis (different chromosomes?)")
 
-    # train/val fold split (folds are integer Borzoi ids and must be present in the file -- else error, no silent skip)
+    # train/val fold split (folds are integer Borzoi ids and must be present in the file -- else error, no silent
+    # skip). --val-fold -1 = NO holdout: train on every fold, no validation (production models on an 'all' cache).
+    all_folds = val_fold < 0
     present = set(models[0].banded.present_folds())
-    if val_fold not in present or test_fold not in present:
+    if not all_folds and (val_fold not in present or test_fold not in present):
         raise ValueError(f"val_fold {val_fold} / test_fold {test_fold} not among the file's folds {sorted(present)}")
-    train_folds, val_folds = present - {val_fold, test_fold}, {val_fold}
+    train_folds = None if all_folds else present - {val_fold, test_fold}  # None -> eligible_mask skips fold rule
+    val_folds = set() if all_folds else {val_fold}
 
     if n_epochs == 0:
         n_epochs = RES_EPOCHS.get(res, 50)
@@ -280,6 +298,9 @@ def train_manta_multi(
     for nb in n_bins:
         entry = {}
         for split, fold_set in (("train", train_folds), ("val", val_folds)):
+            if split == "val" and not val_folds:  # no-holdout run: empty val pool -> zero val batches downstream
+                entry["val"] = {"pos": np.zeros(0, np.int64), "elig": np.zeros((0, len(models)), bool)}
+                continue
             E = np.stack(
                 [
                     m.banded.eligible_mask(
@@ -306,7 +327,7 @@ def train_manta_multi(
     val_rng = np.random.default_rng(12345)
     val_batches = []
     for nb in n_bins:
-        val_batches += make_batches(index[nb]["val"], nb, batch_size, val_rng)
+        val_batches += make_batches(index[nb]["val"], nb, batch_size, val_rng, sum(n_bins))
     print(
         f"[train] frozen val: {sum(b[2].shape[0] for b in val_batches)} windows in {len(val_batches)} batches",
         flush=True,
@@ -363,7 +384,7 @@ def train_manta_multi(
     for epoch in range(n_epochs):
         train_batches = []  # re-sampled each epoch; homogeneous-n_bins batches, shuffled together
         for nb in n_bins:
-            train_batches += make_batches(index[nb]["train"], nb, batch_size, rng)
+            train_batches += make_batches(index[nb]["train"], nb, batch_size, rng, sum(n_bins))
         rng.shuffle(train_batches)
 
         t0 = time.time()
@@ -495,7 +516,9 @@ file = click.Path(exists=True, dir_okay=False)
 @click.option("--n-epochs", "-e", default=0, help="Epochs (0 = auto by resolution).")
 @click.option("--epoch-multiplier", default=1.0, type=float, help="Scale the epoch count.")
 @click.option("--lr", default=2e-4, help="Learning rate.")
-@click.option("--val-fold", default=3, type=int, help="Validation fold (integer Borzoi id, must be in the file).")
+@click.option("--val-fold", default=3, type=int,
+              help="Validation fold (integer Borzoi id, must be in the file). -1 = NO holdout: train on every "
+                   "fold with no validation (production models on an 'all' cache; --test-fold is then ignored).")
 @click.option("--test-fold", default=4, type=int, help="Test fold (integer Borzoi id, held out, not evaluated here).")
 @click.option("--save-every", default=5, help="Re-save each <name>.pth every N epochs (always at the end).")
 @click.option(
