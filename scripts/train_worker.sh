@@ -9,11 +9,12 @@
 # directory. <folds> (12/34/56/70/all) picks the split: XY -> --val-fold X --test-fold Y;
 # 'all' -> no holdout (train on every fold, no validation).
 #
-# Banded inputs are rsynced once to $TMP_BANDED (network is slow); models + train.log go to
+# Per resolution, the banded slice is rsynced to $TMP_BANDED (network is slow), trained, then deleted;
+# models + train.log go to
 #   $MANTA_ROOT/trained_models/<genome>/folds_<folds>/<res>/
 # A resolution whose output folder already exists is SKIPPED -- delete partials manually to retrain.
-# Overridable env: MANTA_ROOT, BATCH_SIZE, TMP_BANDED (put it on a DISK-backed path: hg38 is ~150 GB,
-# a tmpfs /tmp would eat that much RAM).
+# Overridable env: MANTA_ROOT, BATCH_SIZE, TMP_BANDED (needs up to ~45 GB for hg38@256, ~15 GB mm10;
+# put it on a DISK-backed path if /tmp is tmpfs).
 
 set -euo pipefail
 
@@ -39,15 +40,15 @@ echo "[worker] genome=$GENOME gpu=$GPU folds=$FOLDS (val=$VAL test=$TEST) cache=
 command -v manta_hic >/dev/null || { echo "manta_hic not on PATH" >&2; exit 1; }
 [ -d "$MANTA_ROOT/banded_inputs/$GENOME" ] || { echo "no $MANTA_ROOT/banded_inputs/$GENOME" >&2; exit 1; }
 
-# -- local copy of the banded inputs (idempotent) ------------------------------------------------ #
-mkdir -p "$TMP_BANDED"
-rsync -a --info=progress2 "$MANTA_ROOT/banded_inputs/$GENOME/" "$TMP_BANDED/"
-
 # -- one co-training run per resolution, fine-tuned order ---------------------------------------- #
+# Only the current resolution's banded slice is copied to $TMP_BANDED (4-45 GB vs 150 GB for the whole
+# genome) and it is deleted after a successful run; a failed run leaves it for the rerun (rsync skips
+# already-copied files).
+mkdir -p "$TMP_BANDED"
 for RES in "${RES_ORDER[@]}"; do
     OUT=$MANTA_ROOT/trained_models/$GENOME/folds_$FOLDS/$RES
-    FILES=("$TMP_BANDED"/*_"$RES".bhic.h5)
-    if [ ! -e "${FILES[0]}" ]; then
+    SRC=("$MANTA_ROOT/banded_inputs/$GENOME/"*_"$RES".bhic.h5)
+    if [ ! -e "${SRC[0]}" ]; then
         echo "[worker] $RES: no banded files for $GENOME, skipping"
         continue
     fi
@@ -55,6 +56,9 @@ for RES in "${RES_ORDER[@]}"; do
         echo "[worker] $RES: $OUT exists, skipping (delete it to retrain)"
         continue
     fi
+    echo "[worker] $RES: copying ${#SRC[@]} banded files to $TMP_BANDED"
+    rsync -a --info=progress2 "${SRC[@]}" "$TMP_BANDED/"
+    FILES=("$TMP_BANDED"/*_"$RES".bhic.h5)
     mkdir -p "$OUT"
     ARGS=()
     for f in "${FILES[@]}"; do
@@ -65,5 +69,6 @@ for RES in "${RES_ORDER[@]}"; do
     manta_hic train manta "${ARGS[@]}" -c "$CACHE" -o "$OUT" -g "$GENOME" \
         --batch-size="$BATCH_SIZE" --val-fold="$VAL" --test-fold="$TEST" -d "cuda:$GPU" \
         2>&1 | tee "$OUT/train.log"
+    rm -f "${FILES[@]}"                     # reclaim /tmp; next resolution brings its own slice
 done
 echo "[worker] $GENOME ALL DONE"
