@@ -149,6 +149,12 @@ class Manta(nn.Module):
         legacy=False,
     ):
         super(Manta, self).__init__()
+        # Fail at init, not mid-training: the tower 2D branch maxpools n_bins (floor) then deconvs back (x2), so
+        # an odd n_bins crashes the branch join; bins_pad=0 makes the [bins_pad:-bins_pad] crop an empty slice.
+        if n_bins % 2:
+            raise ValueError(f"n_bins must be even (tower branch pools/upsamples by 2), got {n_bins}")
+        if bins_pad < 1:
+            raise ValueError(f"bins_pad must be >= 1, got {bins_pad}")
         self.n_bins = n_bins
         self.bins_pad = bins_pad
         self.channels_1d = channels_1d
@@ -158,10 +164,10 @@ class Manta(nn.Module):
 
         # The 2D tail needs final_channels >= 2 * output_channels (final_conv maps final_channels//2 -> output).
         # Rather than reject, auto-expand final_channels UP to the smallest multiple of 8 that satisfies this, so
-        # a single fixed preset (e.g. medium's final_channels=16) works for any channel count without a per-model
+        # a single fixed preset (e.g. opt1M's final_channels=16) works for any channel count without a per-model
         # override. Multiple-of-8 keeps the GroupNorm groupings and the grouped join conv valid; the preset value
-        # is a floor, so low-channel models are untouched. The expansion is a deterministic function of
-        # (final_channels, output_channels), so a checkpoint reloads at the same shape without recording it.
+        # is a floor, so low-channel models are untouched. save_manta_checkpoint records the *effective*
+        # (post-expansion) value in the config, so reload never depends on re-deriving this formula.
         min_final = -(-2 * output_channels // 8) * 8  # ceil(2*output_channels / 8) * 8
         final_channels = max(final_channels, min_final)
 
@@ -341,7 +347,13 @@ def save_manta_checkpoint(
     if channel_names is not None:
         config["channel_names"] = list(channel_names)
     if model_params:
-        config["model_params"] = dict(model_params)
+        mp = dict(model_params)
+        # Record the EFFECTIVE final_channels (join_conv's out width), not the pre-auto-expansion floor the
+        # caller configured: the config must describe the tensors actually saved, and reload must not depend on
+        # the ceil-to-8 expansion formula staying frozen forever. (Manta.__init__ max()es with the derived
+        # minimum, so feeding the effective value back is a no-op there.)
+        mp["final_channels"] = int(model.join_conv.conv.out_channels)
+        config["model_params"] = mp
     if history is not None:
         config["history"] = list(history)
     if train_meta is not None:

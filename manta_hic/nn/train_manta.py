@@ -119,9 +119,12 @@ class _Model:
         for k in ("tower_height", "n_bins", "bins_pad"):
             prm.pop(k, None)
         self.model_arch = prm
+        # NOTE: ``.to(device)`` only -- never ``.to(dtype=...)`` on the module. Params are already float32 at
+        # init, and ``Module.to(dtype)`` also casts complex buffers, silently turning the rotary ``freqs_cis``
+        # table (complex64 e^{i*theta}) into its real part cos(theta) -- rotation degrades to scaling.
         self.model = Manta(
             n_bins=max_n_bins, bins_pad=bins_pad, tower_height=tower_h, output_channels=self.nch, **prm
-        ).to(device=device, dtype=torch.float32)
+        ).to(device)
         self.opt = optim.Adam(self.model.parameters(), lr=lr)
         self.n_params = sum(p.numel() for p in self.model.parameters())
         self.history = []
@@ -169,54 +172,84 @@ def make_batches(sub, nb, batch_size, rng, sum_nb):
 
 class _Prefetcher:
     """Single background thread (so the one h5py file set is touched by one thread only) that materializes each
-    batch -- shared activation fetch + per-eligible-model target windows -- while the main thread runs the GPU."""
+    batch -- shared activation fetch + per-eligible-model target windows -- while the main thread runs the GPU.
+
+    Failure handling (both directions, so neither side can ever hang the other):
+
+    * Worker fails (missing chromosome, out-of-range fetch, arm-boundary window, ...): the exception object is
+      put on the queue instead of a batch, and ``__iter__`` re-raises it in the main thread -- training dies
+      loudly with the worker's traceback instead of blocking forever on an empty queue.
+    * Consumer exits early (exception in the training step, generator closed): ``__iter__``'s ``finally`` sets
+      a stop event; the worker's queue puts time out, notice it, and the thread returns instead of blocking
+      forever on a full queue.
+    """
 
     def __init__(self, batches, models, fetcher, *, bins_pad, res, n_runs_fn, queue_size=3):
         self.batches, self.models, self.fetcher = batches, models, fetcher
         self.bins_pad, self.res, self.n_runs_fn = bins_pad, res, n_runs_fn
         self.q = queue.Queue(maxsize=queue_size)
+        self._stop = threading.Event()
+
+    def _put(self, item):
+        """Blocking put that gives up (returns False) once the consumer is gone."""
+        while not self._stop.is_set():
+            try:
+                self.q.put(item, timeout=1.0)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def _work(self):
-        for nb, positions, elig, rev in self.batches:
-            acts = []
-            for pos, rc in zip(positions, rev):
-                chrom, start_bp = self.models[0].banded.pos_to_coord(int(pos))  # same coord for all models
-                acts.append(
-                    self.fetcher.fetch(
-                        chrom,
-                        start_bp - self.bins_pad * self.res,
-                        start_bp + (nb + self.bins_pad) * self.res,
-                        reverse=bool(rc),
-                        n_runs=self.n_runs_fn(),
-                        device="cpu",
+        try:
+            for nb, positions, elig, rev in self.batches:
+                acts = []
+                for pos, rc in zip(positions, rev):
+                    chrom, start_bp = self.models[0].banded.pos_to_coord(int(pos))  # same coord for all models
+                    acts.append(
+                        self.fetcher.fetch(
+                            chrom,
+                            start_bp - self.bins_pad * self.res,
+                            start_bp + (nb + self.bins_pad) * self.res,
+                            reverse=bool(rc),
+                            n_runs=self.n_runs_fn(),
+                            device="cpu",
+                        )
                     )
-                )
-            targets = {}
-            for mi, m in enumerate(self.models):
-                rows = np.nonzero(elig[:, mi])[0]
-                if not len(rows):
-                    continue
-                hs, ws, es = [], [], []
-                for r in rows:
-                    hic, weight, exp = m.banded.window_at(int(positions[r]), nb)
-                    if rev[r]:  # reverse-complement flips the map on both axes and the weights on one
-                        hic, weight = hic[:, ::-1, ::-1], weight[:, ::-1]
-                    hs.append(np.ascontiguousarray(hic))
-                    ws.append(np.ascontiguousarray(weight))
-                    es.append(np.ascontiguousarray(exp))
-                targets[mi] = (rows, np.stack(hs), np.stack(ws), np.stack(es))
-            self.q.put((nb, torch.stack(acts), elig, targets))
-        self.q.put(None)
+                targets = {}
+                for mi, m in enumerate(self.models):
+                    rows = np.nonzero(elig[:, mi])[0]
+                    if not len(rows):
+                        continue
+                    hs, ws, es = [], [], []
+                    for r in rows:
+                        hic, weight, exp = m.banded.window_at(int(positions[r]), nb)
+                        if rev[r]:  # reverse-complement flips the map on both axes and the weights on one
+                            hic, weight = hic[:, ::-1, ::-1], weight[:, ::-1]
+                        hs.append(np.ascontiguousarray(hic))
+                        ws.append(np.ascontiguousarray(weight))
+                        es.append(np.ascontiguousarray(exp))
+                    targets[mi] = (rows, np.stack(hs), np.stack(ws), np.stack(es))
+                if not self._put((nb, torch.stack(acts), elig, targets)):
+                    return
+            self._put(None)  # normal end-of-batches sentinel
+        except BaseException as e:  # noqa: B036 -- deliver ANY worker failure to the main thread
+            self._put(e)
 
     def __iter__(self):
-        t = threading.Thread(target=self._work, daemon=True)
+        t = self._thread = threading.Thread(target=self._work, daemon=True)
         t.start()
-        while True:
-            item = self.q.get()
-            if item is None:
-                break
-            yield item
-        t.join()
+        try:
+            while True:
+                item = self.q.get()
+                if item is None:
+                    break
+                if isinstance(item, BaseException):
+                    raise item  # re-raise in the main thread; carries the worker's traceback
+                yield item
+        finally:
+            self._stop.set()  # unblock the worker if we exited early (exception / generator close)
+            t.join(timeout=60)  # bounded by one in-flight fetch; a daemon thread can't outlive the process anyway
 
 
 def train_manta_multi(
@@ -240,6 +273,9 @@ def train_manta_multi(
 ):
     os.makedirs(output_dir, exist_ok=True)
     n_bins = sorted({int(x) for x in ([n_bins] if isinstance(n_bins, int) else n_bins)})
+    bad_nb = [nb for nb in n_bins if nb % 16]
+    if bad_nb:  # hic_hierarchical_loss aggregates 2x2 blocks over 4 levels; Manta itself needs even n_bins
+        raise ValueError(f"--n-bins values must be divisible by 16 (hierarchical loss), got {bad_nb}")
     max_nb = max(n_bins)
     dev_type = torch_device_type(device)
     # params are float32; compute_dtype is the autocast math dtype. fp32 -> no autocast; fp16 -> GradScaler.
@@ -272,8 +308,16 @@ def train_manta_multi(
             raise ValueError(f"model {m.name!r} resolution {m.banded.resolution} != run resolution {res}")
         if m.banded.genome != genome:
             raise ValueError(f"model {m.name!r} genome {m.banded.genome!r} != run genome {genome!r}")
-        if m.banded.total_bins != models[0].banded.total_bins:
-            raise ValueError(f"model {m.name!r} does not share the genome axis (different chromosomes?)")
+        # The genome axis must match EXACTLY (same chromosomes, same order, same per-chrom bin counts): the
+        # prefetcher resolves every window's coordinate through models[0] while each model slices its own file at
+        # the same global pos, so a reordered/subset chrom axis would silently pair activations with the wrong
+        # targets. total_bins equality alone cannot catch a pure reordering.
+        if m.banded.chroms != models[0].banded.chroms or m.banded.chrom_nbins != models[0].banded.chrom_nbins:
+            raise ValueError(
+                f"model {m.name!r} does not share the genome axis with {models[0].name!r}: "
+                f"chroms {m.banded.chroms} (bins {m.banded.chrom_nbins}) != "
+                f"{models[0].banded.chroms} (bins {models[0].banded.chrom_nbins})"
+            )
 
     # train/val fold split (folds are integer Borzoi ids and must be present in the file -- else error, no silent
     # skip). --val-fold -1 = NO holdout: train on every fold, no validation (production models on an 'all' cache).
@@ -346,7 +390,8 @@ def train_manta_multi(
             rows, hic, weight, exp = targets[mi]
             sub = acts[rows]
             to_t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device=device, dtype=torch.float32)
-            target, weightmat = create_expected_matrix(to_t(hic), to_t(weight), to_t(exp))
+            hic_t, weight_t, exp_t = to_t(hic), to_t(weight), to_t(exp)
+            target, weightmat = create_expected_matrix(hic_t, weight_t, exp_t)
             if train:
                 m.model.train()
                 m.opt.zero_grad()
@@ -361,9 +406,13 @@ def train_manta_multi(
                 scalers[mi].update()
             corr = None
             if not train or train_corr:
-                cc = coarsegrained_hic_corrs(pred.detach().float(), target, weight, exp, also_divide_by_mean=True)
+                # Correlate over valid-bin pixels only: zero the bad bins in pred to match target (which
+                # create_expected_matrix already zeroed there), so hic_corrs' nonzero mask drops them on both
+                # sides. Done explicitly here -- the loss is pure and no longer zeroes pred as a side effect.
+                pred_c = pred.detach().float().masked_fill(weightmat == 0, 0)
+                cc = coarsegrained_hic_corrs(pred_c, target, weight_t, exp_t, also_divide_by_mean=True)
                 corr = [float(np.nanmean(x.cpu().numpy())) for x in cc]
-            out[mi] = (float(loss), corr)
+            out[mi] = (loss.detach().item(), corr)  # detach first: float() on a grad-carrying tensor warns
         return out
 
     meta = dict(
