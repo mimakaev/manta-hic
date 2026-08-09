@@ -135,9 +135,13 @@ class MantaInference:
         return self.device.type if isinstance(self.device, torch.device) else str(self.device).split(":")[0]
 
     def _run(self, acts):
-        """Run the model on a ``[in_channels, L]`` activation tensor -> ``[output_channels, n_bins, n_bins]``."""
+        """Run the model on a ``[in_channels, L]`` activation tensor -> ``[output_channels, n_bins, n_bins]``.
+
+        Transfer-then-cast (``.to(device).float()``, here and in :meth:`_forward_flip_slice` / :meth:`target`):
+        casting first would widen the f16 activations on the CPU and double the PCIe traffic -- measured ~4x
+        slower for these shapes."""
         with torch.autocast(self._device_type()):
-            return self.model(acts.unsqueeze(0).float().to(self.device))[0]
+            return self.model(acts.unsqueeze(0).to(self.device).float())[0]
 
     @torch.no_grad()
     def predict(self, chrom, start_bp, *, n_runs=1, average_reverse=False, run_idx=None):
@@ -214,7 +218,7 @@ class MantaInference:
         out = []
         for i in range(0, len(specs), batch_size):
             chunk = specs[i : i + batch_size]
-            batch = torch.stack([a.float() for a in acts_list[i : i + batch_size]]).to(self.device)
+            batch = torch.stack(acts_list[i : i + batch_size]).to(self.device).float()  # native-dtype transfer
             with torch.autocast(dev_type):
                 maps = self.model(batch).float()  # [b, output_channels, n, n], native (maybe RC) orientation
             for spec, m in zip(chunk, maps):
@@ -366,7 +370,7 @@ class MantaInference:
         if adaptive_coarsegrain and not observed_over_expected:
             raise ValueError("adaptive_coarsegrain=True requires observed_over_expected=True")
         hic, weight, exp = self.target_file.get_window(chrom, start_bp, self.n_bins)
-        t = lambda x: torch.from_numpy(np.ascontiguousarray(x)).float().unsqueeze(0).to(self.device)
+        t = lambda x: torch.from_numpy(np.ascontiguousarray(x)).unsqueeze(0).to(self.device).float()
         snippet, expmat = create_expected_matrix(t(hic), t(weight), t(exp))
         if not observed_over_expected:
             return snippet[0]
