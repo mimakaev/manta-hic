@@ -392,7 +392,7 @@ def train_manta_multi(
                 continue
             rows, hic, weight, exp = targets[mi]
             sub = acts[rows]
-            to_t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device).to(torch.float32)
+            to_t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device=device, dtype=torch.float32)
             hic_t, weight_t, exp_t = to_t(hic), to_t(weight), to_t(exp)
             target, weightmat = create_expected_matrix(hic_t, weight_t, exp_t)
             if train:
