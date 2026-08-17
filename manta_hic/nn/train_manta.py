@@ -382,7 +382,10 @@ def train_manta_multi(
 
     def run_batch(nb, acts, elig, targets, *, train):
         """One shared batch across all eligible models. Returns {mi: (loss, corr6|None)} of per-window means."""
-        acts = acts.to(device=device, dtype=torch.float32)
+        # Transfer in the native (narrow) dtype and upcast on the GPU. ``.to(device, dtype=...)`` would cast on
+        # the CPU first (single-threaded) and ship the widened bytes -- measured ~4x slower for these tensors
+        # (acts f16 [8,1032,2304]: 13.6 -> 3.5 ms; hic int16 [8,5,1024,1024]: 29 -> 7.5 ms on a 4090).
+        acts = acts.to(device).to(torch.float32)
         out = {}
         for mi, m in enumerate(models):
             if mi not in targets:

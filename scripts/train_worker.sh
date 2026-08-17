@@ -14,7 +14,7 @@
 #   $MANTA_ROOT/trained_models/<genome>/folds_<folds>/<res>/
 # A resolution whose output folder already exists is SKIPPED -- delete partials manually to retrain.
 # Overridable env: MANTA_ROOT, BATCH_SIZE, TMP_BANDED (needs up to ~45 GB for hg38@256, ~15 GB mm10;
-# put it on a DISK-backed path if /tmp is tmpfs).
+# put it on a DISK-backed path if /tmp is tmpfs), EPOCH_MULT.
 
 set -euo pipefail
 
@@ -36,7 +36,12 @@ CACHE=$(readlink -f "${CACHES[0]}")
 FOLDS=$(basename "$CACHE" .h5)
 FOLDS=${FOLDS##*_}
 if [ "$FOLDS" = all ]; then VAL=-1 TEST=-1; else VAL=${FOLDS:0:1} TEST=${FOLDS:1:1}; fi
-echo "[worker] genome=$GENOME gpu=$GPU folds=$FOLDS (val=$VAL test=$TEST) cache=$CACHE"
+# On the 'all' cache we deliberately overtrain (2x epochs): with every fold in the training set this
+# basically "improves the resolution" of the predicted Hi-C. It should retain predictive capability --
+# when a regular (held-out) model was overtrained 5x by mistake, its validation loss stabilized but
+# did not decline.
+if [ "$FOLDS" = all ]; then EPOCH_MULT=${EPOCH_MULT:-2}; else EPOCH_MULT=${EPOCH_MULT:-1}; fi
+echo "[worker] genome=$GENOME gpu=$GPU folds=$FOLDS (val=$VAL test=$TEST epoch_mult=$EPOCH_MULT) cache=$CACHE"
 command -v manta_hic >/dev/null || { echo "manta_hic not on PATH" >&2; exit 1; }
 [ -d "$MANTA_ROOT/banded_inputs/$GENOME" ] || { echo "no $MANTA_ROOT/banded_inputs/$GENOME" >&2; exit 1; }
 
@@ -67,7 +72,8 @@ for RES in "${RES_ORDER[@]}"; do
     done
     echo "[worker] $RES: ${#FILES[@]} datasets -> $OUT"
     manta_hic train manta "${ARGS[@]}" -c "$CACHE" -o "$OUT" -g "$GENOME" \
-        --batch-size="$BATCH_SIZE" --val-fold="$VAL" --test-fold="$TEST" -d "cuda:$GPU" \
+        --batch-size="$BATCH_SIZE" --val-fold="$VAL" --test-fold="$TEST" \
+        --epoch-multiplier="$EPOCH_MULT" -d "cuda:$GPU" \
         2>&1 | tee "$OUT/train.log"
     rm -f "${FILES[@]}"                     # reclaim /tmp; next resolution brings its own slice
 done
