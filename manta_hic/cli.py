@@ -3,6 +3,7 @@
 import click
 
 from .nn.fill_cache import populate_microzoi_cache as fill_cache_original
+from .nn.save_cooler import make_mcool_cli, save_cooler_cli
 from .nn.train_manta import train_manta_click
 from .nn.train_microzoi import train_microzoi
 
@@ -73,6 +74,16 @@ def io():
 
 
 io.add_command(fill_cache)
+
+
+@cli.group()
+def infer():
+    """Inference related commands."""
+    pass
+
+
+infer.add_command(save_cooler_cli)
+infer.add_command(make_mcool_cli)
 
 
 if __name__ == "__main__":
