@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import json
+from collections.abc import Sequence
 
 import h5py
 import hdf5plugin  # noqa: F401 -- registers the Blosc filter so caches written with it are readable
@@ -149,7 +150,7 @@ class CachedMicrozoiFetcher(object):
         start_bp: int,
         end_bp: int,
         reverse: bool = False,
-        run_idx: int | None = None,
+        run_idx: int | Sequence[int] | None = None,
         n_runs: int = 1,
         device: str = "cpu",
     ) -> torch.Tensor:
@@ -157,12 +158,14 @@ class CachedMicrozoiFetcher(object):
         Fetch cached activations for [start_bp, end_bp) (bin-aligned, within the stored range) as a float16
         torch tensor on ``device`` (default "cpu").
 
-        - ``run_idx`` given: that exact run (what L1 / spec inference uses -- one deterministic run per spec).
+        - ``run_idx`` given: that exact run (what L1 / spec inference uses -- one deterministic run per spec),
+          or a sequence of runs to average deterministically (what the genome-wide sweep uses).
         - otherwise: average ``n_runs`` distinct random runs (``n_runs=1`` = one random run). The training
           loop uses this run-averaging as an augmentation (see ``train_manta``'s ``sample_n_runs``).
         """
         if run_idx is not None:
-            return self._read_runs(chrom, start_bp, end_bp, reverse, [run_idx], device)
+            idxs = [run_idx] if isinstance(run_idx, (int, np.integer)) else list(run_idx)
+            return self._read_runs(chrom, start_bp, end_bp, reverse, idxs, device)
         return self._read_runs(chrom, start_bp, end_bp, reverse, self._pick_runs(n_runs), device)
 
     def _fetch_microzoi_model(self, device):

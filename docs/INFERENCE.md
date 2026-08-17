@@ -156,3 +156,41 @@ Natural-variability view (unsynchronized):
 ```python
 maps, _ = infer.predict_region("chr1", 20_000_000, {"WT": [], "dE": [E]}, backgrounds="random")
 ```
+
+## Genome-wide export to coolers (`manta_hic infer save-cooler`)
+
+Turn a trained checkpoint into browsable genome-wide `.cool`/`.mcool` files (one per output channel):
+
+```bash
+manta_hic infer save-cooler \
+    -m trained_models/hg38/folds_all/2048/4dn-diff.pth \
+    -c microzoi_cache_hg38_all.h5 \
+    -t banded_inputs/hg38/4dn-diff_2048.bhic.h5 \
+    -o out/  -n 4                       # -> out/<channel>_2048.cool, one per channel
+
+# per track, stack the per-resolution predictions into one .mcool (coarsest is zoomified upward):
+manta_hic infer make-mcool out512/ch_512.cool out1024/ch_1024.cool ... -o ch.mcool
+```
+
+What it does (`manta_hic/nn/save_cooler.py` + `manta_hic/io/predicted_cooler.py`):
+
+- Sweeps every chromosome **arm** with overlapping windows (`--steps` per window length, default 8, plus an
+  arm-tail window) and averages the overlaps. Windows never cross arms/centromeres; excluded regions get no
+  pixels.
+- **Averages consistently everywhere**: cache runs `0..n-1` (`--n-runs`, default 4) plus the
+  reverse-complement pass (`--no-reverse` to skip) for every window — deterministic output.
+- Pixel values are `prediction * expected` (per-arm expected from the banded `-t` file), i.e. **balanced-count
+  scale**; the bins carry `weight = 1.0` so balanced-fetch APIs work unchanged. The first two diagonals of the
+  expected are filled from `d=2`.
+- **Single streaming pass, bounded RAM**: window starts only increase, so finalized diagonal-band rows are
+  flushed as pixel chunks into `cooler.create_cooler(..., ordered=True)` iterators — one writer process per
+  channel compresses while the GPU predicts. No temp files, no per-chromosome coolers, no `merge_coolers`.
+- **Cache IO is the dominant cost**, so neighboring windows share one union-span cache read
+  (`--fetch-group`, default 8 — without this the ~90% window overlap is decompressed `steps` times over) and
+  the next group is prefetched on a thread while the model runs. At the defaults the read is fully hidden
+  behind compute; run-averaging depth up to ~8 is essentially free.
+- Prints a per-stage timing summary (fetch wait / model / expected+aggregate / writer wait) so you can see
+  the current bottleneck for your settings.
+
+Whole hg38 at defaults on one RTX 4090: ~12 min at 2048 bp, ~40 min at 512 bp, ~4 min at 16384 bp
+(model-forward-bound at fine resolutions).
