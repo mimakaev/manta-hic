@@ -211,10 +211,13 @@ class FeaturesTo2D(nn.Module):
         2D features of shape [B, out_channels, W, W].
     """
 
-    def __init__(self, in_channels, out_channels, kernel_size=5):
+    def __init__(self, in_channels, out_channels, kernel_size=5, symmetric=False):
         super(FeaturesTo2D, self).__init__()
         # We keep a relatively wide convolution here to encode distance, upper/lower half info, etc.
         self.conv = ConvolutionalBlock2d(in_channels, out_channels, kernel_size)
+        # Ablation switch: build an orientation-blind 2D representation (symmetrized outer sum, no
+        # triangular features) with an IDENTICAL parameter count -- isolates the value of asymmetry.
+        self.symmetric = bool(symmetric)
 
     def forward(self, x, dist_mat):
         """
@@ -228,15 +231,22 @@ class FeaturesTo2D(nn.Module):
         half_1 = x[:, :in_c, :]  # [B, in_c, W]
         half_2 = x[:, in_c:, :]  # [B, in_c, W]
 
-        # Create an asymmetric matrix: half_1[:, :, i] + half_2[:, :, j]
-        # Distinguish upper/lower triangular parts
-        two_d = half_1.unsqueeze(-1) + half_2.unsqueeze(2)  # [B, in_c, W, W]
-
         # Distance features
         dist = dist_mat.unsqueeze(0).repeat(x.size(0), 1, 1, 1)  # [B, 1, W, W]
 
-        # A +/-1 triangular mask so the network can learn upper vs. lower differently
-        triu = torch.triu(torch.ones_like(dist), diagonal=1).to(x.device) * 2 - 1
+        if self.symmetric:
+            # symmetrized outer sum; triangular channels carry no signal (kept as zeros so the conv
+            # input width -- and thus the parameter count -- matches the asymmetric variant exactly)
+            two_d = 0.5 * (
+                half_1.unsqueeze(-1) + half_2.unsqueeze(2) + half_2.unsqueeze(-1) + half_1.unsqueeze(2)
+            )
+            triu = torch.zeros_like(dist)
+        else:
+            # Create an asymmetric matrix: half_1[:, :, i] + half_2[:, :, j]
+            # Distinguish upper/lower triangular parts
+            two_d = half_1.unsqueeze(-1) + half_2.unsqueeze(2)  # [B, in_c, W, W]
+            # A +/-1 triangular mask so the network can learn upper vs. lower differently
+            triu = torch.triu(torch.ones_like(dist), diagonal=1).to(x.device) * 2 - 1
         # Combine all features
         x2d = torch.cat((two_d, triu, dist, dist**2, dist * triu), dim=1)  # wide intermediate
         x2d = self.conv(x2d)

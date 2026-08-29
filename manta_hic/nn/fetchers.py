@@ -345,20 +345,22 @@ class CachedMicrozoiFetcher(object):
 
 class SequenceFetcher(object):
     """
-    A class that fetches sequences from a FASTA file, rather than intermediate activations.
+    Fetches one-hot sequence from a FASTA file, rather than intermediate activations -- for
+    "one shot" models trained end-to-end from sequence (the Akita-style baseline).
 
-    It can be used for "one shot" models that do not use transfer learning, like Akita.
-    Accepts optional "max_shift_bp" argument to apply a random shift in basepairs.
+    Drop-in for :class:`CachedMicrozoiFetcher` in the training loader: :meth:`fetch` has the same
+    signature (run-related arguments are accepted and ignored -- sequence has no cached runs; the
+    random sub-window shift plays the analogous augmentation role) and returns a channels-first
+    float16 torch tensor on ``device``.
     """
 
     def __init__(self, fasta_open, max_shift_bp=128):
         self.fasta_open = fasta_open
         self.max_shift_bp = max_shift_bp
+        self.genome = None  # unknown/any: no cache to disagree with
 
-    def fetch(self, chrom, start_bp, end_bp, reverse=True):
-        """
-        Fetch a sequence from a FASTA file, optionally reversed.
-        """
-
-        shift_bp = np.random.randint(-self.max_shift_bp, self.max_shift_bp + 1)
-        return make_seq_1hot(self.fasta_open, chrom, start_bp + shift_bp, end_bp + shift_bp, reverse).T
+    def fetch(self, chrom, start_bp, end_bp, reverse=False, run_idx=None, n_runs=1, device="cpu"):
+        """One-hot sequence for [start_bp, end_bp) as a ``[4, L]`` float16 tensor on ``device``."""
+        shift_bp = np.random.randint(-self.max_shift_bp, self.max_shift_bp + 1) if self.max_shift_bp else 0
+        seq = make_seq_1hot(self.fasta_open, chrom, start_bp + shift_bp, end_bp + shift_bp, reverse)
+        return torch.from_numpy(np.ascontiguousarray(seq.T)).to(device=device, dtype=torch.float16)

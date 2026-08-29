@@ -49,7 +49,7 @@ import torch
 import torch.optim as optim
 
 from manta_hic.io.banded import BandedHicFile
-from manta_hic.nn.fetchers import CachedMicrozoiFetcher
+from manta_hic.nn.fetchers import CachedMicrozoiFetcher, SequenceFetcher
 from manta_hic.nn.manta import MANTA_PRESETS, Manta, save_manta_checkpoint
 from manta_hic.ops.hic_ops import coarsegrained_hic_corrs, create_expected_matrix, hic_hierarchical_loss
 from manta_hic.ops.tensor_ops import torch_device_type
@@ -67,7 +67,7 @@ N_BINS_DEFAULT = (512, 768, 896, 960, 1024)  # every distributed model sees thes
 DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
 
 
-def resolve_specs(input_file, model, models, cache_path, genome, params):
+def resolve_specs(input_file, model, models, cache_path, genome, params, require_cache=True):
     """Merge the three ways of naming models into a list of {name, input_file, cache_path, genome, params}."""
     specs = []
 
@@ -99,7 +99,7 @@ def resolve_specs(input_file, model, models, cache_path, genome, params):
     if not specs:
         raise ValueError("no models: pass --input-file, one/more --model name=path, or --models manifest.json")
     for s in specs:
-        if s["cache_path"] is None:
+        if s["cache_path"] is None and require_cache:
             raise ValueError(f"model {s['name']!r} has no cache: pass --cache-path or set it in the manifest")
     names = [s["name"] for s in specs]
     if len(set(names)) != len(names):
@@ -270,6 +270,8 @@ def train_manta_multi(
     max_bad_fraction=0.1,
     overlap_threshold=0.9,
     train_corr=False,
+    from_sequence=False,
+    fasta=None,
 ):
     os.makedirs(output_dir, exist_ok=True)
     n_bins = sorted({int(x) for x in ([n_bins] if isinstance(n_bins, int) else n_bins)})
@@ -285,21 +287,35 @@ def train_manta_multi(
     mode = "fp32" if not autocast_on else ("mixed-fp16(scaler)" if scaler_on else "mixed-bf16")
     print(f"[train] precision: params float32, compute {compute_dtype} -> {mode}", flush=True)
 
-    caches = set(s["cache_path"] for s in specs)
     genomes = set(s["genome"] for s in specs)
-    if len(caches) != 1 or len(genomes) != 1:
-        raise ValueError(
-            f"all models in one run must share cache+genome (caches={caches}, genomes={genomes}); "
-            "run separate invocations per cache/genome"
-        )
-    fetcher = CachedMicrozoiFetcher(next(iter(caches)))
+    if len(genomes) != 1:
+        raise ValueError(f"all models in one run must share a genome (genomes={genomes})")
     genome = next(iter(genomes))
-    if fetcher.genome is not None and fetcher.genome != genome:
-        raise ValueError(f"cache genome {fetcher.genome!r} != requested {genome!r}")
+    if from_sequence:
+        # End-to-end (Akita-style) baseline: one-hot sequence in, no activation cache. The conv
+        # tower absorbs the base-pair -> bin reduction: tower_height = log2(resolution) - 1 makes
+        # the input window (n_bins + 2*bins_pad) * resolution base pairs at 1 bp per position.
+        if not fasta:
+            raise ValueError("from_sequence=True requires a fasta path")
+        import pysam
+
+        fetcher = SequenceFetcher(pysam.FastaFile(fasta))
+        for s in specs:
+            s["params"] = {**(s.get("params") or {}), "input_channels": 4}
+    else:
+        caches = set(s["cache_path"] for s in specs)
+        if len(caches) != 1:
+            raise ValueError(
+                f"all models in one run must share a cache (caches={caches}); "
+                "run separate invocations per cache"
+            )
+        fetcher = CachedMicrozoiFetcher(next(iter(caches)))
+        if fetcher.genome is not None and fetcher.genome != genome:
+            raise ValueError(f"cache genome {fetcher.genome!r} != requested {genome!r}")
 
     probe = BandedHicFile(specs[0]["input_file"])  # resolution + tower height (all models must match)
     res = probe.resolution
-    tower_h = int(np.round(np.log2(res))) - 9
+    tower_h = int(np.round(np.log2(res))) - (1 if from_sequence else 9)
     probe.close()
 
     models = [_Model(s, max_n_bins=max_nb, bins_pad=bins_pad, device=device, lr=lr, tower_h=tower_h) for s in specs]
@@ -586,6 +602,14 @@ file = click.Path(exists=True, dir_okay=False)
     help="Min fraction of a window's bins in the fold set to keep it (fold-boundary tolerance).",
 )
 @click.option("--train-corr", is_flag=True, help="Also compute (expensive) train-set correlations each epoch.")
+@click.option(
+    "--from-sequence",
+    is_flag=True,
+    help="Ablation baseline: train end-to-end from one-hot sequence (Akita-style), no activation "
+    "cache; requires --fasta. Checkpoints record tower_height = log2(res)-1 and are for the "
+    "ablation only (their config resolution field is not meaningful).",
+)
+@click.option("--fasta", type=file, default=None, help="Genome fasta (required with --from-sequence).")
 def train_manta_click(
     input_file,
     model,
@@ -609,11 +633,13 @@ def train_manta_click(
     max_bad_fraction,
     overlap_threshold,
     train_corr,
+    from_sequence,
+    fasta,
 ):
     arch = dict(MANTA_PRESETS[preset])  # size preset, then --params JSON overrides individual keys
     if params:
         arch.update(json.load(open(params)))
-    specs = resolve_specs(input_file, model, models, cache_path, genome, arch)
+    specs = resolve_specs(input_file, model, models, cache_path, genome, arch, require_cache=not from_sequence)
     sizes = tuple(int(x) for x in str(n_bins).split(","))
     train_manta_multi(
         specs,
@@ -632,4 +658,6 @@ def train_manta_click(
         max_bad_fraction=max_bad_fraction,
         overlap_threshold=overlap_threshold,
         train_corr=train_corr,
+        from_sequence=from_sequence,
+        fasta=fasta,
     )

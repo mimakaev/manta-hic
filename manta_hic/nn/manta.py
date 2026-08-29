@@ -147,6 +147,7 @@ class Manta(nn.Module):
         checkpoint_first=False,
         conv_blocks_checkpoint=0,
         legacy=False,
+        symmetric_2d=False,  # ablation: orientation-blind 2D former (see FeaturesTo2D)
     ):
         super(Manta, self).__init__()
         # Fail at init, not mid-training: the tower 2D branch maxpools n_bins (floor) then deconvs back (x2), so
@@ -206,11 +207,15 @@ class Manta(nn.Module):
         # Direct 2D branch
         # Reserve some channels for the extra distance/upper-lower features in FeaturesTo2D
         self.conv_direct_1d = ConvolutionalBlock1d(channels_1d, 2 * direct_2d_input_channels - 8, 1)
-        self.features_to_2d_direct = FeaturesTo2D(direct_2d_input_channels, direct_2d_channels, kernel_size=3)
+        self.features_to_2d_direct = FeaturesTo2D(
+            direct_2d_input_channels, direct_2d_channels, kernel_size=3, symmetric=symmetric_2d
+        )
 
         # Tower 2D branch
         self.conv_tower_1d = ConvolutionalBlock1d(channels_1d, 2 * tower_2d_input_channels - 8, 1)
-        self.features_to_2d_tower = FeaturesTo2D(tower_2d_input_channels, tower_2d_channels, kernel_size=3)
+        self.features_to_2d_tower = FeaturesTo2D(
+            tower_2d_input_channels, tower_2d_channels, kernel_size=3, symmetric=symmetric_2d
+        )
 
         # Residual dilated tower
         self.residual_dilated_tower = FibonacciResidualTower(
