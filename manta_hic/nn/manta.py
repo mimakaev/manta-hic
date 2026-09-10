@@ -226,6 +226,17 @@ class Manta(nn.Module):
         # (trained with that "oversight" norm) still load. Same forward ordering either way: norm -> GELU.
         if self.legacy:
             self.batchnorm_tower = nn.BatchNorm2d(tower_2d_channels, momentum=0.01)
+            # Pre-refactor models fed the half-resolution tower branch a distance matrix normalized at ITS OWN
+            # size (mean/std of the n_bins//2 map), not a slice of the full-size map. Reproduce that exactly, or
+            # the tower branch of every legacy checkpoint silently sees a rescaled distance input.
+            half = n_bins // 2
+            i, j = np.indices((half, half))
+            log_d = np.log10(np.abs(i - j) + 3)
+            self.register_buffer(
+                "dist_mat_half_legacy",
+                calculate_distance_matrix(half, mean=float(log_d.mean()), std=float(log_d.std())),
+                persistent=False,
+            )
         else:
             self.gn_tower = nn.GroupNorm(tower_2d_channels // 8, tower_2d_channels)
 
@@ -295,7 +306,9 @@ class Manta(nn.Module):
         x_tower = self.conv_tower_1d(x)  # [B, 2*tower_2d_input_channels - 8, n_bins + 2 * bins_pad]
         x_tower = x_tower[:, :, self.bins_pad : -self.bins_pad]  # [B, 2*tower_2d_input_channels - 8, n_bins]
         x_tower = self.maxpool1d(x_tower)  # [B, tower_2d_input_channels, n_bins//2]
-        x_tower = self.features_to_2d_tower(x_tower, self._dist(x_tower.shape[-1]))  # [B, tower_2d_ch, N/2, N/2]
+        n_half = x_tower.shape[-1]
+        dist_half = self.dist_mat_half_legacy[:, :n_half, :n_half] if self.legacy else self._dist(n_half)
+        x_tower = self.features_to_2d_tower(x_tower, dist_half)  # [B, tower_2d_ch, N/2, N/2]
 
         # 7) Residual tower in 2D
         x_tower = self.residual_dilated_tower(x_tower)  # [B, tower_2d_channels, n_bins//2, n_bins//2]
