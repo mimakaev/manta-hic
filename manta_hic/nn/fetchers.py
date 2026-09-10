@@ -248,7 +248,7 @@ class CachedMicrozoiFetcher(object):
         for i in range(0, len(tiles), self.batch_size):  # one pooled pass through MicroZoi (+8 positional ch)
             batch = list_to_tensor_batch(tiles[i : i + self.batch_size], device)
             with torch.no_grad(), torch.autocast(device_type):
-                act = model(batch.permute(0, 2, 1), genome="hg38", offset=0, crop_mha=crop_mha_bins)
+                act = model(batch.permute(0, 2, 1), genome=self.genome or "hg38", offset=0, crop_mha=crop_mha_bins)
                 lin = torch.linspace(-1, 1, act.shape[2], device=device).unsqueeze(0).unsqueeze(0)
                 lin = torch.cat([lin.repeat(act.shape[0], 1, 1).pow(p) for p in range(8)], dim=1)
                 act = torch.cat([act, lin], dim=1)
@@ -341,6 +341,56 @@ class CachedMicrozoiFetcher(object):
                 self._splice(acts, win_lo, win_hi, patches[job], ck[1], ck[2], ck[3])
             out.append(acts)
         return out
+
+
+class StochasticHybridFetcher(object):
+    """
+    Training-time augmentation fetcher: with probability ``direct_prob`` the activations for a window
+    are recomputed **on the fly** from sequence with fresh, continuous augmentation -- a random sub-bin
+    shift of the sequence against the bin grid (``max_shift_bp``), a random MicroZoi crop
+    (``crop_mha_range``, which changes each tile's receptive-field context), and a random tile phase --
+    instead of being read from the cache, whose 16 runs quantize that augmentation. Otherwise it defers
+    to the wrapped :class:`CachedMicrozoiFetcher` (single run or run-average as usual). Same ``fetch``
+    signature, so it drops into the training loader unchanged. Augmentation ranges default to the
+    values the cache itself was built with (its attributes).
+    """
+
+    def __init__(self, cached, *, direct_prob=0.3, max_shift_bp=None, crop_mha_range=None,
+                 microzoi_batch_size=2, device="cuda:0"):
+        self.cached = cached
+        self.direct_prob = float(direct_prob)
+        self.device = device
+        self.genome = cached.genome
+        self.N_runs = cached.N_runs
+        with h5py.File(cached.cache_path, "r") as f:
+            self.max_shift_bp = int(max_shift_bp if max_shift_bp is not None else f.attrs.get("max_shift_bp", 128))
+            rng_attr = f.attrs.get("crop_mha_range", (640, 1024))
+            self.crop_mha_range = tuple(int(v) for v in (crop_mha_range or rng_attr))
+        self.microzoi_batch_size = int(microzoi_batch_size)
+        if cached.fasta_open is None:
+            raise ValueError("StochasticHybridFetcher needs a CachedMicrozoiFetcher with fasta_open")
+
+    def _direct(self, chrom, start_bp, end_bp, reverse):
+        model = self.cached._fetch_microzoi_model(self.device)
+        old_bs, self.cached.batch_size = self.cached.batch_size, self.microzoi_batch_size
+        try:
+            shift_bp = int(np.random.randint(-self.max_shift_bp, self.max_shift_bp + 1))
+            crop = int(np.random.randint(self.crop_mha_range[0], self.crop_mha_range[1]))
+            tile_bins = MICROZOI_RECEPTIVE_FIELD // BIN_BP - 2 * crop
+            phase = int(np.random.randint(0, tile_bins))  # random tile phase, in bins
+            lo, hi = start_bp + shift_bp - phase * BIN_BP, end_bp + shift_bp
+            job = (chrom, lo, hi, None, bool(reverse))
+            patch = self.cached._recompute_jobs(model, [job], crop, self.device)[job]  # [C+8, bins]
+            n = (end_bp - start_bp) // BIN_BP
+            return patch[:, -n:] if not reverse else patch[:, :n]  # drop the phase bins (window start side)
+        finally:
+            self.cached.batch_size = old_bs
+
+    def fetch(self, chrom, start_bp, end_bp, reverse=False, run_idx=None, n_runs=1, device="cpu"):
+        if run_idx is None and np.random.rand() < self.direct_prob:
+            return self._direct(chrom, start_bp, end_bp, reverse).to(device)
+        return self.cached.fetch(chrom, start_bp, end_bp, reverse=reverse, run_idx=run_idx, n_runs=n_runs,
+                                 device=device)
 
 
 class SequenceFetcher(object):

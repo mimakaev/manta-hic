@@ -49,7 +49,7 @@ import torch
 import torch.optim as optim
 
 from manta_hic.io.banded import BandedHicFile
-from manta_hic.nn.fetchers import CachedMicrozoiFetcher, SequenceFetcher
+from manta_hic.nn.fetchers import CachedMicrozoiFetcher, SequenceFetcher, StochasticHybridFetcher
 from manta_hic.nn.manta import MANTA_PRESETS, Manta, save_manta_checkpoint
 from manta_hic.ops.hic_ops import coarsegrained_hic_corrs, create_expected_matrix, hic_hierarchical_loss
 from manta_hic.ops.tensor_ops import torch_device_type
@@ -272,6 +272,7 @@ def train_manta_multi(
     train_corr=False,
     from_sequence=False,
     fasta=None,
+    direct_prob=0.0,
 ):
     os.makedirs(output_dir, exist_ok=True)
     n_bins = sorted({int(x) for x in ([n_bins] if isinstance(n_bins, int) else n_bins)})
@@ -312,6 +313,17 @@ def train_manta_multi(
         fetcher = CachedMicrozoiFetcher(next(iter(caches)))
         if fetcher.genome is not None and fetcher.genome != genome:
             raise ValueError(f"cache genome {fetcher.genome!r} != requested {genome!r}")
+        if direct_prob > 0:
+            # continuous on-the-fly augmentation for a fraction of windows (see StochasticHybridFetcher)
+            if not fasta:
+                raise ValueError("direct_prob > 0 requires a fasta path")
+            import pysam
+
+            fetcher.fasta_open = pysam.FastaFile(fasta)
+            fetcher.genome = fetcher.genome or genome
+            fetcher = StochasticHybridFetcher(fetcher, direct_prob=direct_prob, device=device)
+            print(f"[train] direct-compute augmentation: p={direct_prob}, shift ±{fetcher.max_shift_bp} bp, "
+                  f"crop {fetcher.crop_mha_range}", flush=True)
 
     probe = BandedHicFile(specs[0]["input_file"])  # resolution + tower height (all models must match)
     res = probe.resolution
@@ -609,7 +621,15 @@ file = click.Path(exists=True, dir_okay=False)
     "cache; requires --fasta. Checkpoints record tower_height = log2(res)-1 and are for the "
     "ablation only (their config resolution field is not meaningful).",
 )
-@click.option("--fasta", type=file, default=None, help="Genome fasta (required with --from-sequence).")
+@click.option("--fasta", type=file, default=None, help="Genome fasta (required with --from-sequence / --direct-prob).")
+@click.option(
+    "--direct-prob",
+    default=0.0,
+    type=float,
+    help="Fraction of training windows whose activations are recomputed on the fly from sequence with "
+    "continuous augmentation (random sub-bin shift, crop, tile phase) instead of read from the cache. "
+    "Requires --fasta. 0 = pure cache (default).",
+)
 def train_manta_click(
     input_file,
     model,
@@ -635,6 +655,7 @@ def train_manta_click(
     train_corr,
     from_sequence,
     fasta,
+    direct_prob,
 ):
     arch = dict(MANTA_PRESETS[preset])  # size preset, then --params JSON overrides individual keys
     if params:
@@ -660,4 +681,5 @@ def train_manta_click(
         train_corr=train_corr,
         from_sequence=from_sequence,
         fasta=fasta,
+        direct_prob=direct_prob,
     )
