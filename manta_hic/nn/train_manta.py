@@ -51,7 +51,12 @@ import torch.optim as optim
 from manta_hic.io.banded import BandedHicFile
 from manta_hic.nn.fetchers import CachedMicrozoiFetcher, SequenceFetcher, StochasticHybridFetcher
 from manta_hic.nn.manta import MANTA_PRESETS, Manta, save_manta_checkpoint
-from manta_hic.ops.hic_ops import coarsegrained_hic_corrs, create_expected_matrix, hic_hierarchical_loss
+from manta_hic.ops.hic_ops import (
+    coarse_grained_mse_loss,
+    coarsegrained_hic_corrs,
+    create_expected_matrix,
+    hic_hierarchical_loss,
+)
 from manta_hic.ops.tensor_ops import torch_device_type
 
 CORR_NAMES = ["spearman", "pearson", "msd", "spearman_bm", "pearson_bm", "msd_bm"]
@@ -273,6 +278,7 @@ def train_manta_multi(
     from_sequence=False,
     fasta=None,
     direct_prob=0.0,
+    loss_fn="multinomial",
 ):
     os.makedirs(output_dir, exist_ok=True)
     n_bins = sorted({int(x) for x in ([n_bins] if isinstance(n_bins, int) else n_bins)})
@@ -430,7 +436,8 @@ def train_manta_multi(
                 m.model.eval()
             with torch.set_grad_enabled(train), torch.autocast(dev_type, dtype=cdt, enabled=autocast_on):
                 pred = m.model(sub)
-                loss = hic_hierarchical_loss(pred, target, weightmat)
+                loss = (coarse_grained_mse_loss(pred, target, weightmat) if loss_fn == "ag"
+                        else hic_hierarchical_loss(pred, target, weightmat))
             if train:
                 scalers[mi].scale(loss).backward()
                 scalers[mi].step(m.opt)
@@ -630,6 +637,14 @@ file = click.Path(exists=True, dir_okay=False)
     "continuous augmentation (random sub-bin shift, crop, tile phase) instead of read from the cache. "
     "Requires --fasta. 0 = pure cache (default).",
 )
+@click.option(
+    "--loss",
+    "loss_fn",
+    type=click.Choice(["multinomial", "ag"]),
+    default="multinomial",
+    help="Training objective: the hierarchical multinomial count likelihood (default) or, for ablations, "
+    "the Akita/Orca/AlphaGenome-style MSE on adaptively coarse-grained log O/E ('ag').",
+)
 def train_manta_click(
     input_file,
     model,
@@ -656,6 +671,7 @@ def train_manta_click(
     from_sequence,
     fasta,
     direct_prob,
+    loss_fn,
 ):
     arch = dict(MANTA_PRESETS[preset])  # size preset, then --params JSON overrides individual keys
     if params:
@@ -682,4 +698,5 @@ def train_manta_click(
         from_sequence=from_sequence,
         fasta=fasta,
         direct_prob=direct_prob,
+        loss_fn=loss_fn,
     )

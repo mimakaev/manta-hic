@@ -475,3 +475,19 @@ def coarsegrained_hic_corrs(
         corrs = list(corrs) + list(corrs2)
 
     return tuple(corrs)
+
+
+def coarse_grained_mse_loss(pred_ooe, raw, exp_mat, cutoff=10, eps=1e-6):
+    """
+    The objective used by Akita / Orca / AlphaGenome, for ablations: MSE between ``log(pred O/E)`` and the log of the
+    adaptively coarse-grained observed O/E, over pixels where the target is finite and positive. The target is the
+    same transform the fair evaluation applies to observed maps, detached (no gradient through it).
+    ``pred_ooe``/``raw``/``exp_mat`` are ``[B, C, N, N]`` as in :func:`hic_hierarchical_loss`.
+    """
+    with torch.no_grad():
+        ooe = torch.where(exp_mat > eps, raw / exp_mat.clamp_min(eps), torch.zeros_like(raw))
+        target = adaptive_coarsegrain_torch(ooe, raw, cutoff=cutoff)
+        valid = torch.isfinite(target) & (target > 0) & (exp_mat > eps)
+    lp = torch.log(pred_ooe.clamp_min(eps))
+    lt = torch.log(target.clamp_min(eps))
+    return F.mse_loss(lp[valid], lt[valid])
