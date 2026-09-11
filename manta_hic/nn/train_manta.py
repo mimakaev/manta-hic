@@ -53,6 +53,7 @@ from manta_hic.nn.fetchers import CachedMicrozoiFetcher, SequenceFetcher, Stocha
 from manta_hic.nn.manta import MANTA_PRESETS, Manta, save_manta_checkpoint
 from manta_hic.ops.hic_ops import (
     coarse_grained_mse_loss,
+    plain_mse_loss,
     coarsegrained_hic_corrs,
     create_expected_matrix,
     hic_hierarchical_loss,
@@ -436,8 +437,14 @@ def train_manta_multi(
                 m.model.eval()
             with torch.set_grad_enabled(train), torch.autocast(dev_type, dtype=cdt, enabled=autocast_on):
                 pred = m.model(sub)
-                loss = (coarse_grained_mse_loss(pred, target, weightmat) if loss_fn == "ag"
-                        else hic_hierarchical_loss(pred, target, weightmat))
+                if loss_fn == "ag":
+                    loss = coarse_grained_mse_loss(pred, target, weightmat)
+                elif loss_fn == "mse":
+                    loss = plain_mse_loss(pred, target, weightmat, space="log")
+                elif loss_fn == "mse_lin":
+                    loss = plain_mse_loss(pred, target, weightmat, space="linear")
+                else:
+                    loss = hic_hierarchical_loss(pred, target, weightmat)
             if train:
                 scalers[mi].scale(loss).backward()
                 scalers[mi].step(m.opt)
@@ -640,10 +647,11 @@ file = click.Path(exists=True, dir_okay=False)
 @click.option(
     "--loss",
     "loss_fn",
-    type=click.Choice(["multinomial", "ag"]),
+    type=click.Choice(["multinomial", "ag", "mse", "mse_lin"]),
     default="multinomial",
     help="Training objective: the hierarchical multinomial count likelihood (default) or, for ablations, "
-    "the Akita/Orca/AlphaGenome-style MSE on adaptively coarse-grained log O/E ('ag').",
+    "the Akita/Orca/AlphaGenome-style MSE on adaptively coarse-grained log O/E ('ag'), plain MSE on "
+    "un-smoothed log O/E over non-empty pixels ('mse'), or plain MSE on linear O/E over all pixels ('mse_lin').",
 )
 def train_manta_click(
     input_file,

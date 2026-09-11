@@ -477,6 +477,27 @@ def coarsegrained_hic_corrs(
     return tuple(corrs)
 
 
+def plain_mse_loss(pred_ooe, raw, exp_mat, space="log", eps=1e-6):
+    """
+    Ablation: MSE against the UN-smoothed observed O/E (no adaptive coarse-graining).
+
+    ``space="log"``: MSE between ``log(pred O/E)`` and ``log(raw / expected)`` over pixels with at least one count
+    (empty pixels have no finite log target and are dropped -- the usual practice, biased toward observed pixels
+    at low depth). ``space="linear"``: MSE between ``pred O/E`` and ``raw / expected`` over all pixels with a
+    positive expected, empty pixels included (unbiased in expectation, heavy-tailed). Shapes as in
+    :func:`coarse_grained_mse_loss`.
+    """
+    with torch.no_grad():
+        ok = exp_mat > eps
+        target = torch.where(ok, raw / exp_mat.clamp_min(eps), torch.zeros_like(raw))
+    if space == "log":
+        valid = ok & (raw > 0)
+        return F.mse_loss(torch.log(pred_ooe.clamp_min(eps))[valid], torch.log(target.clamp_min(eps))[valid])
+    if space == "linear":
+        return F.mse_loss(pred_ooe[ok], target[ok])
+    raise ValueError(f"unknown space {space!r}")
+
+
 def coarse_grained_mse_loss(pred_ooe, raw, exp_mat, cutoff=10, eps=1e-6):
     """
     The objective used by Akita / Orca / AlphaGenome, for ablations: MSE between ``log(pred O/E)`` and the log of the
