@@ -148,6 +148,7 @@ class Manta(nn.Module):
         conv_blocks_checkpoint=0,
         legacy=False,
         symmetric_2d=False,  # ablation: orientation-blind 2D former (see FeaturesTo2D)
+        exchange_2d=0.0,  # experimental: fraction of 2D-tower channels each block reads from the mirror half
     ):
         super(Manta, self).__init__()
         # Fail at init, not mid-training: the tower 2D branch maxpools n_bins (floor) then deconvs back (x2), so
@@ -219,7 +220,11 @@ class Manta(nn.Module):
 
         # Residual dilated tower
         self.residual_dilated_tower = FibonacciResidualTower(
-            tower_2d_channels, tower_2d_height, tower_2d_width, dropout=tower_2d_dropout
+            tower_2d_channels,
+            tower_2d_height,
+            tower_2d_width,
+            dropout=tower_2d_dropout,
+            exchange=int(round(exchange_2d * tower_2d_channels)),
         )
         # Normalize the residual-tower output before the GELU->deconv upsample. New models use GroupNorm (matching
         # the rest of the network); ``legacy=True`` restores the old BatchNorm2d purely so pre-existing checkpoints

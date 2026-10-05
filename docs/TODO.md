@@ -8,3 +8,12 @@
   should center the tile on the coverage window (start = coverage_mid − tile_size/2) so the seam
   margins are symmetric. Any change alters recompute geometry and therefore sweep reproducibility;
   do not apply to reruns meant to match the 2026 sweep.
+
+- **Legacy-checkpoint evaluations before commit 84589b5 are suspect**: the tower-branch distance
+  matrix was mis-scaled for `legacy=True` models (fixed in 84589b5). Re-evaluate anything scored
+  from 2024-era checkpoints with the refactored library before that commit.
+
+- **Rename `create_expected_matrix`** (`ops/hic_ops.py`): it returns the distance expectation
+  multiplied by the per-bin balancing biases (w_i·w_j), i.e. the expected *raw* count matrix, not
+  the expected. Callers that want the plain distance expectation (e.g. to display log contact
+  probability from O/E) must build the Toeplitz from `exp` directly. (Max, 2026-09-11.)

@@ -81,10 +81,19 @@ class ConvolutionalBlock2d(nn.Module):
 
 
 class ResidualDilatedBlock(nn.Module):
-    """Residual block with two dilated ConvolutionalBlock2d layers and dropout."""
+    """Residual block with two dilated ConvolutionalBlock2d layers and dropout.
 
-    def __init__(self, channels, kernel_size, dilation, dropout=0.2):
+    ``exchange`` (experimental, default 0 = off): the convolutional branch reads the first ``exchange`` channels
+    from the MIRROR position (those channels are transposed on the way in; the residual stream itself stays in
+    the original frame). Every block thus passes a slice of state between the two halves of the map, (i, j) <->
+    (j, i), at no extra parameters or compute.
+    """
+
+    def __init__(self, channels, kernel_size, dilation, dropout=0.2, exchange=0):
         super(ResidualDilatedBlock, self).__init__()
+        if not 0 <= exchange <= channels:
+            raise ValueError(f"exchange must be in [0, {channels}], got {exchange}")
+        self.exchange = int(exchange)
         self.conv1 = ConvolutionalBlock2d(channels, channels, kernel_size, dilation=dilation)
         self.conv2 = ConvolutionalBlock2d(channels, channels, kernel_size, dilation=dilation, groups=4)
         self.drop = nn.Dropout(dropout)
@@ -94,6 +103,9 @@ class ResidualDilatedBlock(nn.Module):
         Forward pass: [B, channels, H, W] -> [B, channels, H, W]
         """
         residual = x
+        if self.exchange:
+            k = self.exchange
+            x = torch.cat((x[:, :k].transpose(-2, -1), x[:, k:]), dim=1)
         x = self.conv1(x)
         x = self.conv2(x)
         x = self.drop(x)
@@ -119,7 +131,7 @@ class FibonacciResidualTower(nn.Module):
         Dropout probability (default=0.2).
     """
 
-    def __init__(self, channels, num_layers, kernel_size, dropout=0.2):
+    def __init__(self, channels, num_layers, kernel_size, dropout=0.2, exchange=0):
         super(FibonacciResidualTower, self).__init__()
 
         def fib(n):
@@ -131,7 +143,7 @@ class FibonacciResidualTower(nn.Module):
         self.dilation_rates = list(fib(num_layers))
         self.layers = nn.ModuleList(
             [
-                ResidualDilatedBlock(channels, kernel_size, dilation=rate, dropout=dropout)
+                ResidualDilatedBlock(channels, kernel_size, dilation=rate, dropout=dropout, exchange=exchange)
                 for rate in self.dilation_rates
             ]
         )
