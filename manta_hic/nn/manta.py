@@ -9,7 +9,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 from manta_hic.nn.layers import (
     ConvolutionalBlock1d,
@@ -98,8 +97,6 @@ class Manta(nn.Module):
         smallest multiple of 8 that is >= 2 * output_channels, so one preset works for any channel count.
     output_channels : int
         Number of output channels in the final 2D convolution.
-    checkpoint_first : bool
-        If True, checkpoint the first 1D convolutions.
     conv_blocks_checkpoint : int
         Number of 1D conv blocks to checkpoint GN part (starting from the first one).
 
@@ -117,10 +114,11 @@ class Manta(nn.Module):
     applied after the first convolution and the tower height is set to 1. So we convolve from input_channels to
     channels_1d, immediately do a transformer tower, and convolve/maxpool down to 512bp resolution.
 
-    We have checkpointing logic as follows. The first convolution is checkpointed as a whole convolution, as it's
-    output is the largest activation in the network. The rest of the convolutions have an option to checkpoint only
-    their groupnorm part, as it is "cheaper" than the convolution itself. It is possible to add more checkpointing
-    logic in the future, specifically for "Akita-like" networks, and be checkpointing whole convolutions.
+    Checkpointing: the 1D convolution blocks can checkpoint their groupnorm part (``conv_blocks_checkpoint``),
+    which is cheaper to recompute than the convolution itself. The first convolution is not checkpointed here --
+    when its input carries no gradient (one-hot sequence, or activations read from the cache) a reentrant
+    checkpoint around it is skipped in the backward pass and the convolution never trains. A caller that needs
+    the memory should wrap whole modules itself with ``use_reentrant=False``.
     """
 
     def __init__(
@@ -144,7 +142,6 @@ class Manta(nn.Module):
         tower_2d_height=9,
         final_channels=32,
         output_channels=2,
-        checkpoint_first=False,
         conv_blocks_checkpoint=0,
         legacy=False,
         symmetric_2d=False,  # ablation: orientation-blind 2D former (see FeaturesTo2D)
@@ -160,7 +157,6 @@ class Manta(nn.Module):
         self.n_bins = n_bins
         self.bins_pad = bins_pad
         self.channels_1d = channels_1d
-        self.checkpoint_first = checkpoint_first
         self.conv_blocks_checkpoint = conv_blocks_checkpoint
         self.legacy = bool(legacy)
 
@@ -281,8 +277,7 @@ class Manta(nn.Module):
         """
 
         # 1) First 1D conv + pool [B, channels_1d, ...]
-        do_checkpoint = self.checkpoint_first and self.training
-        x = checkpoint(self.first_conv_1d, x, use_reentrant=True) if do_checkpoint else self.first_conv_1d(x)
+        x = self.first_conv_1d(x)
         if self.tower_height > 0:  # if we want 512bp resolution, we simply don't maxpool here and keep 1 convolution
             x = self.maxpool1d(x)  # [B, channels_1d, half of previous]
 

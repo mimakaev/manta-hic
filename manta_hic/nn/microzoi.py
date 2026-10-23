@@ -14,7 +14,6 @@ import pysam
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 
 from manta_hic.nn.layers import ConvolutionalBlock1d, TransformerTower
 from manta_hic.nn.training_meta import get_seqs_targs
@@ -39,7 +38,6 @@ class Microzoi(nn.Module):
         attn_dropout=0.4,
         conv_dropout=0.15,
         num_gn_checkpoints=0,
-        checkpoint_first=True,
         return_type="default",
     ):
         super().__init__()
@@ -47,7 +45,6 @@ class Microzoi(nn.Module):
         self.nbins = seq_length // 256
         self.crop = (seq_length // 32 - 6144) // 8 // 2
 
-        self.check_first = checkpoint_first
         self.channels_1d = [base_channels * i for i in tower_mults]
         ch_1d = self.channels_1d
         working_channels = self.working_channels = ch_1d[-1]
@@ -88,9 +85,11 @@ class Microzoi(nn.Module):
 
     def forward(self, x, genome="hg38", offset=0, crop_mha=0, crop_result=True):
 
-        # First convolutional layer (possibly checkpointed - it's the biggest)
-        first = lambda x: self.maxpool(self.conv0(x))
-        x = checkpoint(first, x, use_reentrant=True) if self.check_first and self.training else first(x)
+        # First convolutional layer -- the biggest activation in the model, and deliberately NOT
+        # gradient-checkpointed here: the input is one-hot sequence, which carries no gradient, and a
+        # reentrant checkpoint with no grad-carrying input is skipped in the backward pass, which leaves
+        # this convolution without gradients. Checkpoint it from the caller instead, with use_reentrant=False.
+        x = self.maxpool(self.conv0(x))
 
         # Convolutional blocks
         for conv_block in self.conv_blocks:
