@@ -1,0 +1,77 @@
+{
+  "model": {
+    "seq_conv_width": 15,
+    "tower_mults": [
+      8,
+      9,
+      10,
+      11,
+      12,
+      14,
+      16,
+      16
+    ],
+    "groups": [
+      4,
+      1,
+      4,
+      1,
+      4,
+      1,
+      4
+    ],
+    "width": [
+      3,
+      3,
+      3,
+      3,
+      3,
+      3,
+      3
+    ],
+    "base_channels": 64,
+    "n_heads": 16,
+    "transf_layers": 12,
+    "seq_length": 786432,
+    "last_channels_mult": 32,
+    "output_channels_human": 7611,
+    "output_channels_mouse": 2608,
+    "ff_mult": 4,
+    "attn_dropout": 0.05,
+    "conv_dropout": 0.15,
+    "num_gn_checkpoints": 0,
+    "ff_dropout": 0.4,
+    "qk_norm": true,
+    "checkpoint_first": true
+  },
+  "storage": {
+    "base": "hdf5_256bp",
+    "genomes": [
+      "mm10",
+      "hg38"
+    ],
+    "fasta_path": "{}.fa",
+    "resolution": 256
+  },
+  "train": {
+    "num_epochs": 100,
+    "learning_rate": 0.0002,
+    "ramp_up_epochs": 4,
+    "warmup_steps": 20000,
+    "max_shift": 512,
+    "batch_size": 2,
+    "optimizer": "adamw",
+    "weight_decay": 0.05,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "schedule": "cosine",
+    "min_lr_frac": 0.01,
+    "grad_clip": 1.0,
+    "precision": "bf16",
+    "compile": true,
+    "ema_decay": 0.9999,
+    "log_every": 20
+  }
+}

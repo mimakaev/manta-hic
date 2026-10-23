@@ -14,6 +14,7 @@ import pysam
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from manta_hic.nn.layers import ConvolutionalBlock1d, TransformerTower
 from manta_hic.nn.training_meta import get_seqs_targs
@@ -36,8 +37,11 @@ class Microzoi(nn.Module):
         output_channels_human=7611,
         output_channels_mouse=2608,
         attn_dropout=0.4,
+        ff_dropout=None,
         conv_dropout=0.15,
+        qk_norm=False,
         num_gn_checkpoints=0,
+        checkpoint_first=True,
         return_type="default",
     ):
         super().__init__()
@@ -53,6 +57,7 @@ class Microzoi(nn.Module):
         self.output_channels_human = output_channels_human
         self.output_channels_mouse = output_channels_mouse
         self.return_type = return_type
+        self.checkpoint_first = checkpoint_first
 
         # utility layers
         self.dropout = nn.Dropout1d(p=conv_dropout)
@@ -72,9 +77,10 @@ class Microzoi(nn.Module):
             d_model=working_channels,
             n_bins=self.nbins,
             n_heads=n_heads,
-            attn_drop_p=attn_dropout,  # preserve the old single-rate behavior (one rate on all branches)
-            ff_drop_p=attn_dropout,
+            attn_drop_p=attn_dropout,
+            ff_drop_p=attn_dropout if ff_dropout is None else ff_dropout,  # None: the old single rate on both
             ff_mult=ff_mult,
+            qk_norm=qk_norm,
         )
         if self.return_type in ["default"]:
             self.output_conv_block = ConvolutionalBlock1d(working_channels, self.last_chanels, W=1, D=1, groups=1)
@@ -83,19 +89,33 @@ class Microzoi(nn.Module):
             self.final_conv_human = nn.Conv1d(self.last_chanels, self.output_channels_human, kernel_size=1)
             self.final_conv_mouse = nn.Conv1d(self.last_chanels, self.output_channels_mouse, kernel_size=1)
 
-    def forward(self, x, genome="hg38", offset=0, crop_mha=0, crop_result=True):
+    def _first(self, x):
+        return self.maxpool(self.conv0(x))
 
-        # First convolutional layer -- the biggest activation in the model, and deliberately NOT
-        # gradient-checkpointed here: the input is one-hot sequence, which carries no gradient, and a
-        # reentrant checkpoint with no grad-carrying input is skipped in the backward pass, which leaves
-        # this convolution without gradients. Checkpoint it from the caller instead, with use_reentrant=False.
-        x = self.maxpool(self.conv0(x))
+    def trunk(self, x):
+        """One-hot sequence [B, 4, L] -> transformer output [B, working_channels, L // 256]."""
+        # The first convolution has the largest activation in the model; checkpointing it costs ~2% compute.
+        # It MUST be non-reentrant: the one-hot input carries no gradient, and a reentrant checkpoint with no
+        # grad-carrying input is skipped in the backward pass -- conv0 then never trains (it did not, in the
+        # first generation of MicroZoi checkpoints).
+        if self.checkpoint_first and self.training:
+            x = checkpoint(self._first, x, use_reentrant=False)
+        else:
+            x = self._first(x)
 
-        # Convolutional blocks
         for conv_block in self.conv_blocks:
             x = self.maxpool(conv_block(x))
 
-        x = self.mha_tower(x)
+        return self.mha_tower(x)
+
+    def compile_trunk(self, **kwargs):
+        """``torch.compile`` the sequence trunk (conv tower + transformer) in place. The heads stay eager: their
+        integer crop offset changes every step and would force recompiles. The state dict is unchanged."""
+        self.trunk = torch.compile(self.trunk, **kwargs)
+        return self
+
+    def forward(self, x, genome="hg38", offset=0, crop_mha=0, crop_result=True):
+        x = self.trunk(x)
 
         if self.return_type == "mha":
             return x[:, :, crop_mha : x.shape[2] - crop_mha]  # crop on device to make it faster
@@ -124,7 +144,6 @@ class Microzoi(nn.Module):
 def borzoi_loss(output, target, total_weight=0.2):
     "Multinomial-Poisson loss like in Borzoi"
     epsilon = 1e-7
-    total_weight = 0.2
 
     seq_len = output.shape[2]
 
@@ -154,29 +173,11 @@ def corr(target, output, return_individual=False):
     return cr_mean
 
 
-def dataGenerator(
-    *,
-    base,
-    genomes,
-    seq_length,
-    fasta_path,
-    resolution,  # end storage parameters
-    batch_size=1,  # start training/validation parameters
-    val_fold=3,
-    test_fold=4,
-    max_shift=0,
-    random_shift_bp=27,  # +- 27bp out of 256
-    mode="val",
-):
-    """Ranks and world size aware data generator that would alternate hg38 and mm10 blocks"""
-
-    fastas = {name: pysam.FastaFile(fasta_path.format(name)) for name in genomes}
-
+def sequence_table(*, base, genomes, seq_length, batch_size=1, val_fold=3, test_fold=4, mode="val"):
+    """The training/validation sequences of ``mode`` for all ``genomes``, each genome truncated to a multiple of
+    ``batch_size`` (a batch never mixes genomes). Unshuffled."""
     dfs = []
-
-    val_fold = int(val_fold)
-    test_fold = int(test_fold)
-    omit_folds = [val_fold, test_fold]
+    omit_folds = [int(val_fold), int(test_fold)]
     for gen in genomes:
         seqdf, _ = get_seqs_targs(gen)
         # add index and genome, convert fold to int, add seq start and end
@@ -195,19 +196,47 @@ def dataGenerator(
         if mode == "train":
             seqdf = seqdf.filter(~pl.col("fold").cast(int).is_in(omit_folds))
         elif mode == "val":
-            seqdf = seqdf.filter(pl.col("fold").cast(int) == val_fold)
+            seqdf = seqdf.filter(pl.col("fold").cast(int) == int(val_fold))
         elif mode == "test":
-            seqdf = seqdf.filter(pl.col("fold").cast(int) == test_fold)
+            seqdf = seqdf.filter(pl.col("fold").cast(int) == int(test_fold))
         elif mode != "all":
             raise ValueError("Mode should be train, val, test, or all")
         dfs.append(seqdf[: len(seqdf) // batch_size * batch_size])  # truncate to batch size
+    return pl.concat(dfs)
 
-    # concat and shuffle in blocks of batch_size - lol polars is good!
-    seqdf = pl.concat(dfs).sort((pl.int_range(pl.len()) // batch_size).hash(np.random.randint(0, 1e9)))
+
+def dataGenerator(
+    *,
+    base,
+    genomes,
+    seq_length,
+    fasta_path,
+    resolution,  # end storage parameters
+    batch_size=1,  # start training/validation parameters
+    val_fold=3,
+    test_fold=4,
+    max_shift=0,
+    random_shift_bp=27,  # +- 27bp out of 256
+    mode="val",
+):
+    """Ranks and world size aware data generator that would alternate hg38 and mm10 blocks"""
+
+    fastas = {name: pysam.FastaFile(fasta_path.format(name)) for name in genomes}
+    seqdf = sequence_table(
+        base=base,
+        genomes=genomes,
+        seq_length=seq_length,
+        batch_size=batch_size,
+        val_fold=val_fold,
+        test_fold=test_fold,
+        mode=mode,
+    )
+    # shuffle in blocks of batch_size - lol polars is good!
+    seqdf = seqdf.sort((pl.int_range(pl.len()) // batch_size).hash(np.random.randint(0, 1e9)))
 
     for batch in seqdf.iter_slices(batch_size):
         if mode == "train":
-            shift_bins = np.random.randint(-max_shift, max_shift)
+            shift_bins = np.random.randint(-max_shift, max_shift + 1)
             extra_shift_bp = np.random.randint(-random_shift_bp, random_shift_bp + 1)
             shift_bp = shift_bins * resolution + extra_shift_bp
         else:

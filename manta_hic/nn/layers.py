@@ -34,7 +34,7 @@ class ConvolutionalBlock1d(nn.Module):
 
     def forward(self, x):
         fun = lambda x: F.gelu(self.groupnorm(x))
-        x = checkpoint(fun, x, use_reentrant=True) if self.checkpoint_gn else fun(x)
+        x = checkpoint(fun, x, use_reentrant=False) if self.checkpoint_gn else fun(x)
         return self.conv(x)
 
 
@@ -53,9 +53,9 @@ class DoubleConvolutionalDownsampleBlock(nn.Module):
         fun = lambda x: F.gelu(self.gn(x))
         fun2 = lambda x: F.gelu(self.gn2(x))
 
-        x = checkpoint(fun, x, use_reentrant=True) if self.do_check else fun(x)
+        x = checkpoint(fun, x, use_reentrant=False) if self.do_check else fun(x)
         x = self.conv(x)
-        x = checkpoint(fun2, x, use_reentrant=True) if self.do_check else fun2(x)
+        x = checkpoint(fun2, x, use_reentrant=False) if self.do_check else fun2(x)
         x = self.conv2(x)
         return x
 
@@ -249,9 +249,7 @@ class FeaturesTo2D(nn.Module):
         if self.symmetric:
             # symmetrized outer sum; triangular channels carry no signal (kept as zeros so the conv
             # input width -- and thus the parameter count -- matches the asymmetric variant exactly)
-            two_d = 0.5 * (
-                half_1.unsqueeze(-1) + half_2.unsqueeze(2) + half_2.unsqueeze(-1) + half_1.unsqueeze(2)
-            )
+            two_d = 0.5 * (half_1.unsqueeze(-1) + half_2.unsqueeze(2) + half_2.unsqueeze(-1) + half_1.unsqueeze(2))
             triu = torch.zeros_like(dist)
         else:
             # Create an asymmetric matrix: half_1[:, :, i] + half_2[:, :, j]
@@ -326,31 +324,33 @@ class Symmetrize(nn.Module):
 # Licensed under the LLAMA 2 Community License, Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 # Changes made: used SDPA, added dropout, and changed the FF block (Llama's SwiGLU -> a plain GELU MLP), plus
 # heavy overall rewriting.
-def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply the rotary embedding to the Q/K tensors. The rotation is done in float32 (``xq``/``xk`` are cast up,
-    ``freqs_cis`` is already complex64) and cast back to the caller's dtype -- so it is exact under bf16/fp16
-    autocast, the classic silent-corruption spot for this llama-derived code."""
-    if not freqs_cis.is_complex():  # a real table = cos(theta) silently degrades rotation to scaling
+def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, rope: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the rotary embedding to the Q/K tensors ``[B, N, H, D]``. Adjacent channel pairs (2i, 2i+1) are rotated
+    as complex numbers, written out in real arithmetic (cos/sin) so that ``torch.compile`` can fuse it -- Inductor
+    does not generate code for complex ops. The rotation is done in float32 and cast back to the caller's dtype, so
+    it is exact under bf16/fp16 autocast."""
+    if rope.dtype != torch.float32:  # Module.to(dtype) casts the table too; a bf16 table loses position precision
         raise TypeError(
-            f"freqs_cis must be complex, got {freqs_cis.dtype}. Did something call model.to(dtype=...)? "
-            "Module.to(dtype) casts complex buffers to real; use .to(device) / .float() / autocast instead."
+            f"rope table must be float32, got {rope.dtype}. Did something call model.to(dtype=...)? "
+            "Use .to(device) / .float() / autocast instead."
         )
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))  # [B, N, H, C/H] -> [B, N, H, C/(2*H)]
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))  # dtype: complex64
-    if not freqs_cis.shape == (xq_.shape[1], xq_.shape[-1]):
-        raise ValueError(f"freqs_cis mismatch: {freqs_cis.shape}, {(xq_.shape[1], xq_.shape[-1])}")
-    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(2)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)  # [B, N, H, C/(2*H)] -> [B, N, H, C/H]
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)  # dtype: float32
-    return xq_out.type_as(xq), xk_out.type_as(xk)  # dtype: float32/(b)float16 as autocast wishes
+    if not rope.shape == (xq.shape[1], xq.shape[-1] // 2, 2):
+        raise ValueError(f"rope table mismatch: {tuple(rope.shape)}, {(xq.shape[1], xq.shape[-1] // 2, 2)}")
+    cos, sin = rope[None, :, None, :, 0], rope[None, :, None, :, 1]  # [1, N, 1, D/2]
+
+    def rotate(x):
+        x = x.float().unflatten(-1, (-1, 2))  # [B, N, H, D/2, 2]: (real, imag) pairs
+        re, im = x[..., 0], x[..., 1]
+        return torch.stack((re * cos - im * sin, re * sin + im * cos), dim=-1).flatten(-2).type_as(xq)
+
+    return rotate(xq), rotate(xk)
 
 
-def precompute_freqs_cis(dim: int, N: int, theta: float = 10000.0) -> torch.Tensor:
+def precompute_rope(dim: int, N: int, theta: float = 10000.0) -> torch.Tensor:
+    """Rotary table ``[N, dim//2, 2]`` of (cos, sin) of the rotation angles, float32; dim is d_model//n_heads."""
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))  # [dim//2]
-    t = torch.arange(N, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()  # [N, dim//2]
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # dtype: complex64
-    return freqs_cis  # [N, dim//2] where dim is d_model//n_heads
+    angles = torch.outer(torch.arange(N).float(), freqs)  # [N, dim//2]
+    return torch.stack((angles.cos(), angles.sin()), dim=-1)
 
 
 # Adopted from the post by a github user loubbrad https://github.com/pytorch/pytorch/issues/97899
@@ -363,12 +363,23 @@ class FusedEncoderBlock(nn.Module):  # also from llama
     (``ff_drop_p``, default 0.4). Dropping ~40% of attention weights (the old single-rate behavior) is far more
     disruptive than the same rate on the FF branch output.
 
-    ``freqs_cis`` is passed into :meth:`forward` (owned/precomputed once by :class:`TransformerTower`), not stored
+    ``rope`` is passed into :meth:`forward` (owned/precomputed once by :class:`TransformerTower`), not stored
     per block -- so it is neither duplicated across layers nor written to the checkpoint.
+
+    ``qk_norm`` (default off, as in all trained checkpoints) RMS-normalizes each head's queries and keys before the
+    rotation (QK-norm, as in AlphaGenome / OLMo 2 / Qwen 3), which bounds the attention logits and keeps training
+    stable at higher learning rates. It adds two ``d_head``-sized gains per block.
     """
 
     def __init__(
-        self, d_model: int, n_heads: int = 8, *, attn_drop_p: float = 0.05, ff_drop_p: float = 0.4, ff_mult: int = 4
+        self,
+        d_model: int,
+        n_heads: int = 8,
+        *,
+        attn_drop_p: float = 0.05,
+        ff_drop_p: float = 0.4,
+        ff_mult: int = 4,
+        qk_norm: bool = False,
     ):
         super().__init__()
         if (d_model // n_heads) % 2 != 0:
@@ -384,6 +395,10 @@ class FusedEncoderBlock(nn.Module):  # also from llama
         self.v = nn.Linear(in_features=d_model, out_features=d_model, bias=False)
         self.att_proj_linear = nn.Linear(in_features=d_model, out_features=d_model)
         self.resid_dropout = nn.Dropout(attn_drop_p)
+        self.qk_norm = qk_norm
+        if qk_norm:
+            self.q_norm = nn.RMSNorm(self.d_head)
+            self.k_norm = nn.RMSNorm(self.d_head)
 
         # FF Layer
         self.ff_dropout = nn.Dropout(ff_drop_p)
@@ -394,15 +409,15 @@ class FusedEncoderBlock(nn.Module):  # also from llama
         self.norm1 = nn.RMSNorm(d_model)
         self.norm2 = nn.RMSNorm(d_model)
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-        x = x + self._att_block(self.norm1(x), freqs_cis)
+    def forward(self, x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
+        x = x + self._att_block(self.norm1(x), rope)
         x = x + self._ff_block(self.norm2(x))
         return x
 
     def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
         return self.ff_dropout(self.ff_linear_2(F.gelu(self.ff_linear_1(x))))
 
-    def _att_block(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    def _att_block(self, x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
         xq, xk, xv = self.q(x), self.k(x), self.v(x)
 
@@ -410,9 +425,11 @@ class FusedEncoderBlock(nn.Module):  # also from llama
         xq = xq.view(batch_size, seq_len, self.n_heads, self.d_head)
         xk = xk.view(batch_size, seq_len, self.n_heads, self.d_head)
         xv = xv.view(batch_size, seq_len, self.n_heads, self.d_head)
-        # Rotary is position-indexed, so freqs_cis for a length-L sequence is exactly the first L rows of the
-        # freqs_cis precomputed for the max length -- slice, so ONE model runs at variable window size.
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis[:seq_len])
+        if self.qk_norm:
+            xq, xk = self.q_norm(xq), self.k_norm(xk)
+        # Rotary is position-indexed, so rope for a length-L sequence is exactly the first L rows of the
+        # rope precomputed for the max length -- slice, so ONE model runs at variable window size.
+        xq, xk = apply_rotary_emb(xq, xk, rope[:seq_len])
 
         # Reshape for attention calculation: (b_sz, n_head, s_len, d_head)
         xq = xq.transpose(1, 2)
@@ -432,7 +449,7 @@ class TransformerTower(nn.Module):
     A stack of :class:`FusedEncoderBlock` s with a channel-first <-> length-first permute (the surrounding
     architecture is convolutional / channel-first).
 
-    Owns the rotary ``freqs_cis`` table: it is computed once for ``n_bins`` (the max window) and passed into every
+    Owns the rotary ``rope`` table: it is computed once for ``n_bins`` (the max window) and passed into every
     block, so it is not duplicated per layer. It is a **non-persistent** buffer (like Manta's ``dist_mat``) -- it
     is derived from ``n_bins`` and stays out of the state dict, so a checkpoint loads regardless of the ``n_bins``
     it is instantiated at (each block just slices the first ``seq_len`` rows at runtime).
@@ -440,14 +457,14 @@ class TransformerTower(nn.Module):
 
     def __init__(self, n_layers: int, d_model: int, n_bins: int, n_heads: int, **kwargs):
         super().__init__()
-        self.register_buffer("freqs_cis", precompute_freqs_cis(d_model // n_heads, n_bins), persistent=False)
+        self.register_buffer("rope", precompute_rope(d_model // n_heads, n_bins), persistent=False)
         self.layers = nn.ModuleList([FusedEncoderBlock(d_model, n_heads, **kwargs) for _ in range(n_layers)])
         self.norm = nn.RMSNorm(d_model)
 
     def forward(self, x):
         x = x.permute(0, 2, 1)
         for layer in self.layers:
-            x = layer(x, self.freqs_cis)
+            x = layer(x, self.rope)
         x = self.norm(x)
         x = x.permute(0, 2, 1)
         return x

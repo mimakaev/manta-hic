@@ -173,7 +173,7 @@ class Manta(nn.Module):
         # normalization (see calculate_distance_matrix) makes a slice equal a freshly-computed smaller matrix.
         # Non-persistent: it is derived from n_bins, so it stays out of the state dict and every checkpoint (old
         # or new) loads regardless of the size it was built at. n_bins here is the *max* size (also sizes the
-        # transformer's freqs_cis), so windows larger than n_bins are not supported.
+        # transformer's rotary table), so windows larger than n_bins are not supported.
         self.register_buffer("dist_mat", calculate_distance_matrix(n_bins), persistent=False)
 
         # 1D backbone
