@@ -1,4 +1,5 @@
 {
+  "_status": "EXPERIMENTAL / work in progress: proposed MicroZoi v2 recipe, not yet trained or validated. Not used by the paper (all released models and caches are first-generation MicroZoi). See docs/TODO.md before training with it.",
   "model": {
     "seq_conv_width": 15,
     "tower_mults": [
