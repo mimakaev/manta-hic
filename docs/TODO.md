@@ -27,11 +27,13 @@
   on `microzoi_all.pth` and a Manta head: activations match `main` to ~4e-7 relative, heads to
   ~2e-4, which is fp32 rounding from the real-arithmetic RoPE, far below bf16 precision).
   Before a v2 run:
-  - `qk_norm` changes the state dict (adds per-block `q_norm`/`k_norm` gains), so v1 and v2
-    checkpoints only load into a model built with the matching flag. `fill_cache.py` loads with
-    `strict=False`: building a cache from a v2 checkpoint with a params file missing
-    `qk_norm: true` would silently drop the norms and write wrong activations. Make that strict
-    first.
+  - Versions are tracked: `microzoi_version` = 1 (no QK-norm) or 2 (QK-norm). New MicroZoi
+    checkpoints, including the weights stored in caches, carry their version and full
+    architecture; `load_microzoi` loads them, and the old raw state dicts, strictly and refuses
+    params that disagree. Caches record the version as an attr, Manta checkpoints record the
+    version of the cache they were trained on, and `MantaInference` refuses a head/cache
+    mismatch. Anything without a version counts as v1. Fold (12/34/56/70/all) is not checked:
+    a head can still be paired with a cache of another fold.
   - `checkpoint_first=True` (now the default) lets `conv0` train; first-generation training did
     not (reentrant-checkpoint bug). Exactly reproducing v1 training needs `checkpoint_first=False`
     plus the old caller-side reentrant checkpoint.

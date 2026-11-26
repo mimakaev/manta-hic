@@ -20,6 +20,37 @@ from manta_hic.nn.layers import ConvolutionalBlock1d, TransformerTower
 from manta_hic.nn.training_meta import get_seqs_targs
 from manta_hic.ops.seq_ops import make_seq_1hot
 
+# Constructor arguments that determine the weights or the inference-time math. A state dict alone does not pin
+# all of them down: ``n_heads`` leaves every tensor shape unchanged and ``seq_length`` owns no tensor at all, so a
+# wrong value loads strictly and silently gives wrong outputs. That is why checkpoints carry this config.
+# Everything else (dropouts, gradient checkpointing, ``return_type``) only affects training or which output is
+# returned.
+MICROZOI_ARCH_KEYS = (
+    "seq_conv_width",
+    "tower_mults",
+    "groups",
+    "width",
+    "base_channels",
+    "n_heads",
+    "ff_mult",
+    "transf_layers",
+    "seq_length",
+    "last_channels_mult",
+    "output_channels_human",
+    "output_channels_mouse",
+    "qk_norm",
+)
+MICROZOI_CHECKPOINT_FORMAT = "microzoi-checkpoint"
+# Head layers, absent from a ``return_type="mha"`` model (and from the weights stored in activation caches).
+_HEAD_PREFIXES = ("output_conv_block.", "output_conv_block2.", "final_conv_human.", "final_conv_mouse.")
+
+
+def microzoi_version(config):
+    """Architecture generation of a MicroZoi config: 1 = first generation (every model and cache in the paper),
+    2 = with QK-norm (``configs/microzoi_v2.json``, experimental). Training-recipe changes that leave the
+    architecture alone do not change the version."""
+    return 2 if config.get("qk_norm", False) else 1
+
 
 class Microzoi(nn.Module):
     def __init__(
@@ -45,6 +76,12 @@ class Microzoi(nn.Module):
         return_type="default",
     ):
         super().__init__()
+        # the full architecture (defaults filled in), written into every checkpoint by microzoi_checkpoint()
+        args = locals()
+        self.arch_config = {
+            k: list(args[k]) if isinstance(args[k], (list, tuple)) else args[k] for k in MICROZOI_ARCH_KEYS
+        }
+        self.version = microzoi_version(self.arch_config)
         # Hard-coding those as Borzoi training data never changes
         self.nbins = seq_length // 256
         self.crop = (seq_length // 32 - 6144) // 8 // 2
@@ -139,6 +176,90 @@ class Microzoi(nn.Module):
             raise ValueError("Target can be hg38 or mm10")
         x = F.softplus(x)
         return x
+
+
+def microzoi_checkpoint(model, state_dict=None):
+    """A self-describing MicroZoi checkpoint: ``{"format", "version", "config", "state_dict"}``, where ``config``
+    is the full architecture (:data:`MICROZOI_ARCH_KEYS`) and ``version`` its generation. ``state_dict`` defaults
+    to the model's own (pass e.g. an EMA's to save that instead). Read it back with :func:`load_microzoi`."""
+    return {
+        "format": MICROZOI_CHECKPOINT_FORMAT,
+        "version": model.version,
+        "config": dict(model.arch_config),
+        "state_dict": model.state_dict() if state_dict is None else state_dict,
+    }
+
+
+def save_microzoi(model, path, state_dict=None):
+    """Save :func:`microzoi_checkpoint` to ``path`` (a filename or a binary buffer)."""
+    torch.save(microzoi_checkpoint(model, state_dict), path)
+
+
+def _same(a, b):
+    norm = lambda v: list(v) if isinstance(v, (list, tuple)) else v
+    return norm(a) == norm(b)
+
+
+def resolve_microzoi_checkpoint(obj, params=None, return_type="default"):
+    """Check a loaded MicroZoi checkpoint against ``params`` and return ``(constructor_kwargs, state_dict)``
+    ready for a strict ``load_state_dict``.
+
+    ``obj`` is either a self-describing checkpoint (:func:`microzoi_checkpoint`) or a raw state dict (all
+    first-generation checkpoints and the weights in caches written before checkpoints carried their config).
+    ``params`` is the ``"model"`` section of a params json, or None.
+
+    - Self-describing: the stored config is authoritative. Any architecture key in ``params`` that disagrees
+      with it is an error; non-architecture keys (dropouts etc.) are kept from ``params``.
+    - Raw state dict: the architecture comes from ``params`` (library defaults where missing). Whether the
+      weights have QK-norm is read from the keys, and must agree with ``params``.
+
+    Obsolete ``freqs_cis`` buffers are dropped, and the head weights too when ``return_type="mha"``.
+    """
+    params = dict(params or {})
+    if not isinstance(obj, dict):
+        raise TypeError(f"expected a MicroZoi checkpoint dict, got {type(obj).__name__}")
+    if "format" in obj or "state_dict" in obj:
+        if obj.get("format") != MICROZOI_CHECKPOINT_FORMAT:
+            raise ValueError(f"not a MicroZoi checkpoint (format={obj.get('format')!r})")
+        config, sd = dict(obj["config"]), obj["state_dict"]
+        if missing := [k for k in MICROZOI_ARCH_KEYS if k not in config]:
+            raise ValueError(f"MicroZoi checkpoint config lacks architecture keys {missing}")
+        if obj["version"] != microzoi_version(config):
+            raise ValueError(
+                f"MicroZoi checkpoint says version {obj['version']} but its config is version "
+                f"{microzoi_version(config)}"
+            )
+        bad = {k: (params[k], config[k]) for k in MICROZOI_ARCH_KEYS if k in params and not _same(params[k], config[k])}
+        if bad:
+            raise ValueError(
+                "params disagree with the MicroZoi checkpoint's own architecture (params, checkpoint): "
+                + ", ".join(f"{k}={a!r} vs {b!r}" for k, (a, b) in bad.items())
+            )
+        kwargs = params | config
+    else:
+        sd = obj
+        has_qk = any(k.endswith((".q_norm.weight", ".k_norm.weight")) for k in sd)
+        if has_qk != bool(params.get("qk_norm", False)):
+            raise ValueError(
+                f"MicroZoi weights are version {2 if has_qk else 1} ({'with' if has_qk else 'without'} QK-norm) "
+                f"but params say qk_norm={params.get('qk_norm', False)}; pass the params the model was trained with"
+            )
+        kwargs = params
+    sd = {k: v for k, v in sd.items() if not k.endswith("freqs_cis")}
+    if return_type == "mha":
+        sd = {k: v for k, v in sd.items() if not k.startswith(_HEAD_PREFIXES)}
+    return kwargs | {"return_type": return_type}, sd
+
+
+def load_microzoi(source, params=None, *, device="cpu", return_type="default"):
+    """Load a MicroZoi from ``source`` (a path, a binary buffer, or an already-loaded checkpoint dict), checked
+    against ``params`` by :func:`resolve_microzoi_checkpoint` and loaded strictly. Returns the model in eval
+    mode on ``device``."""
+    obj = source if isinstance(source, dict) else torch.load(source, map_location=device, weights_only=True)
+    kwargs, sd = resolve_microzoi_checkpoint(obj, params, return_type)
+    model = Microzoi(**kwargs).to(device)
+    model.load_state_dict(sd, strict=True)
+    return model.eval()
 
 
 def borzoi_loss(output, target, total_weight=0.2):

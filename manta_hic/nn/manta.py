@@ -334,7 +334,15 @@ class Manta(nn.Module):
 
 
 def save_manta_checkpoint(
-    model, path, *, channel_names=None, model_params=None, genome=None, history=None, train_meta=None
+    model,
+    path,
+    *,
+    channel_names=None,
+    model_params=None,
+    genome=None,
+    microzoi_version=None,
+    history=None,
+    train_meta=None,
 ):
     """
     Save a Manta model as a **self-describing** checkpoint: ``{"state_dict": ..., "config": {...}}``.
@@ -345,6 +353,9 @@ def save_manta_checkpoint(
     is genome-specific, so this lets inference reject a mismatched cache/target), ``channel_names`` (so channel
     labels no longer depend on the target file) and non-default ``model_params``. ``MantaInference`` reads this
     format directly.
+
+    ``microzoi_version`` (optional) is the MicroZoi architecture generation of the activation cache the model
+    was trained on; inference rejects a cache of another version. Checkpoints without it are first-generation.
 
     ``history`` (optional) is the per-epoch training log -- a list of small dicts of *mean* metrics (train/val
     loss and mean correlations). Stored right in the checkpoint so the model file IS its own training record; no
@@ -362,6 +373,8 @@ def save_manta_checkpoint(
     }
     if genome is not None:
         config["genome"] = str(genome)
+    if microzoi_version is not None:
+        config["microzoi_version"] = int(microzoi_version)
     if channel_names is not None:
         config["channel_names"] = list(channel_names)
     if model_params:

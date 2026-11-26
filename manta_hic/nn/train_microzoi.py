@@ -76,7 +76,16 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
     torch.set_float32_matmul_precision("high")
     from torch import GradScaler, autocast
 
-    from manta_hic.nn.microzoi import Microzoi, borzoi_loss, corr, dataGenerator, sequence_table
+    from manta_hic.nn.microzoi import (
+        Microzoi,
+        borzoi_loss,
+        corr,
+        dataGenerator,
+        microzoi_checkpoint,
+        resolve_microzoi_checkpoint,
+        save_microzoi,
+        sequence_table,
+    )
     from manta_hic.nn.training_meta import get_strand_pair
     from manta_hic.ops.tensor_ops import list_to_tensor_batch
 
@@ -146,18 +155,18 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
     if continue_training:
         if os.path.exists(f"{folder}/state.pth"):  # full training state: model, optimizer, scaler, EMA
             state = torch.load(f"{folder}/state.pth", map_location=DEVICE)
-            model.load_state_dict(state["model"])
+            # checked against the current params: resuming with a different architecture is an error
+            model.load_state_dict(resolve_microzoi_checkpoint(state["model"], model_params)[1], strict=True)
             optimizer.load_state_dict(state["optimizer"])
             scaler.load_state_dict(state["scaler"])
             if ema is not None:
-                ema.load_state_dict(state["ema"])
+                ema.load_state_dict(resolve_microzoi_checkpoint(state["ema"], model_params)[1], strict=True)
             st_epoch = state["epoch"] + 1
         else:  # runs from before state.pth: weights only
             mods = glob.glob(f"{folder}/model_*.pth")
             assert len(mods) > 0, "No models found in output folder"
             mods = sorted(mods, key=lambda x: int(x.split("/")[-1].split("_")[1].split(".")[0]))
-            sd = torch.load(mods[-1])
-            sd = {k: v for k, v in sd.items() if not k.endswith("freqs_cis")}  # now a non-persistent buffer
+            _, sd = resolve_microzoi_checkpoint(torch.load(mods[-1], map_location=DEVICE), model_params)
             model.load_state_dict(sd, strict=True)
             if ema is not None:
                 ema.load_state_dict(sd)
@@ -270,11 +279,13 @@ def train_microzoi(gpu, param_file, output_folder, continue_training, val_fold, 
         else:
             val_corrs_epoch = [0]
 
-        torch.save(model.state_dict(), f"{folder}/model_{epoch}.pth")
+        # self-describing checkpoints: MicroZoi version + architecture + weights (see load_microzoi)
+        save_microzoi(model, f"{folder}/model_{epoch}.pth")
         if ema is not None:
-            torch.save(ema.state_dict(), f"{folder}/ema_{epoch}.pth")
-        state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict()}
-        state |= {"ema": ema.state_dict() if ema is not None else None, "epoch": epoch}
+            save_microzoi(ema, f"{folder}/ema_{epoch}.pth")
+        state = {"model": microzoi_checkpoint(model), "optimizer": optimizer.state_dict()}
+        state |= {"scaler": scaler.state_dict(), "ema": microzoi_checkpoint(ema) if ema is not None else None}
+        state |= {"epoch": epoch}
         torch.save(state, f"{folder}/state.pth.tmp")
         os.replace(f"{folder}/state.pth.tmp", f"{folder}/state.pth")
         pickle.dump((train_corrs_epoch, val_corrs_epoch), open(f"{folder}/corrs_{epoch}.pkl", "wb"))

@@ -16,7 +16,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from manta_hic.nn.fetchers import BIN_BP, CACHE_OVERHANG_BP, MICROZOI_RECEPTIVE_FIELD
-from manta_hic.nn.microzoi import Microzoi
+from manta_hic.nn.microzoi import load_microzoi, save_microzoi
 from manta_hic.ops.seq_ops import make_seq_1hot, open_fasta_chromsizes
 from manta_hic.ops.tensor_ops import list_to_tensor_batch, round_mantissa, torch_device_type
 
@@ -224,7 +224,8 @@ def populate_microzoi_cache(
       - We check that the returned activation shape for every piece is [n_channels, chunk_bins]
       - If the activation shape's channels differ from n_channels, we raise an error.
 
-    We also store the entire model with torch.save() in a single "model_blob" dataset.
+    We also store the model as a self-describing checkpoint (:func:`save_microzoi`) in a single "model_blob"
+    dataset, and its architecture generation in the ``microzoi_version`` attr.
     The random parameters for each run are stored in run-group attrs.
 
     Parameters
@@ -275,10 +276,12 @@ def populate_microzoi_cache(
     else:
         params = json.load(open(params_file, "r"))
 
-    base_model = Microzoi(return_type="mha", **params["model"]).to(device)
-    sd = torch.load(modfile, map_location=device, weights_only=True)
-    base_model.load_state_dict(sd, strict=False)
-    base_model.eval()
+    # Strict and checked: a self-describing checkpoint must agree with the params file; a raw state dict must
+    # match it (including QK-norm, i.e. the MicroZoi version). The architecture actually loaded is what the cache
+    # records, so the fetcher rebuilds exactly this model.
+    base_model = load_microzoi(modfile, params["model"], device=device, return_type="mha")
+    params = params | {"model": params["model"] | base_model.arch_config}
+    print(f"MicroZoi version {base_model.version}")
 
     # We'll store crop values via a linspace
     crop_values = np.round(np.linspace(crop_mha_range[0], crop_mha_range[1], N_runs)).astype(int)
@@ -292,10 +295,11 @@ def populate_microzoi_cache(
         f.attrs["max_shift_bp"] = max_shift_bp
         f.attrs["crop_mha_range"] = crop_mha_range
         f.attrs["model_params"] = json.dumps(params)
+        f.attrs["microzoi_version"] = base_model.version
 
-        # Save the entire model as a single blob
+        # Save the model (self-describing: version, architecture and weights) as a single blob
         with io.BytesIO() as buffer:
-            torch.save(base_model.state_dict(), buffer)
+            save_microzoi(base_model, buffer)
             buffer.seek(0)
             model_bytes = np.frombuffer(buffer.read(), dtype=np.uint8)
         f.create_dataset("model_blob", data=model_bytes)

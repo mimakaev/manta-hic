@@ -114,6 +114,16 @@ class MantaInference:
             if self.genome is not None and self.target_file.genome != self.genome:
                 raise ValueError(f"target genome {self.target_file.genome!r} != model genome {self.genome!r}")
 
+        # Manta heads are tied to the MicroZoi that produced their training activations. Checkpoints and caches
+        # without a version are first-generation; fetchers that don't read a cache (no attribute) are not checked.
+        self.microzoi_version = int(cfg.get("microzoi_version", 1))
+        cache_version = getattr(fetcher, "microzoi_version", None)
+        if cache_version is not None and cache_version != self.microzoi_version:
+            raise ValueError(
+                f"cache holds MicroZoi version {cache_version} activations but this Manta model was trained on "
+                f"version {self.microzoi_version}"
+            )
+
         self.fetcher = fetcher
         self.resolution = resolution
         self.device = device
