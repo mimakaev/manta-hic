@@ -14,10 +14,42 @@ import pysam
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from manta_hic.nn.layers import ConvolutionalBlock1d, TransformerTower
 from manta_hic.nn.training_meta import get_seqs_targs
 from manta_hic.ops.seq_ops import make_seq_1hot
+
+# Constructor arguments that determine the weights or the inference-time math. A state dict alone does not pin
+# all of them down: ``n_heads`` leaves every tensor shape unchanged and ``seq_length`` owns no tensor at all, so a
+# wrong value loads strictly and silently gives wrong outputs. That is why checkpoints carry this config.
+# Everything else (dropouts, gradient checkpointing, ``return_type``) only affects training or which output is
+# returned.
+MICROZOI_ARCH_KEYS = (
+    "seq_conv_width",
+    "tower_mults",
+    "groups",
+    "width",
+    "base_channels",
+    "n_heads",
+    "ff_mult",
+    "transf_layers",
+    "seq_length",
+    "last_channels_mult",
+    "output_channels_human",
+    "output_channels_mouse",
+    "qk_norm",
+)
+MICROZOI_CHECKPOINT_FORMAT = "microzoi-checkpoint"
+# Head layers, absent from a ``return_type="mha"`` model (and from the weights stored in activation caches).
+_HEAD_PREFIXES = ("output_conv_block.", "output_conv_block2.", "final_conv_human.", "final_conv_mouse.")
+
+
+def microzoi_version(config):
+    """Architecture generation of a MicroZoi config: 1 = first generation (every model and cache in the paper),
+    2 = with QK-norm (``configs/microzoi_v2.json``, experimental). Training-recipe changes that leave the
+    architecture alone do not change the version."""
+    return 2 if config.get("qk_norm", False) else 1
 
 
 class Microzoi(nn.Module):
@@ -36,11 +68,20 @@ class Microzoi(nn.Module):
         output_channels_human=7611,
         output_channels_mouse=2608,
         attn_dropout=0.4,
+        ff_dropout=None,
         conv_dropout=0.15,
+        qk_norm=False,
         num_gn_checkpoints=0,
+        checkpoint_first=True,
         return_type="default",
     ):
         super().__init__()
+        # the full architecture (defaults filled in), written into every checkpoint by microzoi_checkpoint()
+        args = locals()
+        self.arch_config = {
+            k: list(args[k]) if isinstance(args[k], (list, tuple)) else args[k] for k in MICROZOI_ARCH_KEYS
+        }
+        self.version = microzoi_version(self.arch_config)
         # Hard-coding those as Borzoi training data never changes
         self.nbins = seq_length // 256
         self.crop = (seq_length // 32 - 6144) // 8 // 2
@@ -53,6 +94,7 @@ class Microzoi(nn.Module):
         self.output_channels_human = output_channels_human
         self.output_channels_mouse = output_channels_mouse
         self.return_type = return_type
+        self.checkpoint_first = checkpoint_first
 
         # utility layers
         self.dropout = nn.Dropout1d(p=conv_dropout)
@@ -72,9 +114,10 @@ class Microzoi(nn.Module):
             d_model=working_channels,
             n_bins=self.nbins,
             n_heads=n_heads,
-            attn_drop_p=attn_dropout,  # preserve the old single-rate behavior (one rate on all branches)
-            ff_drop_p=attn_dropout,
+            attn_drop_p=attn_dropout,
+            ff_drop_p=attn_dropout if ff_dropout is None else ff_dropout,  # None: the old single rate on both
             ff_mult=ff_mult,
+            qk_norm=qk_norm,
         )
         if self.return_type in ["default"]:
             self.output_conv_block = ConvolutionalBlock1d(working_channels, self.last_chanels, W=1, D=1, groups=1)
@@ -83,19 +126,33 @@ class Microzoi(nn.Module):
             self.final_conv_human = nn.Conv1d(self.last_chanels, self.output_channels_human, kernel_size=1)
             self.final_conv_mouse = nn.Conv1d(self.last_chanels, self.output_channels_mouse, kernel_size=1)
 
-    def forward(self, x, genome="hg38", offset=0, crop_mha=0, crop_result=True):
+    def _first(self, x):
+        return self.maxpool(self.conv0(x))
 
-        # First convolutional layer -- the biggest activation in the model, and deliberately NOT
-        # gradient-checkpointed here: the input is one-hot sequence, which carries no gradient, and a
-        # reentrant checkpoint with no grad-carrying input is skipped in the backward pass, which leaves
-        # this convolution without gradients. Checkpoint it from the caller instead, with use_reentrant=False.
-        x = self.maxpool(self.conv0(x))
+    def trunk(self, x):
+        """One-hot sequence [B, 4, L] -> transformer output [B, working_channels, L // 256]."""
+        # The first convolution has the largest activation in the model; checkpointing it costs ~2% compute.
+        # It MUST be non-reentrant: the one-hot input carries no gradient, and a reentrant checkpoint with no
+        # grad-carrying input is skipped in the backward pass -- conv0 then never trains (it did not, in the
+        # first generation of MicroZoi checkpoints).
+        if self.checkpoint_first and self.training:
+            x = checkpoint(self._first, x, use_reentrant=False)
+        else:
+            x = self._first(x)
 
-        # Convolutional blocks
         for conv_block in self.conv_blocks:
             x = self.maxpool(conv_block(x))
 
-        x = self.mha_tower(x)
+        return self.mha_tower(x)
+
+    def compile_trunk(self, **kwargs):
+        """``torch.compile`` the sequence trunk (conv tower + transformer) in place. The heads stay eager: their
+        integer crop offset changes every step and would force recompiles. The state dict is unchanged."""
+        self.trunk = torch.compile(self.trunk, **kwargs)
+        return self
+
+    def forward(self, x, genome="hg38", offset=0, crop_mha=0, crop_result=True):
+        x = self.trunk(x)
 
         if self.return_type == "mha":
             return x[:, :, crop_mha : x.shape[2] - crop_mha]  # crop on device to make it faster
@@ -121,10 +178,93 @@ class Microzoi(nn.Module):
         return x
 
 
+def microzoi_checkpoint(model, state_dict=None):
+    """A self-describing MicroZoi checkpoint: ``{"format", "version", "config", "state_dict"}``, where ``config``
+    is the full architecture (:data:`MICROZOI_ARCH_KEYS`) and ``version`` its generation. ``state_dict`` defaults
+    to the model's own (pass e.g. an EMA's to save that instead). Read it back with :func:`load_microzoi`."""
+    return {
+        "format": MICROZOI_CHECKPOINT_FORMAT,
+        "version": model.version,
+        "config": dict(model.arch_config),
+        "state_dict": model.state_dict() if state_dict is None else state_dict,
+    }
+
+
+def save_microzoi(model, path, state_dict=None):
+    """Save :func:`microzoi_checkpoint` to ``path`` (a filename or a binary buffer)."""
+    torch.save(microzoi_checkpoint(model, state_dict), path)
+
+
+def _same(a, b):
+    norm = lambda v: list(v) if isinstance(v, (list, tuple)) else v
+    return norm(a) == norm(b)
+
+
+def resolve_microzoi_checkpoint(obj, params=None, return_type="default"):
+    """Check a loaded MicroZoi checkpoint against ``params`` and return ``(constructor_kwargs, state_dict)``
+    ready for a strict ``load_state_dict``.
+
+    ``obj`` is either a self-describing checkpoint (:func:`microzoi_checkpoint`) or a raw state dict (all
+    first-generation checkpoints and the weights in caches written before checkpoints carried their config).
+    ``params`` is the ``"model"`` section of a params json, or None.
+
+    - Self-describing: the stored config is authoritative. Any architecture key in ``params`` that disagrees
+      with it is an error; non-architecture keys (dropouts etc.) are kept from ``params``.
+    - Raw state dict: the architecture comes from ``params`` (library defaults where missing). Whether the
+      weights have QK-norm is read from the keys, and must agree with ``params``.
+
+    Obsolete ``freqs_cis`` buffers are dropped, and the head weights too when ``return_type="mha"``.
+    """
+    params = dict(params or {})
+    if not isinstance(obj, dict):
+        raise TypeError(f"expected a MicroZoi checkpoint dict, got {type(obj).__name__}")
+    if "format" in obj or "state_dict" in obj:
+        if obj.get("format") != MICROZOI_CHECKPOINT_FORMAT:
+            raise ValueError(f"not a MicroZoi checkpoint (format={obj.get('format')!r})")
+        config, sd = dict(obj["config"]), obj["state_dict"]
+        if missing := [k for k in MICROZOI_ARCH_KEYS if k not in config]:
+            raise ValueError(f"MicroZoi checkpoint config lacks architecture keys {missing}")
+        if obj["version"] != microzoi_version(config):
+            raise ValueError(
+                f"MicroZoi checkpoint says version {obj['version']} but its config is version "
+                f"{microzoi_version(config)}"
+            )
+        bad = {k: (params[k], config[k]) for k in MICROZOI_ARCH_KEYS if k in params and not _same(params[k], config[k])}
+        if bad:
+            raise ValueError(
+                "params disagree with the MicroZoi checkpoint's own architecture (params, checkpoint): "
+                + ", ".join(f"{k}={a!r} vs {b!r}" for k, (a, b) in bad.items())
+            )
+        kwargs = params | config
+    else:
+        sd = obj
+        has_qk = any(k.endswith((".q_norm.weight", ".k_norm.weight")) for k in sd)
+        if has_qk != bool(params.get("qk_norm", False)):
+            raise ValueError(
+                f"MicroZoi weights are version {2 if has_qk else 1} ({'with' if has_qk else 'without'} QK-norm) "
+                f"but params say qk_norm={params.get('qk_norm', False)}; pass the params the model was trained with"
+            )
+        kwargs = params
+    sd = {k: v for k, v in sd.items() if not k.endswith("freqs_cis")}
+    if return_type == "mha":
+        sd = {k: v for k, v in sd.items() if not k.startswith(_HEAD_PREFIXES)}
+    return kwargs | {"return_type": return_type}, sd
+
+
+def load_microzoi(source, params=None, *, device="cpu", return_type="default"):
+    """Load a MicroZoi from ``source`` (a path, a binary buffer, or an already-loaded checkpoint dict), checked
+    against ``params`` by :func:`resolve_microzoi_checkpoint` and loaded strictly. Returns the model in eval
+    mode on ``device``."""
+    obj = source if isinstance(source, dict) else torch.load(source, map_location=device, weights_only=True)
+    kwargs, sd = resolve_microzoi_checkpoint(obj, params, return_type)
+    model = Microzoi(**kwargs).to(device)
+    model.load_state_dict(sd, strict=True)
+    return model.eval()
+
+
 def borzoi_loss(output, target, total_weight=0.2):
     "Multinomial-Poisson loss like in Borzoi"
     epsilon = 1e-7
-    total_weight = 0.2
 
     seq_len = output.shape[2]
 
@@ -154,29 +294,11 @@ def corr(target, output, return_individual=False):
     return cr_mean
 
 
-def dataGenerator(
-    *,
-    base,
-    genomes,
-    seq_length,
-    fasta_path,
-    resolution,  # end storage parameters
-    batch_size=1,  # start training/validation parameters
-    val_fold=3,
-    test_fold=4,
-    max_shift=0,
-    random_shift_bp=27,  # +- 27bp out of 256
-    mode="val",
-):
-    """Ranks and world size aware data generator that would alternate hg38 and mm10 blocks"""
-
-    fastas = {name: pysam.FastaFile(fasta_path.format(name)) for name in genomes}
-
+def sequence_table(*, base, genomes, seq_length, batch_size=1, val_fold=3, test_fold=4, mode="val"):
+    """The training/validation sequences of ``mode`` for all ``genomes``, each genome truncated to a multiple of
+    ``batch_size`` (a batch never mixes genomes). Unshuffled."""
     dfs = []
-
-    val_fold = int(val_fold)
-    test_fold = int(test_fold)
-    omit_folds = [val_fold, test_fold]
+    omit_folds = [int(val_fold), int(test_fold)]
     for gen in genomes:
         seqdf, _ = get_seqs_targs(gen)
         # add index and genome, convert fold to int, add seq start and end
@@ -195,19 +317,47 @@ def dataGenerator(
         if mode == "train":
             seqdf = seqdf.filter(~pl.col("fold").cast(int).is_in(omit_folds))
         elif mode == "val":
-            seqdf = seqdf.filter(pl.col("fold").cast(int) == val_fold)
+            seqdf = seqdf.filter(pl.col("fold").cast(int) == int(val_fold))
         elif mode == "test":
-            seqdf = seqdf.filter(pl.col("fold").cast(int) == test_fold)
+            seqdf = seqdf.filter(pl.col("fold").cast(int) == int(test_fold))
         elif mode != "all":
             raise ValueError("Mode should be train, val, test, or all")
         dfs.append(seqdf[: len(seqdf) // batch_size * batch_size])  # truncate to batch size
+    return pl.concat(dfs)
 
-    # concat and shuffle in blocks of batch_size - lol polars is good!
-    seqdf = pl.concat(dfs).sort((pl.int_range(pl.len()) // batch_size).hash(np.random.randint(0, 1e9)))
+
+def dataGenerator(
+    *,
+    base,
+    genomes,
+    seq_length,
+    fasta_path,
+    resolution,  # end storage parameters
+    batch_size=1,  # start training/validation parameters
+    val_fold=3,
+    test_fold=4,
+    max_shift=0,
+    random_shift_bp=27,  # +- 27bp out of 256
+    mode="val",
+):
+    """Ranks and world size aware data generator that would alternate hg38 and mm10 blocks"""
+
+    fastas = {name: pysam.FastaFile(fasta_path.format(name)) for name in genomes}
+    seqdf = sequence_table(
+        base=base,
+        genomes=genomes,
+        seq_length=seq_length,
+        batch_size=batch_size,
+        val_fold=val_fold,
+        test_fold=test_fold,
+        mode=mode,
+    )
+    # shuffle in blocks of batch_size - lol polars is good!
+    seqdf = seqdf.sort((pl.int_range(pl.len()) // batch_size).hash(np.random.randint(0, 1e9)))
 
     for batch in seqdf.iter_slices(batch_size):
         if mode == "train":
-            shift_bins = np.random.randint(-max_shift, max_shift)
+            shift_bins = np.random.randint(-max_shift, max_shift + 1)
             extra_shift_bp = np.random.randint(-random_shift_bp, random_shift_bp + 1)
             shift_bp = shift_bins * resolution + extra_shift_bp
         else:

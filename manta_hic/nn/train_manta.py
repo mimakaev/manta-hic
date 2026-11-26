@@ -126,8 +126,8 @@ class _Model:
             prm.pop(k, None)
         self.model_arch = prm
         # NOTE: ``.to(device)`` only -- never ``.to(dtype=...)`` on the module. Params are already float32 at
-        # init, and ``Module.to(dtype)`` also casts complex buffers, silently turning the rotary ``freqs_cis``
-        # table (complex64 e^{i*theta}) into its real part cos(theta) -- rotation degrades to scaling.
+        # init, and ``Module.to(dtype)`` also casts buffers, including the float32 rotary ``rope`` table
+        # (apply_rotary_emb refuses a non-float32 table).
         self.model = Manta(
             n_bins=max_n_bins, bins_pad=bins_pad, tower_height=tower_h, output_channels=self.nch, **prm
         ).to(device)
@@ -299,6 +299,7 @@ def train_manta_multi(
     if len(genomes) != 1:
         raise ValueError(f"all models in one run must share a genome (genomes={genomes})")
     genome = next(iter(genomes))
+    microzoi_version = None  # of the activation cache; recorded in every checkpoint (None: trained from sequence)
     if from_sequence:
         # End-to-end (Akita-style) baseline: one-hot sequence in, no activation cache. The conv
         # tower absorbs the base-pair -> bin reduction: tower_height = log2(resolution) - 1 makes
@@ -318,6 +319,7 @@ def train_manta_multi(
                 "run separate invocations per cache"
             )
         fetcher = CachedMicrozoiFetcher(next(iter(caches)))
+        microzoi_version = fetcher.microzoi_version
         if fetcher.genome is not None and fetcher.genome != genome:
             raise ValueError(f"cache genome {fetcher.genome!r} != requested {genome!r}")
         if direct_prob > 0:
@@ -521,6 +523,7 @@ def train_manta_multi(
                     channel_names=m.banded.shortnames,
                     model_params=m.model_arch,
                     genome=m.banded.genome,
+                    microzoi_version=microzoi_version,
                     history=m.history,
                     train_meta=meta,
                 )

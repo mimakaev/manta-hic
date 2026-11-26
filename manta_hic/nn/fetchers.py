@@ -21,7 +21,7 @@ import hdf5plugin  # noqa: F401 -- registers the Blosc filter so caches written 
 import numpy as np
 import torch
 
-from manta_hic.nn.microzoi import Microzoi
+from manta_hic.nn.microzoi import load_microzoi
 from manta_hic.nn.specs import Spec, mutation_span
 from manta_hic.ops.seq_ops import make_seq_1hot
 from manta_hic.ops.tensor_ops import list_to_tensor_batch
@@ -43,7 +43,7 @@ def create_microzoi_model_from_cache(cache_path, device="cuda", return_type="mha
     device : str
         Torch device.
     kwargs : dict
-        Additional keyword arguments to pass to the Microzoi constructor.
+        Additional Microzoi constructor arguments. Architecture arguments must agree with the cached model.
 
     Returns
     -------
@@ -54,20 +54,9 @@ def create_microzoi_model_from_cache(cache_path, device="cuda", return_type="mha
         model_bytes = f["model_blob"][:].tobytes()
         params = json.loads(f.attrs["model_params"])
 
-    # combine model parameters
-    mod_args = params["model"]
-    mod_args.update(kwargs)
-    mod_args.update({"return_type": return_type})
-
-    model = Microzoi(**mod_args).to(device)
-    sd = torch.load(io.BytesIO(model_bytes), map_location=device, weights_only=True)
-    # ``freqs_cis`` used to be a persistent per-layer buffer and is present in older blobs; it is now a
-    # non-persistent buffer that the model recomputes identically at init (deterministic from n_bins/theta), so
-    # drop those keys to load the real weights strictly. Removing this filter once all blobs are re-saved is safe.
-    sd = {k: v for k, v in sd.items() if not k.endswith("freqs_cis")}
-    model.load_state_dict(sd, strict=True)
-    model.eval()
-    return model
+    # Newer blobs are self-describing (version + architecture); older ones are raw state dicts whose
+    # architecture is the cache's model_params. Either way the load is checked and strict.
+    return load_microzoi(io.BytesIO(model_bytes), params["model"] | kwargs, device=device, return_type=return_type)
 
 
 class CachedMicrozoiFetcher(object):
@@ -103,6 +92,8 @@ class CachedMicrozoiFetcher(object):
             self.bin_bp = f.attrs["BIN_BP"]
             genome = f.attrs.get("genome")  # caches written before genome-baking lack it -> None
             self.genome = genome.decode() if isinstance(genome, bytes) else genome
+            # MicroZoi architecture generation of the cached activations; caches without it are first-generation
+            self.microzoi_version = int(f.attrs.get("microzoi_version", 1))
 
     def _read_runs(self, chrom, start_bp, end_bp, reverse, run_indices, device):
         """
@@ -361,6 +352,7 @@ class StochasticHybridFetcher(object):
         self.direct_prob = float(direct_prob)
         self.device = device
         self.genome = cached.genome
+        self.microzoi_version = cached.microzoi_version
         self.N_runs = cached.N_runs
         with h5py.File(cached.cache_path, "r") as f:
             self.max_shift_bp = int(max_shift_bp if max_shift_bp is not None else f.attrs.get("max_shift_bp", 128))
